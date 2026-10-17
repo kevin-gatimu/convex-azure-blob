@@ -3,6 +3,19 @@
 Thanks for helping. Bug reports and pull requests are welcome at
 <https://github.com/kevin-gatimu/convex-azure-blob>.
 
+## Reporting bugs and requesting features
+
+[Open an issue](https://github.com/kevin-gatimu/convex-azure-blob/issues/new/choose)
+and choose **Bug report** or **Feature request**. Search existing issues first to
+avoid duplicates.
+
+For bugs, include a minimal reproduction, expected and actual behavior, package
+and runtime versions, and whether you use Azure Blob Storage or Azurite. For
+feature requests, describe the problem, proposed solution, and alternatives.
+
+Never include Azure account keys, connection strings, SAS tokens or URLs, Convex
+deployment keys, or other secrets in reports, logs, or screenshots.
+
 ## Layout
 
 | Path                        | What it is                                                                                        |
