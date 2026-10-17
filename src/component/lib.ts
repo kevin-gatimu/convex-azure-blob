@@ -1,6 +1,7 @@
 // Apps reach these as `components.azureBlob.lib.<fn>`, usually through the `AzureBlob` client class.
 import { paginator } from "convex-helpers/server/pagination";
 import {
+  type FunctionHandle,
   paginationOptsValidator,
   paginationResultValidator,
 } from "convex/server";
@@ -56,6 +57,7 @@ export const create = mutation({
     fileName: v.optional(v.string()),
     metadata: metadataValidator,
     createdAt: v.number(),
+    uploadExpiresAt: v.number(),
   },
   returns: v.id("files"),
   handler: async (ctx, args) => {
@@ -119,18 +121,29 @@ export const update = mutation({
   },
 });
 
-/** Only a pending file can become ready; returns false otherwise. */
+/** Commits the ready transition and the app's attachment in one transaction. */
 export const markReady = mutation({
-  args: { fileId: v.id("files"), size: v.number() },
-  returns: v.boolean(),
+  args: {
+    fileId: v.id("files"),
+    size: v.number(),
+    onUpload: v.optional(v.string()),
+  },
+  returns: v.union(fileDoc, v.null()),
   handler: async (ctx, args) => {
     const row = await ctx.db.get("files", args.fileId);
-    if (!row || row.status !== "pending") return false;
+    if (!row || row.status === "deleting") return null;
+    if (row.status === "ready") return toDoc(row);
     await ctx.db.patch("files", args.fileId, {
       status: "ready",
       size: args.size,
     });
-    return true;
+    if (args.onUpload) {
+      await ctx.runMutation(
+        args.onUpload as FunctionHandle<"mutation", { fileId: string }>,
+        { fileId: args.fileId },
+      );
+    }
+    return toDoc({ ...row, status: "ready", size: args.size });
   },
 });
 
@@ -142,6 +155,7 @@ export const markDeleting = mutation({
       container: v.string(),
       blobName: v.string(),
       createdAt: v.number(),
+      uploadExpiresAt: v.number(),
     }),
     v.null(),
   ),
@@ -155,6 +169,7 @@ export const markDeleting = mutation({
       container: row.container,
       blobName: row.blobName,
       createdAt: row.createdAt,
+      uploadExpiresAt: row.uploadExpiresAt,
     };
   },
 });
@@ -169,8 +184,8 @@ export const remove = mutation({
   },
 });
 
-/** Files whose blob should be gone: marked deleting, or pending since before the cutoff. */
-export const listSweepable = query({
+/** Atomically claims stale pending uploads, so confirmation cannot race the selection. */
+export const claimSweepable = mutation({
   args: { pendingBefore: v.number(), limit: v.number() },
   returns: v.array(
     v.object({
@@ -178,6 +193,7 @@ export const listSweepable = query({
       container: v.string(),
       blobName: v.string(),
       createdAt: v.number(),
+      uploadExpiresAt: v.number(),
     }),
   ),
   handler: async (ctx, args) => {
@@ -198,11 +214,15 @@ export const listSweepable = query({
             )
             .take(limit - deleting.length)
         : [];
+    for (const row of stale) {
+      await ctx.db.patch("files", row._id, { status: "deleting" });
+    }
     return [...deleting, ...stale].map((row) => ({
       fileId: row._id,
       container: row.container,
       blobName: row.blobName,
       createdAt: row.createdAt,
+      uploadExpiresAt: row.uploadExpiresAt,
     }));
   },
 });

@@ -24,6 +24,19 @@ import type { FunctionReference } from "convex/server";
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
     lib: {
+      claimSweepable: FunctionReference<
+        "mutation",
+        "internal",
+        { limit: number; pendingBefore: number },
+        Array<{
+          blobName: string;
+          container: string;
+          createdAt: number;
+          fileId: string;
+          uploadExpiresAt: number;
+        }>,
+        Name
+      >;
       create: FunctionReference<
         "mutation",
         "internal",
@@ -35,6 +48,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           maxBytes: number;
           metadata?: Record<string, string>;
+          uploadExpiresAt: number;
           uploadedBy: string;
         },
         string,
@@ -55,6 +69,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           metadata?: Record<string, string>;
           size?: number;
           status: "pending" | "ready" | "deleting";
+          uploadExpiresAt: number;
           uploadedBy: string;
         } | null,
         Name
@@ -87,6 +102,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             metadata?: Record<string, string>;
             size?: number;
             status: "pending" | "ready" | "deleting";
+            uploadExpiresAt: number;
             uploadedBy: string;
           }>;
           pageStatus?: "SplitRecommended" | "SplitRequired" | null;
@@ -94,30 +110,36 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         },
         Name
       >;
-      listSweepable: FunctionReference<
-        "query",
-        "internal",
-        { limit: number; pendingBefore: number },
-        Array<{
-          blobName: string;
-          container: string;
-          createdAt: number;
-          fileId: string;
-        }>,
-        Name
-      >;
       markDeleting: FunctionReference<
         "mutation",
         "internal",
         { fileId: string },
-        { blobName: string; container: string; createdAt: number } | null,
+        {
+          blobName: string;
+          container: string;
+          createdAt: number;
+          uploadExpiresAt: number;
+        } | null,
         Name
       >;
       markReady: FunctionReference<
         "mutation",
         "internal",
-        { fileId: string; size: number },
-        boolean,
+        { fileId: string; onUpload?: string; size: number },
+        {
+          blobName: string;
+          container: string;
+          contentType: string;
+          createdAt: number;
+          fileId: string;
+          fileName?: string;
+          maxBytes: number;
+          metadata?: Record<string, string>;
+          size?: number;
+          status: "pending" | "ready" | "deleting";
+          uploadExpiresAt: number;
+          uploadedBy: string;
+        } | null,
         Name
       >;
       remove: FunctionReference<

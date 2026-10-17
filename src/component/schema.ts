@@ -25,6 +25,8 @@ export const fileFields = {
   metadata: v.optional(v.record(v.string(), v.string())),
   status: fileStatus,
   createdAt: v.number(),
+  /** Expiry of the create-only SAS issued for this file, independent of later client settings. */
+  uploadExpiresAt: v.number(),
 };
 
 export default defineSchema({

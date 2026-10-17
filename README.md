@@ -72,7 +72,7 @@ For local development, use [Azurite](#local-development-with-azurite) instead.
 
 ### A Convex app
 
-Any Convex project with `convex@1.43` or later. Run `npm create convex` to start
+Any Convex project with `convex@1.46` or later. Run `npm create convex` to start
 one.
 
 ## Installation
@@ -127,7 +127,7 @@ export const azure = new AzureBlob(components.azureBlob, {
   maxBytes: 5 * 1024 * 1024, // default 10 MiB
 });
 
-export const { generateUploadUrl, confirmUpload } = azure.clientApi({
+const uploadApi: ReturnType<AzureBlob["clientApi"]> = azure.clientApi({
   // Who is uploading? Return null to refuse. This runs in both functions, and
   // only the uploader can confirm their own upload.
   identify: async (ctx) => (await ctx.auth.getUserIdentity())?.subject ?? null,
@@ -137,12 +137,22 @@ export const { generateUploadUrl, confirmUpload } = azure.clientApi({
     // e.g. enforce a quota with ctx.db
   },
 
-  // Optional: runs once the upload is confirmed.
-  onUpload: async (ctx, file) => {
-    await ctx.runMutation(internal.posts.attachImage, { fileId: file.fileId });
-  },
+  // Optional: an internal mutation accepting { fileId }.
+  onUpload: internal.posts.attachImage,
 });
+export const { generateUploadUrl, confirmUpload } = uploadApi;
 ```
+
+`onUpload` is committed in the same transaction as the file becoming ready.
+Inside that internal mutation, use `await azure.getFile(ctx, fileId)` to read
+the confirmed file, then update your app's tables. If the mutation throws, both
+changes roll back and confirmation can be retried. Concurrent or repeated
+confirmations commit the attachment only once. As with any Convex mutation, the
+handler may be re-executed on transaction retries; do not perform external side
+effects in it. Schedule actions for email, webhooks, or other network work.
+
+The typed `uploadApi` variable avoids circular inference when the callback is
+referenced through your generated `internal` API.
 
 Then upload from React:
 
@@ -299,7 +309,8 @@ export const myFiles = query({
 
 `list` returns ready files, newest first, as a standard pagination result. Each
 file has `fileId`, `container`, `blobName`, `contentType`, `size`, `maxBytes`,
-`uploadedBy`, `fileName`, `metadata`, `status` and `createdAt`.
+`uploadedBy`, `fileName`, `metadata`, `status`, `createdAt` and
+`uploadExpiresAt`.
 
 Set a display name and string metadata at upload (`fileName`, `metadata`), or
 later:
@@ -357,8 +368,11 @@ export const sweep = internalAction({
 ```
 
 `azure.delete` is an alias of `purge`. After a delete, the row stays in the
-`deleting` state until the file's upload URL has expired, because that URL could
-otherwise re-create the blob. A later sweep removes it.
+`deleting` state until the file's recorded `uploadExpiresAt` plus a five-minute
+clock-skew allowance, because that URL could otherwise re-create the blob. A
+later sweep removes it. Changing client TTL settings does not shorten this
+retention. Sweep atomically claims stale pending uploads before deleting them,
+so a confirmation that commits first is not swept.
 
 ## Storing files from actions
 
@@ -500,7 +514,7 @@ query methods from mutations and actions too.
 | Method                                                                                        | Call from    | Returns                                                      |
 | --------------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------ |
 | `generateUploadUrl(ctx, { contentType, uploadedBy, maxBytes?, size?, fileName?, metadata? })` | mutation     | `{ fileId, uploadUrl, headers }`                             |
-| `confirmUpload(ctx, fileId)`                                                                  | action       | `{ ok: true, size, contentType }` or `{ ok: false, reason }` |
+| `confirmUpload(ctx, fileId, onUpload?)`                                                       | action       | `{ ok: true, size, contentType }` or `{ ok: false, reason }` |
 | `getFile(ctx, fileId)`                                                                        | query        | `FileDoc` or `null`                                          |
 | `getUrl(ctx, fileId, { download?, cacheControl? })`                                           | query        | URL or `null`                                                |
 | `urlForFile(file, { download?, cacheControl? })`                                              | anywhere     | URL or `null`                                                |
@@ -521,6 +535,9 @@ query methods from mutations and actions too.
   same upload without React.
 - `UploadError` is thrown for failed PUTs (with `status`) and rejected
   confirmations.
+- Starting another upload cancels the previous one. Cancellation also applies
+  while waiting for an upload ticket, and unmounting aborts the active PUT. A
+  confirmation already sent to the server cannot be undone by cancellation.
 
 ### Lower-level exports
 
