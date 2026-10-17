@@ -1,0 +1,122 @@
+name: Bug report
+description: Something is not working as expected.
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. A small, runnable reproduction is the fastest
+        path to a fix. See our [contributing guide](https://github.com/kevin-gatimu/convex-azure-blob/blob/main/CONTRIBUTING.md)
+        for local setup and checks.
+
+        Do not include Azure account keys, connection strings, SAS tokens or URLs,
+        Convex deployment keys, or other secrets in code, logs, or screenshots.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you get instead?
+      placeholder: I expected X, but I got Y.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description:
+        Provide the smallest code sample or sequence that shows the problem. A
+        link to a minimal reproduction repository is welcome.
+      placeholder: |
+        1. Configure the component with ...
+        2. Upload a file using ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error messages
+      description:
+        Include relevant Convex logs or browser console errors, with all secrets
+        removed.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: package-version
+    attributes:
+      label: convex-azure-blob version
+      description:
+        Run `npm ls convex-azure-blob` in your app, or provide the commit SHA if
+        testing from source.
+    validations:
+      required: true
+
+  - type: input
+    id: convex-version
+    attributes:
+      label: Convex version
+      description: The installed version from `npm ls convex`.
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: The output of `node --version`.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: storage-backend
+    attributes:
+      label: Storage backend
+      options:
+        - Azure Blob Storage
+        - Azurite
+        - Both
+        - Not applicable or unsure
+    validations:
+      required: true
+
+  - type: input
+    id: browser-react
+    attributes:
+      label: Browser and React version
+      description:
+        For browser uploads or React hook issues, include your browser
+        name/version and React version.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label:
+            I removed credentials, SAS tokens, and other secrets from this
+            report.
+          required: true
+        - label: I reproduced this with the latest release or the latest `main`.
+          required: false
