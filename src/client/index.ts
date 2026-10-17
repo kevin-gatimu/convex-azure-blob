@@ -1,6 +1,11 @@
-import { actionGeneric, mutationGeneric } from "convex/server";
+import {
+  actionGeneric,
+  createFunctionHandle,
+  mutationGeneric,
+} from "convex/server";
 import type {
   Auth,
+  FunctionReference,
   GenericActionCtx,
   GenericDataModel,
   GenericMutationCtx,
@@ -40,6 +45,13 @@ type RunActionCtx = Pick<
 /** A file as the component stores it. `fileId` is what the app keeps on its own documents. */
 export type FileDoc = { fileId: string } & ObjectType<typeof fileFields>;
 export type FileStatus = FileDoc["status"];
+
+/** An app mutation invoked atomically with the file's ready transition. */
+export type UploadCallback = FunctionReference<
+  "mutation",
+  "internal",
+  { fileId: string }
+>;
 
 /** Image types allowed by default, mapped to the extension of the generated blob name. */
 export const IMAGE_CONTENT_TYPES: Readonly<Record<string, string>> = {
@@ -177,6 +189,7 @@ export class AzureBlob {
     container: string,
     blobName: string,
     permissions: string,
+    expiresOn?: number,
   ) {
     const base = config.internalEndpoint ?? config.endpoint;
     const now = this.now();
@@ -187,7 +200,7 @@ export class AzureBlob {
       blobName,
       permissions,
       startsOn: now - CLOCK_SKEW_MS,
-      expiresOn: now + SERVER_SAS_TTL_MS,
+      expiresOn: expiresOn ?? now + SERVER_SAS_TTL_MS,
       protocol: this.protocolFor(base),
     });
     return `${this.blobUrl(base, container, blobName)}?${sas}`;
@@ -204,6 +217,7 @@ export class AzureBlob {
       fileName?: string;
       metadata?: Record<string, string>;
     },
+    ttlMs = this.uploadTtlMs,
   ) {
     const contentType = mediaType(args.contentType);
     const extension = this.allowed[contentType];
@@ -214,6 +228,8 @@ export class AzureBlob {
     }
     const prefix = this.options.pathPrefix ? `${this.options.pathPrefix}/` : "";
     const blobName = `${prefix}${crypto.randomUUID()}.${extension}`;
+    const createdAt = this.now();
+    const uploadExpiresAt = createdAt + ttlMs;
     const fileId = await ctx.runMutation(this.component.lib.create, {
       container: config.container,
       blobName,
@@ -222,9 +238,10 @@ export class AzureBlob {
       uploadedBy: args.uploadedBy,
       fileName: args.fileName,
       metadata: args.metadata,
-      createdAt: this.now(),
+      createdAt,
+      uploadExpiresAt,
     });
-    return { fileId, blobName, contentType };
+    return { fileId, blobName, contentType, createdAt, uploadExpiresAt };
   }
 
   /**
@@ -246,20 +263,16 @@ export class AzureBlob {
     },
   ): Promise<UploadTicket> {
     const config = this.config();
-    const { fileId, blobName, contentType } = await this.reserve(
-      ctx,
-      config,
-      args,
-    );
-    const now = this.now();
+    const { fileId, blobName, contentType, createdAt, uploadExpiresAt } =
+      await this.reserve(ctx, config, args);
     const sas = await signBlobSas({
       accountName: config.accountName,
       accountKey: config.accountKey,
       container: config.container,
       blobName,
       permissions: "c",
-      startsOn: now - CLOCK_SKEW_MS,
-      expiresOn: now + this.uploadTtlMs,
+      startsOn: createdAt - CLOCK_SKEW_MS,
+      expiresOn: uploadExpiresAt,
       protocol: this.protocolFor(config.endpoint),
     });
     return {
@@ -346,10 +359,12 @@ export class AzureBlob {
   /**
    * Checks the uploaded blob's size, type and (by default) leading bytes against what was
    * reserved. A blob that fails is deleted and its file removed. Confirming twice is harmless.
+   * An optional app mutation attaches the file atomically; a failure rolls back confirmation.
    */
   async confirmUpload(
     ctx: RunActionCtx,
     fileId: string,
+    onUpload?: UploadCallback,
   ): Promise<ConfirmResult> {
     const file = await this.getFile(ctx, fileId);
     if (!file || file.status === "deleting")
@@ -376,8 +391,14 @@ export class AzureBlob {
       await this.purge(ctx, fileId);
       return { ok: false, reason };
     }
-    await ctx.runMutation(this.component.lib.markReady, { fileId, size });
-    return { ok: true, size, contentType };
+    const ready = await ctx.runMutation(this.component.lib.markReady, {
+      fileId,
+      size,
+      onUpload: onUpload ? await createFunctionHandle(onUpload) : undefined,
+    });
+    return ready
+      ? { ok: true, size: ready.size ?? size, contentType: ready.contentType }
+      : { ok: false, reason: "Unknown upload" };
   }
 
   private rejection(file: FileDoc, size: number, contentType: string) {
@@ -451,6 +472,7 @@ export class AzureBlob {
       container: string;
       blobName: string;
       createdAt: number;
+      uploadExpiresAt: number;
     },
   ) {
     const url = await this.serverUrl(
@@ -461,7 +483,7 @@ export class AzureBlob {
     );
     const response = await fetch(url, { method: "DELETE" });
     if (!response.ok && response.status !== 404) return false;
-    if (this.now() >= file.createdAt + this.uploadTtlMs + CLOCK_SKEW_MS) {
+    if (this.now() >= file.uploadExpiresAt + CLOCK_SKEW_MS) {
       await ctx.runMutation(this.component.lib.remove, { fileId: file.fileId });
     }
     return true;
@@ -477,16 +499,13 @@ export class AzureBlob {
     ctx: RunActionCtx,
     args: { pendingOlderThanMs?: number; limit?: number } = {},
   ) {
-    const stale = await ctx.runQuery(this.component.lib.listSweepable, {
+    const stale = await ctx.runMutation(this.component.lib.claimSweepable, {
       pendingBefore:
         this.now() - (args.pendingOlderThanMs ?? DEFAULT_PENDING_TTL_MS),
       limit: args.limit ?? 100,
     });
     let removed = 0;
     for (const file of stale) {
-      await ctx.runMutation(this.component.lib.markDeleting, {
-        fileId: file.fileId,
-      });
       if (await this.removeBlobAndRow(ctx, file)) removed += 1;
     }
     return removed;
@@ -507,11 +526,20 @@ export class AzureBlob {
     const config = this.config();
     const { data, ...rest } = args;
     const body = data instanceof Blob ? data : new Blob([data]);
-    const { fileId, blobName, contentType } = await this.reserve(ctx, config, {
-      ...rest,
-      size: body.size,
-    });
-    const url = await this.serverUrl(config, config.container, blobName, "c");
+    const { fileId, blobName, contentType, uploadExpiresAt } =
+      await this.reserve(
+        ctx,
+        config,
+        { ...rest, size: body.size },
+        SERVER_SAS_TTL_MS,
+      );
+    const url = await this.serverUrl(
+      config,
+      config.container,
+      blobName,
+      "c",
+      uploadExpiresAt,
+    );
     const response = await fetch(url, {
       method: "PUT",
       headers: { "x-ms-blob-type": "BlockBlob", "content-type": contentType },
@@ -573,18 +601,7 @@ export class AzureBlob {
           if (!file || file.uploadedBy !== uploadedBy) {
             return { ok: false, reason: "Unknown upload" };
           }
-          const wasReady = file.status === "ready";
-          const result = await this.confirmUpload(ctx, args.fileId);
-          if (result.ok && !wasReady && options.onUpload) {
-            const confirmed = await this.getFile(ctx, args.fileId);
-            if (confirmed) {
-              await options.onUpload(
-                ctx as GenericActionCtx<DataModel>,
-                confirmed,
-              );
-            }
-          }
-          return result;
+          return await this.confirmUpload(ctx, args.fileId, options.onUpload);
         },
       }),
     };
@@ -607,9 +624,9 @@ export type ClientApiOptions<DataModel extends GenericDataModel> = {
       size?: number;
     },
   ) => void | Promise<void>;
-  /** Runs once after an upload is confirmed, e.g. to attach the file to a document. */
-  onUpload?: (
-    ctx: GenericActionCtx<DataModel>,
-    file: FileDoc,
-  ) => void | Promise<void>;
+  /**
+   * An internal mutation accepting `{ fileId }`, committed with the ready transition.
+   * Throws roll back both attachment and confirmation. Schedule external work from the mutation.
+   */
+  onUpload?: UploadCallback;
 };

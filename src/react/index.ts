@@ -2,7 +2,7 @@
 
 import { useAction, useMutation } from "convex/react";
 import type { FunctionReference } from "convex/server";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 type UploadTicket = {
   fileId: string;
@@ -123,6 +123,15 @@ export function useUploadFile<Args extends GenerateArgs>(api: UploadApi<Args>) {
   const [error, setError] = useState<Error | null>(null);
   const controller = useRef<AbortController | null>(null);
 
+  useEffect(
+    () => () => {
+      const active = controller.current;
+      controller.current = null;
+      active?.abort();
+    },
+    [],
+  );
+
   const upload = useCallback(
     async (
       file: File | Blob,
@@ -146,18 +155,23 @@ export function useUploadFile<Args extends GenerateArgs>(api: UploadApi<Args>) {
         const ticket = await (
           generateUploadUrl as unknown as (args: Args) => Promise<UploadTicket>
         )(args);
+        abort.signal.throwIfAborted();
         await uploadToAzure(ticket.uploadUrl, file, {
           headers: ticket.headers,
-          onProgress: setProgress,
+          onProgress: (fraction) => {
+            if (controller.current === abort) setProgress(fraction);
+          },
           signal: abort.signal,
         });
+        abort.signal.throwIfAborted();
         const result = await confirmUpload({ fileId: ticket.fileId });
+        abort.signal.throwIfAborted();
         if (!result.ok) throw new UploadError(result.reason);
         return ticket.fileId;
       } catch (caught) {
         const failure =
           caught instanceof Error ? caught : new Error(String(caught));
-        setError(failure);
+        if (controller.current === abort) setError(failure);
         throw failure;
       } finally {
         if (controller.current === abort) {

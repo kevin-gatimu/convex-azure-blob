@@ -38,7 +38,12 @@ npm run build:codegen  # component codegen, then build to dist/
 npm run typecheck
 npm run lint
 npm test
+npm run test:package  # tarball imports and upload flow with minimum peers
 ```
+
+`npm run check` runs all release checks, including the isolated consumer test.
+The consumer test requires registry access; component codegen additionally
+requires your configured Convex development deployment.
 
 The tests run with Azure stubbed. To also run the integration tests against
 Azurite, which checks real SAS signatures:

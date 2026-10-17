@@ -1,6 +1,11 @@
 /// <reference types="vite/client" />
 import { convexTest, defineTestApp } from "convex-test";
-import { defineSchema } from "convex/server";
+import {
+  defineSchema,
+  defineTable,
+  internalMutationGeneric,
+} from "convex/server";
+import { v } from "convex/values";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import componentTest, { register } from "../test.js";
 import { AzureBlob } from "./index.js";
@@ -16,6 +21,13 @@ const config = {
 };
 const T0 = Date.UTC(2026, 0, 1, 12, 0, 0);
 const MINUTE = 60_000;
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 const PNG = new Uint8Array([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13,
 ]);
@@ -260,6 +272,37 @@ describe("generateUploadUrl", () => {
 });
 
 describe("confirmUpload", () => {
+  it.each(["mark", "purge"] as const)(
+    "does not report success when %s wins during validation",
+    async (operation) => {
+      const { t, azure, reserve, file, advance } = setup();
+      const fileId = await reserve();
+      advance(11 * MINUTE);
+      stubBlob({});
+      const fetchBlob = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url, init) => {
+        const response = await fetchBlob(url, init);
+        if (init?.method === "HEAD") {
+          await t.action((ctx) =>
+            operation === "purge"
+              ? azure.purge(ctx, fileId)
+              : azure.markForDeletion(ctx, fileId),
+          );
+        }
+        return response;
+      });
+      expect(await t.action((ctx) => azure.confirmUpload(ctx, fileId))).toEqual(
+        {
+          ok: false,
+          reason: "Unknown upload",
+        },
+      );
+      expect((await file(fileId))?.status ?? null).toBe(
+        operation === "purge" ? null : "deleting",
+      );
+    },
+  );
+
   it("marks the file ready after a HEAD and a 64-byte ranged read, both read-only", async () => {
     const { t, azure, reserve, file } = setup();
     const fileId = await reserve({ maxBytes: 2000 });
@@ -521,6 +564,67 @@ describe("list and updateFile", () => {
 });
 
 describe("purge and sweep", () => {
+  it("uses the issued expiry when another client has a shorter upload lifetime", async () => {
+    const { t, azure, reserve, file, advance } = setup({
+      uploadTtlSeconds: 24 * 60 * 60,
+    });
+    const fileId = await reserve();
+    expect((await file(fileId))?.uploadExpiresAt).toBe(T0 + 24 * 60 * MINUTE);
+    const cleanup = new AzureBlob(azure.component, {
+      config,
+      now: () => T0 + 60 * MINUTE,
+    });
+    stubBlob({});
+    expect(await t.action((ctx) => cleanup.purge(ctx, fileId))).toBe(true);
+    expect((await file(fileId))?.status).toBe("deleting");
+    advance(24 * 60 * MINUTE + 5 * MINUTE);
+    expect(await t.action((ctx) => azure.sweep(ctx))).toBe(1);
+    expect(await file(fileId)).toBeNull();
+  });
+
+  it("claims a stale upload before deleting its blob, refusing an in-flight confirmation", async () => {
+    const { t, azure, reserve, file, advance } = setup();
+    const fileId = await reserve();
+    advance(2 * 60 * MINUTE);
+    const checking = deferred();
+    const resume = deferred();
+    stubBlob({});
+    const fetchBlob = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "HEAD") {
+        checking.resolve();
+        await resume.promise;
+      }
+      if (init?.method === "DELETE") {
+        expect((await file(fileId))?.status).toBe("deleting");
+      }
+      return await fetchBlob(url, init);
+    });
+    const confirming = t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    await checking.promise;
+    try {
+      expect(await t.action((ctx) => azure.sweep(ctx))).toBe(1);
+    } finally {
+      resume.resolve();
+    }
+    expect(await confirming).toEqual({ ok: false, reason: "Unknown upload" });
+    expect(await file(fileId)).toBeNull();
+  });
+
+  it("preserves an old upload confirmed before sweep claims it", async () => {
+    const { t, azure, reserve, file, advance } = setup();
+    const fileId = await reserve();
+    advance(2 * 60 * MINUTE);
+    stubBlob({});
+    expect((await t.action((ctx) => azure.confirmUpload(ctx, fileId))).ok).toBe(
+      true,
+    );
+    fetchMock.mockClear();
+    expect(await t.action((ctx) => azure.sweep(ctx))).toBe(0);
+    expect((await file(fileId))?.status).toBe("ready");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("deletes the blob with a delete-only token, removing the row once the upload URL expired", async () => {
     const { t, azure, upload, file, advance } = setup();
     const fileId = await upload();
@@ -608,6 +712,7 @@ describe("store", () => {
       expect(await file(result.fileId)).toMatchObject({
         status: "ready",
         fileName: "x.png",
+        uploadExpiresAt: Date.parse(params(String(url)).get("se")!),
       });
   });
 
@@ -663,14 +768,34 @@ describe("store", () => {
 describe("clientApi", () => {
   const onUpload = vi.fn();
   const app = defineTestApp({
-    schema: defineSchema({}),
+    schema: defineSchema({
+      attachments: defineTable({ fileId: v.string(), uploadedBy: v.string() }),
+    }),
     components: { azureBlob: componentTest },
   });
   const azure = new AzureBlob(app.components.azureBlob, {
     config,
     now: () => T0,
   });
+  const callbacks = {
+    attach: internalMutationGeneric({
+      args: { fileId: v.string() },
+      returns: v.null(),
+      handler: async (ctx, { fileId }) => {
+        const file = await azure.getFile(ctx, fileId);
+        if (!file || file.status !== "ready") throw new Error("File not ready");
+        await ctx.db.insert("attachments", {
+          fileId,
+          uploadedBy: file.uploadedBy,
+        });
+        await onUpload(ctx, file);
+        return null;
+      },
+    }),
+  };
+  const { internal } = app.defineModules({ callbacks });
   const { api, createTest } = app.defineModules({
+    callbacks,
     files: azure.clientApi({
       identify: async (ctx) =>
         (await ctx.auth.getUserIdentity())?.subject ?? null,
@@ -678,11 +803,63 @@ describe("clientApi", () => {
         if (args.fileName === "forbidden.png")
           throw new Error("Quota exceeded");
       },
-      onUpload,
+      onUpload: internal.callbacks.attach,
     }),
   });
 
   beforeEach(() => onUpload.mockReset());
+
+  it("commits one attachment for simultaneous confirmations", async () => {
+    const t = createTest().withIdentity({ subject: "user1" });
+    const { fileId } = await t.mutation(api.files.generateUploadUrl, {
+      contentType: "image/png",
+    });
+    const bothChecking = deferred();
+    let heads = 0;
+    stubBlob({});
+    const fetchBlob = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "HEAD") {
+        if (++heads === 2) bothChecking.resolve();
+        await bothChecking.promise;
+      }
+      return await fetchBlob(url, init);
+    });
+    const results = await Promise.all([
+      t.action(api.files.confirmUpload, { fileId }),
+      t.action(api.files.confirmUpload, { fileId }),
+    ]);
+    expect(results.every((result) => result.ok)).toBe(true);
+    expect(heads).toBe(2);
+    expect(
+      await t.run((ctx) => ctx.db.query("attachments").take(10)),
+    ).toHaveLength(1);
+    expect(onUpload).toHaveBeenCalledTimes(1);
+  });
+
+  it("rolls back a failed attachment and retries it on the next confirmation", async () => {
+    const t = createTest().withIdentity({ subject: "user1" });
+    const { fileId } = await t.mutation(api.files.generateUploadUrl, {
+      contentType: "image/png",
+    });
+    stubBlob({});
+    onUpload.mockRejectedValueOnce(new Error("Attachment failed"));
+    await expect(t.action(api.files.confirmUpload, { fileId })).rejects.toThrow(
+      "Attachment failed",
+    );
+    expect(
+      (await t.query(app.components.azureBlob.lib.get, { fileId }))?.status,
+    ).toBe("pending");
+    expect(
+      await t.run((ctx) => ctx.db.query("attachments").take(10)),
+    ).toHaveLength(0);
+    expect((await t.action(api.files.confirmUpload, { fileId })).ok).toBe(true);
+    await t.action(api.files.confirmUpload, { fileId });
+    expect(onUpload).toHaveBeenCalledTimes(2);
+    expect(
+      await t.run((ctx) => ctx.db.query("attachments").take(10)),
+    ).toHaveLength(1);
+  });
 
   it("issues and confirms uploads for the signed-in user, calling onUpload once", async () => {
     const t = createTest().withIdentity({ subject: "user1" });

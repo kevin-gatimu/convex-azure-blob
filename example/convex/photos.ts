@@ -22,7 +22,7 @@ async function currentUser(ctx: { auth: Auth }) {
 }
 
 // `useUploadFile(api.photos)` in the browser calls these two.
-export const { generateUploadUrl, confirmUpload } = azure.clientApi({
+const uploadApi: ReturnType<AzureBlob["clientApi"]> = azure.clientApi({
   identify: currentUser,
   checkUpload: async (ctx, { uploadedBy }) => {
     const existing = await ctx.db
@@ -33,19 +33,22 @@ export const { generateUploadUrl, confirmUpload } = azure.clientApi({
       throw new ConvexError("You can keep at most 100 photos");
     }
   },
-  onUpload: async (ctx, file) => {
-    await ctx.runMutation(internal.photos.attach, {
-      fileId: file.fileId,
-      owner: file.uploadedBy,
-    });
-  },
+  onUpload: internal.photos.attach,
 });
+export const { generateUploadUrl, confirmUpload } = uploadApi;
 
 export const attach = internalMutation({
-  args: { fileId: v.string(), owner: v.string() },
+  args: { fileId: v.string() },
   returns: v.null(),
-  handler: async (ctx, args) => {
-    await ctx.db.insert("photos", args);
+  handler: async (ctx, args): Promise<null> => {
+    const file = await azure.getFile(ctx, args.fileId);
+    if (!file || file.status !== "ready") {
+      throw new ConvexError("Photo upload not found");
+    }
+    await ctx.db.insert("photos", {
+      fileId: args.fileId,
+      owner: file.uploadedBy,
+    });
     return null;
   },
 });

@@ -28,16 +28,19 @@
     "azurite:setup": "node scripts/azurite-setup.mjs",
     "build": "tsc --project ./tsconfig.build.json",
     "build:codegen": "npx convex codegen --component-dir ./src/component && npm run build",
-    "build:clean": "rm -rf dist *.tsbuildinfo && npm run build:codegen",
-    "clean": "rm -rf dist *.tsbuildinfo",
+    "build:clean": "npm run clean && npm run build",
+    "clean": "node scripts/clean.mjs",
     "typecheck": "tsc --noEmit && tsc -p example && tsc -p example/convex",
     "lint": "eslint .",
     "format": "prettier --write .",
     "test": "vitest run --typecheck",
+    "test:package": "npm run build && node scripts/test-package.mjs",
     "test:watch": "vitest --typecheck --clearScreen false",
     "test:coverage": "vitest run --coverage --coverage.reporter=text",
     "prepare": "npm run build",
-    "preversion": "npm ci && npm run build:clean && npm run test && npm run lint && npm run typecheck",
+    "check": "npm run build:clean && npm run test && npm run lint && npm run typecheck && npm run test:package",
+    "prepublishOnly": "npm run check",
+    "preversion": "npm run check",
     "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
     "release": "npm version patch && npm publish && git push --follow-tags"
   },
@@ -73,7 +76,7 @@
     }
   },
   "peerDependencies": {
-    "convex": "^1.43.0",
+    "convex": "^1.46.0",
     "react": "^18.3.1 || ^19.0.0"
   },
   "peerDependenciesMeta": {
@@ -92,6 +95,7 @@
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
+    "@types/react-test-renderer": "^19.1.0",
     "@vitejs/plugin-react": "^6.0.5",
     "chokidar-cli": "3.0.0",
     "convex": "^1.47.0",
@@ -105,6 +109,7 @@
     "prettier": "3.9.6",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-test-renderer": "^19.2.8",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "8.66.0",
     "vite": "8.2.0",
