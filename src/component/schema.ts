@@ -11,6 +11,21 @@ export const fileStatus = v.union(
   v.literal("deleting"),
 );
 
+/** Azure block blob storage tiers. */
+export const accessTier = v.union(
+  v.literal("Hot"),
+  v.literal("Cool"),
+  v.literal("Cold"),
+  v.literal("Archive"),
+);
+
+/** Azure archive rehydration states returned by Get Blob Properties. */
+export const archiveStatus = v.union(
+  v.literal("rehydrate-pending-to-hot"),
+  v.literal("rehydrate-pending-to-cool"),
+  v.literal("rehydrate-pending-to-cold"),
+);
+
 export const fileFields = {
   /** Container the blob lives in, so one deployment can use several containers. */
   container: v.string(),
@@ -29,6 +44,8 @@ export const fileFields = {
   /** App-defined string metadata. */
   metadata: v.optional(v.record(v.string(), v.string())),
   status: fileStatus,
+  accessTier: v.optional(accessTier),
+  archiveStatus: v.optional(archiveStatus),
   createdAt: v.number(),
   /** Expiry of the create-only SAS; optional for files created before this field existed. */
   uploadExpiresAt: v.optional(v.number()),

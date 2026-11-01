@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add server-side access tier defaults, `setTier`, `rehydrate`, and
+  `refreshTier`, plus exported access-tier/archive-status validators and
+  optional file properties. Archived files stay unservable through rehydration;
+  failed automatic tiering preserves ready files and reads their actual tier.
+  The README covers pricing, lifecycle policies, polling, and archived snapshot
+  restrictions.
 - Add optional `md5` (base64 of a 16-byte digest, computed by the app) to
   `generateUploadUrl` and the `clientApi` mutation. The ticket carries
   `Content-MD5`, so Azure refuses a mismatched body, and `confirmUpload` rejects
