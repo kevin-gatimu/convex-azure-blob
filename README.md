@@ -760,6 +760,31 @@ export const importAvatar = internalAction({
 
 `store` runs the same checks as a browser upload.
 
+When a source is already available at an HTTPS URL, Azure can fetch it directly
+without passing the bytes through the Convex action:
+
+```ts
+const result = await azure.storeFromUrl(ctx, {
+  sourceUrl,
+  contentType: "image/png",
+  uploadedBy: userId,
+  fileName: "avatar",
+  maxBytes: 5 * 1024 * 1024,
+});
+if (!result.ok) throw new Error(result.reason);
+return result.fileId;
+```
+
+`storeFromUrl` accepts only HTTPS source URLs and applies the same size,
+content-type and file-signature checks as `store`. The source must be publicly
+readable or include a read SAS, and must return a valid `Content-Length`. Source
+URLs are limited to 2 KiB. Azure's synchronous operation is limited to 5,000
+MiB; an oversized source or one without a valid length is rejected. Azure
+fetches the source URL itself, so treat user-supplied URLs as an SSRF risk:
+validate them against your application's trusted-source policy before calling
+this method. HTTPS alone does not make an arbitrary URL safe. Do not log source
+URLs that contain SAS tokens.
+
 ## Several containers or folders
 
 Create one client per container or folder. Each file remembers its container, so
@@ -900,6 +925,7 @@ query methods from mutations and actions too.
 | `purge(ctx, fileId)` / `delete(ctx, fileId)`                                                  | action       | `boolean`                                                                       |
 | `sweep(ctx, { pendingOlderThanMs?, limit? })`                                                 | action       | number of blobs removed                                                         |
 | `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
+| `storeFromUrl(ctx, { sourceUrl, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`  | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
 | `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key  |
 | `scanMalware(ctx, limit?)`                                                                    | action       | number of due Defender scan jobs checked                                        |
 | `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | public upload functions and internal `scanMalware` action                       |
