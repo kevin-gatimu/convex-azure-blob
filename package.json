@@ -21,9 +21,9 @@
   ],
   "type": "module",
   "scripts": {
-    "dev": "convex dev --typecheck-components --start 'npm run dev:build'",
+    "dev": "convex dev --typecheck-components --start \"npm run dev:build\"",
     "dev:frontend": "cd example && vite",
-    "dev:build": "chokidar 'tsconfig*.json' 'src/**/*.ts' 'src/**/*.tsx' -i '**/*.test.ts' -c 'npm run build:codegen' --initial",
+    "dev:build": "chokidar \"tsconfig*.json\" \"src/**/*.ts\" \"src/**/*.tsx\" -i \"**/*.test.ts\" -c \"npm run build:codegen\" --initial",
     "predev": "convex init && npm run build:codegen",
     "azurite:setup": "node scripts/azurite-setup.mjs",
     "build": "tsc --project ./tsconfig.build.json",

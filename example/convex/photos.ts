@@ -1,6 +1,7 @@
 import { AzureBlob } from "convex-azure-blob";
 import type { Auth } from "convex/server";
 import { ConvexError, v } from "convex/values";
+import { ALLOWED_CONTENT_TYPES, MAX_FILE_BYTES } from "../upload-policy";
 import { components, internal } from "./_generated/api.js";
 import {
   internalAction,
@@ -11,7 +12,9 @@ import {
 
 // One instance per container or prefix. Configuration comes from the AZURE_BLOB_* variables.
 export const azure = new AzureBlob(components.azureBlob, {
-  maxBytes: 5 * 1024 * 1024,
+  maxBytes: MAX_FILE_BYTES,
+  allowedContentTypes: ALLOWED_CONTENT_TYPES,
+  blockUploads: true,
   pathPrefix: "photos",
 });
 
@@ -30,12 +33,13 @@ const uploadApi: ReturnType<AzureBlob["clientApi"]> = azure.clientApi({
       .withIndex("by_owner", (q) => q.eq("owner", uploadedBy))
       .take(100);
     if (existing.length >= 100) {
-      throw new ConvexError("You can keep at most 100 photos");
+      throw new ConvexError("You can keep at most 100 files");
     }
   },
   onUpload: internal.photos.attach,
 });
-export const { generateUploadUrl, confirmUpload } = uploadApi;
+export const { generateUploadUrl, confirmUpload, renewUploadUrl, scanMalware } =
+  uploadApi;
 
 export const attach = internalMutation({
   args: { fileId: v.string() },
@@ -62,12 +66,18 @@ export const list = query({
       caption: v.optional(v.string()),
       fileName: v.optional(v.string()),
       size: v.optional(v.number()),
+      contentType: v.optional(v.string()),
       url: v.union(v.string(), v.null()),
       downloadUrl: v.union(v.string(), v.null()),
     }),
   ),
   handler: async (ctx) => {
-    const photos = await ctx.db.query("photos").order("desc").take(50);
+    const owner = await currentUser(ctx);
+    const photos = await ctx.db
+      .query("photos")
+      .withIndex("by_owner", (q) => q.eq("owner", owner))
+      .order("desc")
+      .take(100);
     return await Promise.all(
       photos.map(async (photo) => {
         const file = await azure.getFile(ctx, photo.fileId);
@@ -77,9 +87,10 @@ export const list = query({
           caption: photo.caption,
           fileName: file?.fileName,
           size: file?.size,
-          url: file ? await azure.urlForFile(file) : null,
+          contentType: file?.contentType,
+          url: file ? await azure.urlForFile(file, {}, ctx) : null,
           downloadUrl: file
-            ? await azure.urlForFile(file, { download: true })
+            ? await azure.urlForFile(file, { download: true }, ctx)
             : null,
         };
       }),
@@ -131,4 +142,13 @@ export const sweep = internalAction({
   args: {},
   returns: v.number(),
   handler: async (ctx) => await azure.sweep(ctx),
+});
+
+export const refreshUserDelegationKey = internalAction({
+  args: { force: v.optional(v.boolean()) },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await azure.refreshUserDelegationKey(ctx, { force: args.force });
+    return null;
+  },
 });

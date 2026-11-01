@@ -9,6 +9,7 @@
  */
 
 import type * as crons from "../crons.js";
+import type * as http from "../http.js";
 import type * as photos from "../photos.js";
 
 import type {
@@ -19,6 +20,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   crons: typeof crons;
+  http: typeof http;
   photos: typeof photos;
 }>;
 

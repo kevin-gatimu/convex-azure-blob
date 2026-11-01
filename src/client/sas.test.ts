@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { attachmentDisposition, blobStringToSign, signBlobSas } from "./sas.js";
+import {
+  attachmentDisposition,
+  blobStringToSign,
+  signBlobSas,
+  signUserDelegationSas,
+  userDelegationStringToSign,
+} from "./sas.js";
 
 // Azurite's published development account key, so the vector is not a secret.
 const KEY =
@@ -13,6 +19,28 @@ const base = {
 };
 
 describe("blob service SAS", () => {
+  it("signs snapshot resources and includes the exact snapshot timestamp", async () => {
+    const snapshot = "2026-01-01T00:00:00.0000000Z";
+    const input = {
+      ...base,
+      permissions: "r",
+      expiresOn: base.startsOn + 60_000,
+      snapshot,
+    };
+    expect(blobStringToSign(input).split("\n").slice(8, 11)).toEqual([
+      "bs",
+      snapshot,
+      "",
+    ]);
+    const params = new URLSearchParams(await signBlobSas(input));
+    expect(params.get("sr")).toBe("bs");
+    expect(params.get("snapshot")).toBe(snapshot);
+    expect(params.get("sig")).not.toBe(
+      new URLSearchParams(
+        await signBlobSas({ ...input, snapshot: undefined }),
+      ).get("sig"),
+    );
+  });
   it("builds the 2022-11-02 string-to-sign with empty optional fields", () => {
     const stringToSign = blobStringToSign({
       ...base,
@@ -56,6 +84,22 @@ describe("blob service SAS", () => {
     expect(params.get("sig")).toBe(
       "LgaxLM+aF4CyvrzHFi0EbQo1NF51IoRxL82PB8M24us=",
     );
+  });
+
+  it("signs a tag-only token for Get Blob Tags", async () => {
+    const query = await signBlobSas({
+      ...base,
+      permissions: "t",
+      expiresOn: Date.UTC(2026, 0, 1, 0, 5, 0),
+    });
+    expect(new URLSearchParams(query).get("sp")).toBe("t");
+    await expect(
+      signBlobSas({
+        ...base,
+        permissions: "tr",
+        expiresOn: Date.UTC(2026, 0, 1, 0, 5, 0),
+      }),
+    ).rejects.toThrow("Invalid SAS permissions");
   });
 
   it("rejects permissions out of Azure's order, repeated, or empty", async () => {
@@ -119,6 +163,106 @@ describe("blob service SAS", () => {
     expect(params.get("rscc")).toBe("public, max-age=60");
     expect(params.get("rscd")).toBe('attachment; filename="a.png"');
     expect(params.has("rsct")).toBe(false);
+  });
+});
+
+describe("user delegation SAS", () => {
+  const delegationKey = {
+    keyValue: "dGVzdC11c2VyLWRlbGVnYXRpb24ta2V5",
+    signedObjectId: "11111111-2222-3333-4444-555555555555",
+    signedTenantId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    signedStart: "2026-01-01T00:00:00Z",
+    signedExpiry: "2026-01-08T00:00:00Z",
+    signedService: "b",
+    signedVersion: "2022-11-02",
+  };
+  const input = {
+    accountName: "acct",
+    container: "uploads",
+    blobName: "folder/a.png",
+    permissions: "r",
+    startsOn: Date.UTC(2026, 0, 1, 0, 10, 0),
+    expiresOn: Date.UTC(2026, 0, 1, 1, 10, 0),
+    protocol: "https" as const,
+    delegationKey,
+  };
+  it("signs the snapshot timestamp and bs resource in a delegation SAS", async () => {
+    const snapshot = "2026-01-01T00:30:00.0000000Z";
+    const snapshotInput = { ...input, snapshot };
+    expect(
+      userDelegationStringToSign(snapshotInput).split("\n").slice(16, 19),
+    ).toEqual(["bs", snapshot, ""]);
+    const params = new URLSearchParams(
+      await signUserDelegationSas(snapshotInput),
+    );
+    expect(params.get("sr")).toBe("bs");
+    expect(params.get("snapshot")).toBe(snapshot);
+    expect(params.get("sig")).not.toBe(
+      new URLSearchParams(await signUserDelegationSas(input)).get("sig"),
+    );
+  });
+
+  it("uses the 2020-12-06 user delegation string-to-sign field order", () => {
+    expect(userDelegationStringToSign(input)).toBe(
+      [
+        "r",
+        "2026-01-01T00:10:00Z",
+        "2026-01-01T01:10:00Z",
+        "/blob/acct/uploads/folder/a.png",
+        delegationKey.signedObjectId,
+        delegationKey.signedTenantId,
+        delegationKey.signedStart,
+        delegationKey.signedExpiry,
+        "b",
+        "2022-11-02",
+        "",
+        "",
+        "",
+        "",
+        "https",
+        "2022-11-02",
+        "b",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  // Expected signature is an independent HMAC-SHA256 vector computed with Python hmac.
+  it("signs a user delegation token against the independent HMAC vector", async () => {
+    const query = await signUserDelegationSas(input);
+    const params = new URLSearchParams(query);
+    expect(params.get("sig")).toBe(
+      "Znw9JAshWRWsi7rPSboUhO1BXQHYoyCMvemlCoxmaCw=",
+    );
+    expect(Object.fromEntries(params)).toMatchObject({
+      sv: "2022-11-02",
+      sr: "b",
+      sp: "r",
+      st: "2026-01-01T00:10:00Z",
+      se: "2026-01-01T01:10:00Z",
+      skoid: delegationKey.signedObjectId,
+      sktid: delegationKey.signedTenantId,
+      skt: delegationKey.signedStart,
+      ske: delegationKey.signedExpiry,
+      sks: "b",
+      skv: "2022-11-02",
+      spr: "https",
+    });
+  });
+
+  it("rejects a SAS that outlives its delegation key", async () => {
+    await expect(
+      signUserDelegationSas({
+        ...input,
+        expiresOn: Date.UTC(2026, 0, 9),
+      }),
+    ).rejects.toThrow("fit within the user delegation key");
   });
 });
 

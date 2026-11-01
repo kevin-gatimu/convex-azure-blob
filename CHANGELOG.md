@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+- Add `eventGridHandler({ secret, onUpload? })` for standard-schema Azure Event
+  Grid `BlobCreated` events. It handles subscription validation, confirms
+  tracked uploads through the normal checks, and makes repeated delivery safe.
+  Transient confirmation failures return a retryable status. The README covers
+  the HTTPS route, shared-secret setup, Azure CLI subscription, and rotation.
+- Add opt-in Defender for Storage malware scanning with internal polling,
+  `scanning`/`rejected`/`scan_timed_out` statuses, and a 24-hour timeout.
+  `onUpload` runs only after a clean verdict; block uploads cannot enable this
+  gate because their mutable blob tags cannot verify the immutable snapshot.
+  Blob index tags must be enabled, and hierarchical-namespace accounts are not
+  supported. Rejected-blob cleanup persists through upload SAS expiry, and
+  scanner failures are retried independently without blocking the batch.
+- Add opt-in resumable browser block uploads via `blockUploads`, block ticket
+  metadata, owner-authorized `renewUploadUrl`, and React `pause`, `resume`, and
+  `canResume`. The default single-PUT flow and server-side `store` remain
+  unchanged. Confirmed block files use immutable snapshot reads.
+- Expand the React example to single and multi-file queues, image/document/
+  archive/audio/video uploads, progress, pause/resume, explicit connection and
+  deletion errors, and a clear explanation of the direct Azure/Convex flow. Keep
+  signature validation and document finite Azure limits and the shared demo
+  identity.
+- Fix development script quoting for Windows.
+- Add a View file action to the example that opens the verified read URL in a
+  new tab, separate from the attachment download.
+- Add Microsoft Entra client-credential authentication and user-delegation SAS
+  for accounts with shared-key access disabled. The account-key path remains
+  preferred when `AZURE_BLOB_KEY` is configured.
+- Add `refreshUserDelegationKey` for caching delegation keys, and allow
+  `urlForFile` to receive a query context so it can sign URLs without network
+  calls. See the README for role assignments, configuration, and key-revocation
+  guidance.
+- `AzureBlobConfig.authorityHost` is optional again, so existing config objects
+  still compile; Entra token requests default to
+  `https://login.microsoftonline.com`.
+- `refreshUserDelegationKey` accepts `{ force: true }` to replace a still-valid
+  cached key after revocation; the example action forwards `force`.
+- Renewing an upload never shortens the cleanup expiry tracked for an earlier
+  issued URL, and the sweep no longer lets young short-lived uploads starve
+  eligible older ones.
+- The example shows Retry for every failed upload, even when a resume cannot
+  continue.
+- Keep pre-release file records without `uploadExpiresAt` compatible with schema
+  updates; cleanup applies a conservative expiry fallback without rewriting or
+  deleting those records.
+
 ## 0.1.0
 
 First public release.
@@ -12,9 +59,8 @@ First public release.
   confirmed first. Confirmation refuses files already claimed for deletion.
 - Each file records its issued `uploadExpiresAt`, so cleanup retains tracking
   until that expiry plus clock-skew allowance even if client TTL settings
-  change. Pre-release deployments with existing rows must populate this required
-  field with the actual issued expiry, or recreate their development component
-  data, before deploying the new schema.
+  change. Legacy rows without this field use the configured upload TTL (with a
+  one-hour minimum) as a cleanup fallback.
 - Upload hooks isolate overlapping uploads, honor cancellation while waiting for
   tickets, and abort active transfers on unmount.
 - Publishing enforces clean build, tests, lint, types and a packed-consumer

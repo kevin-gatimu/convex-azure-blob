@@ -7,7 +7,7 @@
 export const SAS_VERSION = "2022-11-02";
 
 // Azure requires blob permission letters in this order.
-const PERMISSION_ORDER = "racwd";
+const PERMISSION_ORDER = "racwdt";
 
 /** Response headers a read SAS can override for whoever uses it. */
 export type SasResponseHeaders = {
@@ -25,7 +25,7 @@ export type BlobSasInput = {
   container: string;
   /** Unencoded blob name, e.g. `avatars/3f1c.png`. */
   blobName: string;
-  /** Subset of "racwd" in that order, e.g. "r" or "c". */
+  /** Subset of "racwdt" in that order, e.g. "r", "c", or "t". */
   permissions: string;
   /** Epoch milliseconds. */
   startsOn: number;
@@ -36,6 +36,22 @@ export type BlobSasInput = {
   /** One IPv4 address or an inclusive range `a.b.c.d-e.f.g.h`. */
   ipRange?: string;
   responseHeaders?: SasResponseHeaders;
+  /** Azure snapshot timestamp; signs the immutable snapshot resource. */
+  snapshot?: string;
+};
+
+export type UserDelegationKey = {
+  keyValue: string;
+  signedObjectId: string;
+  signedTenantId: string;
+  signedStart: string;
+  signedExpiry: string;
+  signedService: string;
+  signedVersion: string;
+};
+
+export type UserDelegationSasInput = Omit<BlobSasInput, "accountKey"> & {
+  delegationKey: UserDelegationKey;
 };
 
 /** ISO 8601 UTC without milliseconds, the form Azure signs. */
@@ -66,8 +82,40 @@ export function blobStringToSign(input: BlobSasInput) {
     input.ipRange ?? "",
     input.protocol ?? "",
     SAS_VERSION,
-    "b", // signedResource: blob
-    "", // signedSnapshotTime
+    input.snapshot ? "bs" : "b",
+    input.snapshot ?? "",
+    "", // signedEncryptionScope
+    headers.cacheControl ?? "",
+    headers.contentDisposition ?? "",
+    headers.contentEncoding ?? "",
+    headers.contentLanguage ?? "",
+    headers.contentType ?? "",
+  ].join("\n");
+}
+
+/** The string-to-sign for a user delegation SAS using the 2020-12-06 format. */
+export function userDelegationStringToSign(input: UserDelegationSasInput) {
+  const headers = input.responseHeaders ?? {};
+  const key = input.delegationKey;
+  return [
+    input.permissions,
+    sasTime(input.startsOn),
+    sasTime(input.expiresOn),
+    `/blob/${input.accountName}/${input.container}/${input.blobName}`,
+    key.signedObjectId,
+    key.signedTenantId,
+    key.signedStart,
+    key.signedExpiry,
+    key.signedService,
+    key.signedVersion,
+    "", // signedAuthorizedUserObjectId
+    "", // signedUnauthorizedUserObjectId
+    "", // signedCorrelationId
+    input.ipRange ?? "",
+    input.protocol ?? "",
+    SAS_VERSION,
+    input.snapshot ? "bs" : "b",
+    input.snapshot ?? "",
     "", // signedEncryptionScope
     headers.cacheControl ?? "",
     headers.contentDisposition ?? "",
@@ -117,10 +165,59 @@ export async function signBlobSas(input: BlobSasInput) {
     sv: SAS_VERSION,
     st: sasTime(input.startsOn),
     se: sasTime(input.expiresOn),
-    sr: "b",
+    sr: input.snapshot ? "bs" : "b",
     sp: input.permissions,
   });
   if (input.protocol) params.set("spr", input.protocol);
+  if (input.snapshot) params.set("snapshot", input.snapshot);
+  if (input.ipRange) params.set("sip", input.ipRange);
+  const headers = input.responseHeaders ?? {};
+  const overrides = [
+    ["rscc", headers.cacheControl],
+    ["rscd", headers.contentDisposition],
+    ["rsce", headers.contentEncoding],
+    ["rscl", headers.contentLanguage],
+    ["rsct", headers.contentType],
+  ] as const;
+  for (const [name, value] of overrides) if (value) params.set(name, value);
+  params.set("sig", signature);
+  return params.toString();
+}
+
+/** The SAS query string (without a leading "?") for one blob signed with a delegation key. */
+export async function signUserDelegationSas(input: UserDelegationSasInput) {
+  assertPermissions(input.permissions);
+  if (input.expiresOn <= input.startsOn)
+    throw new Error("SAS expiry must be after its start");
+  const keyStart = Date.parse(input.delegationKey.signedStart);
+  const keyExpiry = Date.parse(input.delegationKey.signedExpiry);
+  if (
+    !Number.isFinite(keyStart) ||
+    !Number.isFinite(keyExpiry) ||
+    input.startsOn < keyStart ||
+    input.expiresOn > keyExpiry
+  ) {
+    throw new Error("SAS validity must fit within the user delegation key");
+  }
+  const signature = await hmacSha256Base64(
+    input.delegationKey.keyValue,
+    userDelegationStringToSign(input),
+  );
+  const params = new URLSearchParams({
+    sv: SAS_VERSION,
+    st: sasTime(input.startsOn),
+    se: sasTime(input.expiresOn),
+    sr: input.snapshot ? "bs" : "b",
+    sp: input.permissions,
+    skoid: input.delegationKey.signedObjectId,
+    sktid: input.delegationKey.signedTenantId,
+    skt: input.delegationKey.signedStart,
+    ske: input.delegationKey.signedExpiry,
+    sks: input.delegationKey.signedService,
+    skv: input.delegationKey.signedVersion,
+  });
+  if (input.protocol) params.set("spr", input.protocol);
+  if (input.snapshot) params.set("snapshot", input.snapshot);
   if (input.ipRange) params.set("sip", input.ipRange);
   const headers = input.responseHeaders ?? {};
   const overrides = [
