@@ -3197,3 +3197,297 @@ describe("access tiers", () => {
     ).toHaveLength(1);
   });
 });
+
+describe("checkSetup", () => {
+  const ORIGIN = "https://app.example.com";
+  const corsOk = () =>
+    new Response(null, {
+      status: 200,
+      headers: {
+        "access-control-allow-origin": ORIGIN,
+        "access-control-allow-methods": "PUT",
+        "access-control-allow-headers": "x-ms-blob-type,content-type",
+      },
+    });
+  const azureError = (status: number, code: string) =>
+    new Response(null, { status, headers: { "x-ms-error-code": code } });
+
+  function stubSetup(probe: () => Response, cors: () => Response = corsOk) {
+    const entra = fetchMock.getMockImplementation();
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "OPTIONS") return cors();
+      if (init?.method === "HEAD") return probe();
+      return await entra!(url, init);
+    });
+  }
+  const blobNotFound = () => azureError(404, "BlobNotFound");
+  const names = (checks: { name: string }[]) => checks.map((c) => c.name);
+
+  it("passes every check with a shared key and an origin, probing with a read SAS", async () => {
+    const { t, azure } = setup();
+    stubSetup(blobNotFound);
+    const result = await t.action((ctx) =>
+      azure.checkSetup(ctx, { origin: ORIGIN }),
+    );
+    expect(result).toEqual({
+      ok: true,
+      checks: [
+        { name: "config", ok: true },
+        { name: "credentials", ok: true },
+        { name: "container", ok: true },
+        { name: "cors", ok: true },
+      ],
+    });
+    const head = fetchMock.mock.calls.find(([, i]) => i?.method === "HEAD");
+    expect(params(String(head?.[0])).get("sp")).toBe("r");
+    const preflight = fetchMock.mock.calls.find(
+      ([, i]) => i?.method === "OPTIONS",
+    );
+    expect(String(preflight?.[0])).not.toContain("?");
+    expect(preflight?.[1]?.headers).toMatchObject({
+      origin: ORIGIN,
+      "access-control-request-method": "PUT",
+      "access-control-request-headers": "x-ms-blob-type,content-type",
+    });
+  });
+
+  it("omits the cors check without an origin", async () => {
+    const { t, azure } = setup();
+    stubSetup(blobNotFound);
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(names(result.checks)).toEqual([
+      "config",
+      "credentials",
+      "container",
+    ]);
+    expect(methods()).toEqual(["HEAD"]);
+  });
+
+  it("passes with Entra and verifies the delegation key without caching it", async () => {
+    const { t, azure } = setupEntra();
+    stubSetup(blobNotFound);
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.ok).toBe(true);
+    expect(String(fetchMock.mock.calls.at(-1)?.[0])).not.toContain(
+      "userdelegationkey",
+    );
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).includes("comp=userdelegationkey"),
+      ),
+    ).toBe(true);
+    expect(
+      await t.query(azure.component.lib.getUserDelegationKey, {
+        accountName: entraConfig.accountName,
+        now: T0,
+      }),
+    ).toBeNull();
+  });
+
+  it.each([
+    ["AuthenticationFailed", ["credentials", "container"], /key.*clock/],
+    [
+      "KeyBasedAuthenticationNotPermitted",
+      ["credentials", "container"],
+      /Entra/,
+    ],
+    [
+      "AuthorizationPermissionMismatch",
+      ["container"],
+      /Storage Blob Data Contributor/,
+    ],
+    ["AuthorizationFailure", ["credentials", "container"], /key.*clock/],
+  ])("hints for %s on a shared key", async (code, failedNames, hint) => {
+    const { t, azure } = setup();
+    stubSetup(() => azureError(403, code));
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.ok).toBe(false);
+    const failed = result.checks.filter((c) => !c.ok);
+    expect(failed.map((c) => c.name)).toEqual(failedNames);
+    expect(failed[0]?.hint).toMatch(hint);
+  });
+  it("hints for a missing role on Entra at the container check", async () => {
+    const { t, azure } = setupEntra();
+    stubSetup(() => azureError(403, "AuthorizationPermissionMismatch"));
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[1]).toEqual({ name: "credentials", ok: true });
+    expect(result.checks[2]).toMatchObject({
+      name: "container",
+      ok: false,
+      hint: expect.stringContaining("Storage Blob Data Contributor"),
+    });
+  });
+
+  it("fails the container check on ContainerNotFound", async () => {
+    const { t, azure } = setup();
+    stubSetup(() => azureError(404, "ContainerNotFound"));
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[1]).toEqual({ name: "credentials", ok: true });
+    expect(result.checks[2]).toMatchObject({
+      name: "container",
+      ok: false,
+      hint: expect.stringContaining("container does not exist"),
+    });
+  });
+
+  it("fails cors when the preflight is refused or lacks PUT or a header", async () => {
+    const { t, azure } = setup();
+    const cases = [
+      () => azureError(403, "CorsPreflightFailure"),
+      () =>
+        new Response(null, {
+          headers: {
+            "access-control-allow-origin": "https://other.example.com",
+            "access-control-allow-methods": "PUT",
+            "access-control-allow-headers": "*",
+          },
+        }),
+      () =>
+        new Response(null, {
+          headers: {
+            "access-control-allow-origin": ORIGIN,
+            "access-control-allow-methods": "GET",
+            "access-control-allow-headers": "*",
+          },
+        }),
+      () =>
+        new Response(null, {
+          headers: {
+            "access-control-allow-origin": ORIGIN,
+            "access-control-allow-methods": "PUT",
+            "access-control-allow-headers": "content-type",
+          },
+        }),
+    ];
+    for (const cors of cases) {
+      stubSetup(blobNotFound, cors);
+      const result = await t.action((ctx) =>
+        azure.checkSetup(ctx, { origin: ORIGIN }),
+      );
+      expect(result.ok).toBe(false);
+      expect(result.checks.at(-1)).toMatchObject({
+        name: "cors",
+        ok: false,
+        hint: expect.stringContaining(`origin ${ORIGIN}`),
+      });
+    }
+  });
+
+  it("accepts a wildcard cors rule", async () => {
+    const { t, azure } = setup();
+    stubSetup(
+      blobNotFound,
+      () =>
+        new Response(null, {
+          headers: {
+            "access-control-allow-origin": "*",
+            "access-control-allow-methods": "PUT",
+            "access-control-allow-headers": "*",
+          },
+        }),
+    );
+    const result = await t.action((ctx) =>
+      azure.checkSetup(ctx, { origin: ORIGIN }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("names the missing environment variables and skips the rest", async () => {
+    const { t, azure } = setup({
+      config: { ...config, accountName: "", container: "", endpoint: "" },
+    });
+    const result = await t.action((ctx) =>
+      azure.checkSetup(ctx, { origin: ORIGIN }),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.checks).toEqual([
+      {
+        name: "config",
+        ok: false,
+        hint: expect.stringContaining("AZURE_BLOB_ACCOUNT"),
+      },
+      { name: "credentials", ok: false, hint: "skipped: config failed" },
+      { name: "container", ok: false, hint: "skipped: config failed" },
+      { name: "cors", ok: false, hint: "skipped: config failed" },
+    ]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("skips the container check when credentials fail", async () => {
+    const { t, azure } = setup();
+    stubSetup(() => azureError(403, "AuthenticationFailed"));
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[2]).toEqual({
+      name: "container",
+      ok: false,
+      hint: "skipped: credentials failed",
+    });
+  });
+
+  it("reports an Entra token failure and skips the container", async () => {
+    const { t, azure } = setupEntra();
+    const entra = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("/oauth2/v2.0/token"))
+        return new Response("nope", { status: 401 });
+      return await entra(url, init);
+    });
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[1]).toMatchObject({
+      name: "credentials",
+      ok: false,
+      hint: expect.stringContaining("token"),
+    });
+    expect(result.checks[2]?.hint).toBe("skipped: credentials failed");
+  });
+
+  it("maps a delegation key permission error to a role hint", async () => {
+    const { t, azure } = setupEntra();
+    const entra = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("comp=userdelegationkey"))
+        return new Response("<Error><Message>denied</Message></Error>", {
+          status: 403,
+          headers: { "x-ms-error-code": "AuthorizationPermissionMismatch" },
+        });
+      return await entra(url, init);
+    });
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[1]).toMatchObject({
+      name: "credentials",
+      ok: false,
+      hint: expect.stringContaining("Storage Blob Delegator"),
+    });
+  });
+
+  it("reports an unreachable endpoint without throwing", async () => {
+    const { t, azure } = setup();
+    fetchMock.mockRejectedValue(new TypeError("fetch failed"));
+    const result = await t.action((ctx) =>
+      azure.checkSetup(ctx, { origin: ORIGIN }),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.checks.slice(1).every((c) => !c.ok)).toBe(true);
+    expect(result.checks[1]?.hint).toContain("unreachable");
+    expect(result.checks[3]?.hint).toContain("unreachable");
+  });
+
+  it("never includes the key, a SAS, a token or a URL in the result", async () => {
+    const secrets = [config.accountKey, "access-token", "client-secret"];
+    for (const state of [setup(), setupEntra()]) {
+      for (const probe of [
+        blobNotFound,
+        () => azureError(403, "AuthenticationFailed"),
+        () => azureError(404, "ContainerNotFound"),
+      ]) {
+        stubSetup(probe, () => azureError(403, "CorsPreflightFailure"));
+        const { checks } = await state.t.action((ctx) =>
+          state.azure.checkSetup(ctx, { origin: ORIGIN }),
+        );
+        const text = JSON.stringify(checks).replaceAll(ORIGIN, "");
+        for (const secret of secrets) expect(text).not.toContain(secret);
+        expect(text).not.toMatch(/https?:\/\/|sig=|sv=|se=|\?/);
+      }
+    }
+  });
+});

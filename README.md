@@ -90,6 +90,9 @@ Found a bug or want a feature?
    Preserve any existing CORS rules for other applications.
 
 For local development, use [Azurite](#local-development-with-azurite) instead.
+Once the variables are set, [check your setup](#checking-your-setup) to catch a
+wrong key, a missing role, a missing container, or a CORS rule that blocks
+uploads.
 
 ### A Convex app
 
@@ -961,6 +964,34 @@ export const documents = new AzureBlob(components.azureBlob, {
 - **Authorization is yours.** `uploadedBy` is an opaque string. The component
   does not check it, except that `clientApi` only lets the uploader confirm.
 
+## Checking your setup
+
+`checkSetup` verifies the configuration from an action and reports one entry per
+check, each with a fix hint when it fails:
+
+```ts
+export const checkSetup = internalAction({
+  args: { origin: v.optional(v.string()) },
+  handler: async (ctx, args) => await azure.checkSetup(ctx, args),
+});
+```
+
+Run it from the Convex dashboard, or
+`npx convex run photos:checkSetup '{"origin":"http://localhost:5173"}'` in the
+example app.
+
+| Check         | Passes when                                                                                                    |
+| ------------- | -------------------------------------------------------------------------------------------------------------- |
+| `config`      | the required environment variables resolve (the hint names the missing ones)                                   |
+| `credentials` | Azure accepts a signed request (shared key), or a Microsoft Entra token and a user delegation key are obtained |
+| `container`   | a read probe for a random blob name answers `BlobNotFound`, so the container exists and the identity can read  |
+| `cors`        | with `origin`, a `PUT` preflight for the upload headers is allowed on the endpoint browsers use                |
+
+A check is skipped, with the hint `skipped: <check> failed`, when an earlier one
+it depends on fails. The Entra check only verifies that a delegation key can be
+requested; it does not cache it, so run `refreshUserDelegationKey` separately.
+The result never contains the key, a SAS, a token, or a URL.
+
 ## Local development with Azurite
 
 [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite)
@@ -1035,29 +1066,30 @@ complete test with Azure stubbed.
 The `ctx` type each method needs is the smallest that works, so you can call
 query methods from mutations and actions too.
 
-| Method                                                                                        | Call from    | Returns                                                                         |
-| --------------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------- |
-| `generateUploadUrl(ctx, { contentType, uploadedBy, maxBytes?, size?, fileName?, metadata? })` | mutation     | `{ fileId, uploadUrl, headers }`                                                |
-| `renewUploadUrl(ctx, { fileId, uploadedBy })`                                                 | mutation     | Same pending upload ticket with a renewed expiry; authorize the uploader first. |
-| `confirmUpload(ctx, fileId, onUpload?)`                                                       | action       | `{ ok: true, size, contentType }` or `{ ok: false, reason }`                    |
-| `getFile(ctx, fileId)`                                                                        | query        | `FileDoc` or `null`                                                             |
-| `read(ctx, fileId, { range?: { start, end? } }?)`                                             | action       | `Response` (200, or 206 with `range`), or `null` unless the file is `ready`     |
-| `getUrl(ctx, fileId, { download?, cacheControl? })`                                           | query        | URL or `null`                                                                   |
-| `urlForFile(file, { download?, cacheControl? }, ctx?)`                                        | anywhere     | URL or `null`                                                                   |
-| `list(ctx, { uploadedBy?, paginationOpts })`                                                  | query        | `PaginationResult<FileDoc>`                                                     |
-| `updateFile(ctx, fileId, { fileName?, metadata? })`                                           | mutation     | `boolean`                                                                       |
-| `setTier(ctx, fileId, tier)`                                                                  | action       | `boolean`                                                                       |
-| `rehydrate(ctx, fileId, { tier, priority? })`                                                 | action       | `boolean`                                                                       |
-| `refreshTier(ctx, fileId)`                                                                    | action       | `boolean`                                                                       |
-| `markForDeletion(ctx, fileId)`                                                                | mutation     | `boolean`                                                                       |
-| `purge(ctx, fileId)` / `delete(ctx, fileId)`                                                  | action       | `boolean`                                                                       |
-| `sweep(ctx, { pendingOlderThanMs?, limit?, concurrency?, continueWith?, run?, maxRuns? })`    | action       | number of blobs removed                                                         |
-| `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
-| `storeFromUrl(ctx, { sourceUrl, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`  | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
-| `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key  |
-| `scanMalware(ctx, limit?)`                                                                    | action       | number of due Defender scan jobs checked                                        |
-| `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | public upload functions and internal `scanMalware` action                       |
-| `eventGridHandler({ secret, onUpload? })`                                                     | module scope | HTTP action for standard-schema Event Grid BlobCreated events                   |
+| Method                                                                                        | Call from    | Returns                                                                                  |
+| --------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------- |
+| `generateUploadUrl(ctx, { contentType, uploadedBy, maxBytes?, size?, fileName?, metadata? })` | mutation     | `{ fileId, uploadUrl, headers }`                                                         |
+| `renewUploadUrl(ctx, { fileId, uploadedBy })`                                                 | mutation     | Same pending upload ticket with a renewed expiry; authorize the uploader first.          |
+| `confirmUpload(ctx, fileId, onUpload?)`                                                       | action       | `{ ok: true, size, contentType }` or `{ ok: false, reason }`                             |
+| `getFile(ctx, fileId)`                                                                        | query        | `FileDoc` or `null`                                                                      |
+| `read(ctx, fileId, { range?: { start, end? } }?)`                                             | action       | `Response` (200, or 206 with `range`), or `null` unless the file is `ready`              |
+| `getUrl(ctx, fileId, { download?, cacheControl? })`                                           | query        | URL or `null`                                                                            |
+| `urlForFile(file, { download?, cacheControl? }, ctx?)`                                        | anywhere     | URL or `null`                                                                            |
+| `list(ctx, { uploadedBy?, paginationOpts })`                                                  | query        | `PaginationResult<FileDoc>`                                                              |
+| `updateFile(ctx, fileId, { fileName?, metadata? })`                                           | mutation     | `boolean`                                                                                |
+| `setTier(ctx, fileId, tier)`                                                                  | action       | `boolean`                                                                                |
+| `rehydrate(ctx, fileId, { tier, priority? })`                                                 | action       | `boolean`                                                                                |
+| `refreshTier(ctx, fileId)`                                                                    | action       | `boolean`                                                                                |
+| `markForDeletion(ctx, fileId)`                                                                | mutation     | `boolean`                                                                                |
+| `purge(ctx, fileId)` / `delete(ctx, fileId)`                                                  | action       | `boolean`                                                                                |
+| `sweep(ctx, { pendingOlderThanMs?, limit?, concurrency?, continueWith?, run?, maxRuns? })`    | action       | number of blobs removed                                                                  |
+| `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                                        |
+| `storeFromUrl(ctx, { sourceUrl, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`  | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                                        |
+| `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key           |
+| `checkSetup(ctx, { origin? }?)`                                                               | action       | `{ ok, checks: [{ name, ok, hint? }] }`; see [Checking your setup](#checking-your-setup) |
+| `scanMalware(ctx, limit?)`                                                                    | action       | number of due Defender scan jobs checked                                                 |
+| `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | public upload functions and internal `scanMalware` action                                |
+| `eventGridHandler({ secret, onUpload? })`                                                     | module scope | HTTP action for standard-schema Event Grid BlobCreated events                            |
 
 ### `convex-azure-blob/react`
 

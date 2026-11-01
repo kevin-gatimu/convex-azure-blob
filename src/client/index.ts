@@ -34,6 +34,15 @@ import {
 import type { SasResponseHeaders } from "./sas.js";
 import type { UserDelegationKey } from "./sas.js";
 import { SNIFF_BYTES, sniffContentType } from "./sniff.js";
+import {
+  corsFailure,
+  hintForError,
+  hintForMessage,
+  NETWORK_HINT,
+  UPLOAD_HEADERS,
+} from "./setup.js";
+import type { SetupCheck, SetupResult } from "./setup.js";
+export type { SetupCheck, SetupResult } from "./setup.js";
 
 export { resolveConfig } from "./config.js";
 export type { AzureBlobConfig } from "./config.js";
@@ -591,6 +600,165 @@ export class AzureBlob {
       accountName: config.accountName,
       ...key,
     });
+  }
+
+  /**
+   * Diagnoses the setup without changing anything: config, credentials, the container and,
+   * when `origin` is given, the browser CORS preflight. Hints never contain secrets or URLs.
+   *
+   * ```ts
+   * const { ok, checks } = await azure.checkSetup(ctx, { origin: "https://app.example.com" });
+   * ```
+   */
+  async checkSetup(
+    _ctx: RunActionCtx,
+    options: { origin?: string } = {},
+  ): Promise<SetupResult> {
+    const checks: SetupCheck[] = [];
+    const skipped = (name: string, prerequisite: string) =>
+      checks.push({
+        name,
+        ok: false,
+        hint: `skipped: ${prerequisite} failed`,
+      });
+
+    let config: AzureBlobConfig;
+    try {
+      config = this.config();
+      checks.push({ name: "config", ok: true });
+    } catch (error) {
+      checks.push({
+        name: "config",
+        ok: false,
+        hint: error instanceof Error ? error.message : "Invalid configuration",
+      });
+      skipped("credentials", "config");
+      skipped("container", "config");
+      if (options.origin !== undefined) skipped("cors", "config");
+      return { ok: false, checks };
+    }
+
+    // Entra only verifies the delegation key: a diagnostic must not write the cache.
+    let accessToken: string | undefined;
+    let credentials: SetupCheck = { name: "credentials", ok: true };
+    if (!config.accountKey) {
+      try {
+        accessToken = await getAccessToken(config);
+      } catch (error) {
+        credentials = {
+          name: "credentials",
+          ok: false,
+          hint: `Could not get a Microsoft Entra token: ${error instanceof Error ? error.message : "unknown error"}`,
+        };
+      }
+      if (accessToken) {
+        try {
+          await requestUserDelegationKey(config, this.now());
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          credentials = {
+            name: "credentials",
+            ok: false,
+            hint: /fetch failed|network/i.test(message)
+              ? NETWORK_HINT
+              : hintForMessage(
+                  message,
+                  "Azure refused the user delegation key request: assign Storage Blob Delegator to the identity",
+                ),
+          };
+        }
+      }
+    }
+
+    let probe: Response | undefined;
+    if (credentials.ok) {
+      try {
+        const request = await this.serverRequest(
+          config,
+          config.container,
+          `setup-check-${crypto.randomUUID()}`,
+          "r",
+          this.now() + 60_000,
+          accessToken,
+        );
+        probe = await fetch(request.url, {
+          method: "HEAD",
+          headers: { ...request.headers, "x-ms-version": SAS_VERSION },
+        });
+      } catch {
+        if (config.accountKey) {
+          credentials = {
+            name: "credentials",
+            ok: false,
+            hint: NETWORK_HINT,
+          };
+        }
+      }
+    }
+    const probeCode = probe?.headers.get("x-ms-error-code") ?? null;
+    const isAuthError =
+      probeCode === "AuthenticationFailed" ||
+      probeCode === "KeyBasedAuthenticationNotPermitted" ||
+      probeCode === "AuthorizationFailure";
+    if (config.accountKey && probe && isAuthError) {
+      credentials = {
+        name: "credentials",
+        ok: false,
+        // Azure answers a SAS with a bad signature as AuthorizationFailure.
+        hint: hintForError(
+          probeCode === "AuthorizationFailure"
+            ? "AuthenticationFailed"
+            : probeCode,
+          probe.status,
+        ),
+      };
+    }
+    checks.push(credentials);
+
+    if (!credentials.ok) {
+      skipped("container", "credentials");
+    } else if (!probe) {
+      checks.push({ name: "container", ok: false, hint: NETWORK_HINT });
+    } else if (probe.status === 404 && probeCode === "BlobNotFound") {
+      checks.push({ name: "container", ok: true });
+    } else {
+      checks.push({
+        name: "container",
+        ok: false,
+        hint: hintForError(probeCode, probe.status),
+      });
+    }
+
+    if (options.origin !== undefined) {
+      const origin = options.origin;
+      let hint: string | null;
+      try {
+        const response = await fetch(
+          this.blobUrl(
+            config.endpoint,
+            config.container,
+            `setup-check-${crypto.randomUUID()}`,
+          ),
+          {
+            method: "OPTIONS",
+            headers: {
+              origin,
+              "access-control-request-method": "PUT",
+              "access-control-request-headers": UPLOAD_HEADERS.join(","),
+            },
+          },
+        );
+        hint = corsFailure(response, origin);
+      } catch {
+        hint = NETWORK_HINT;
+      }
+      checks.push(
+        hint === null
+          ? { name: "cors", ok: true }
+          : { name: "cors", ok: false, hint },
+      );
+    }
+    return { ok: checks.every((check) => check.ok), checks };
   }
 
   private async reserve(
