@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `AzureBlob.read(ctx, fileId, { range? })` to read a ready file's bytes
+  from an action, optionally an inclusive byte range (206). It returns null for
+  an unknown or not-ready file, and throws without exposing the URL or SAS when
+  Azure answers with an error.
+
 - Add `eventGridHandler({ secret, onUpload? })` for standard-schema Azure Event
   Grid `BlobCreated` events. It handles subscription validation, confirms
   tracked uploads through the normal checks, and makes repeated delivery safe.

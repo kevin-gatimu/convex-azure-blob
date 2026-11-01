@@ -252,6 +252,105 @@ describe("constructor", () => {
   });
 });
 
+describe("read", () => {
+  const readText = (
+    state: ReturnType<typeof setup>,
+    fileId: string,
+    options?: { range?: { start: number; end?: number } },
+  ) =>
+    state.t.action(async (ctx) => {
+      const response = await state.azure.read(ctx, fileId, options);
+      return response
+        ? {
+            status: response.status,
+            bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+          }
+        : null;
+    });
+
+  it("returns the bytes of a ready file with a read-only SAS", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    fetchMock.mockImplementation(
+      async () => new Response(PNG, { status: 200 }),
+    );
+    expect(await readText(state, fileId)).toEqual({
+      status: 200,
+      bytes: Array.from(PNG),
+    });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(params(String(url)).get("sp")).toBe("r");
+    expect(init?.method).toBe("GET");
+    expect(init?.headers).not.toHaveProperty("x-ms-range");
+  });
+
+  it("returns null for a file that is not ready without calling Azure", async () => {
+    const state = setup();
+    const pending = await state.reserve();
+    const deleting = await state.upload();
+    await state.t.action((ctx) => state.azure.markForDeletion(ctx, deleting));
+    fetchMock.mockClear();
+    expect(await readText(state, pending)).toBeNull();
+    expect(await readText(state, deleting)).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns null for an unknown file id without calling Azure", async () => {
+    const state = setup();
+    fetchMock.mockClear();
+    expect(await readText(state, "unknown")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends an inclusive x-ms-range and returns the 206 response", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    fetchMock.mockImplementation(
+      async () => new Response(PNG.slice(2, 5), { status: 206 }),
+    );
+    expect(
+      await readText(state, fileId, { range: { start: 2, end: 4 } }),
+    ).toEqual({ status: 206, bytes: Array.from(PNG.slice(2, 5)) });
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      "x-ms-range": "bytes=2-4",
+    });
+    await readText(state, fileId, { range: { start: 7 } });
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      "x-ms-range": "bytes=7-",
+    });
+  });
+
+  it("rejects an invalid range before calling Azure", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    for (const range of [
+      { start: -1 },
+      { start: 1.5 },
+      { start: Number.NaN },
+      { start: 5, end: 4 },
+      { start: 0, end: 2.5 },
+    ]) {
+      await expect(readText(state, fileId, { range })).rejects.toThrow();
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("throws on a non-2xx response with the status but not the URL or SAS", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    const body = new Response("denied", { status: 403 });
+    const cancel = vi.spyOn(body.body!, "cancel");
+    fetchMock.mockImplementation(async () => body);
+    const error = await readText(state, fileId).catch((e: unknown) => e);
+    const message = String((error as Error).message);
+    expect(message).toContain("403");
+    expect(message).not.toContain("http");
+    expect(message).not.toContain("sig=");
+    expect(message).not.toContain("devstoreaccount1");
+    expect(cancel).toHaveBeenCalled();
+  });
+});
+
 describe("generateUploadUrl", () => {
   it("returns a create-only URL for one server-named blob with a short expiry", async () => {
     const { t, azure, file } = setup();
