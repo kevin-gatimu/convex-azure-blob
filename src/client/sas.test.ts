@@ -86,6 +86,22 @@ describe("blob service SAS", () => {
     );
   });
 
+  it("signs a tag-only token for Get Blob Tags", async () => {
+    const query = await signBlobSas({
+      ...base,
+      permissions: "t",
+      expiresOn: Date.UTC(2026, 0, 1, 0, 5, 0),
+    });
+    expect(new URLSearchParams(query).get("sp")).toBe("t");
+    await expect(
+      signBlobSas({
+        ...base,
+        permissions: "tr",
+        expiresOn: Date.UTC(2026, 0, 1, 0, 5, 0),
+      }),
+    ).rejects.toThrow("Invalid SAS permissions");
+  });
+
   it("rejects permissions out of Azure's order, repeated, or empty", async () => {
     const input = { ...base, expiresOn: base.startsOn + 1000 };
     await expect(

@@ -11,5 +11,11 @@ crons.interval(
   internal.photos.refreshUserDelegationKey,
   {},
 );
+crons.interval(
+  "check Azure Blob malware scan results",
+  { minutes: 1 },
+  internal.photos.scanMalware,
+  {},
+);
 
 export default crons;

@@ -200,6 +200,21 @@ function stubBlob(blob: Blob, deleteStatus = 202) {
   });
 }
 
+function stubScanResult(result?: string, key = "Malware scanning scan result") {
+  const blobFetch = fetchMock.getMockImplementation()!;
+  fetchMock.mockImplementation(async (url, init) => {
+    const parsed = new URL(String(url));
+    if (init?.method === "GET" && parsed.searchParams.get("comp") === "tags") {
+      const tags =
+        result === undefined
+          ? ""
+          : `<Tag><Key>${key}</Key><Value>${result}</Value></Tag>`;
+      return new Response(`<Tags><TagSet>${tags}</TagSet></Tags>`);
+    }
+    return await blobFetch(url, init);
+  });
+}
+
 const methods = () =>
   fetchMock.mock.calls.map(([, init]) => init?.method ?? "GET");
 const params = (url: string | null | undefined) =>
@@ -224,6 +239,16 @@ describe("constructor", () => {
     expect(
       () => new AzureBlob(component, { pathPrefix: "users/avatars" }),
     ).not.toThrow();
+  });
+
+  it("refuses malware gating with overwrite-capable block upload tickets", () => {
+    expect(
+      () =>
+        new AzureBlob({} as never, {
+          blockUploads: true,
+          requireMalwareScan: true,
+        }),
+    ).toThrow("cannot be combined with blockUploads");
   });
 });
 
@@ -527,6 +552,89 @@ describe("confirmUpload", () => {
       ok: false,
       reason: "Unknown upload",
     });
+  });
+});
+
+describe("malware scan gate", () => {
+  it("keeps a confirmed file unservable until the scan result is clean", async () => {
+    const { t, azure, reserve, file } = setup({ requireMalwareScan: true });
+    const fileId = await reserve();
+    stubBlob({});
+    expect(await t.action((ctx) => azure.confirmUpload(ctx, fileId))).toEqual({
+      ok: true,
+      size: 1000,
+      contentType: "image/png",
+    });
+    expect((await file(fileId))?.status).toBe("scanning");
+    expect(await t.action((ctx) => azure.getUrl(ctx, fileId))).toBeNull();
+
+    stubScanResult("No threats found", "Scan result");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    const [tagUrl, tagRequest] = fetchMock.mock.calls.at(-1)!;
+    expect(new URL(String(tagUrl)).searchParams.get("comp")).toBe("tags");
+    expect(new URL(String(tagUrl)).searchParams.get("sp")).toBe("t");
+    expect(tagRequest?.method).toBe("GET");
+    expect((await file(fileId))?.status).toBe("ready");
+    expect(await t.action((ctx) => azure.getUrl(ctx, fileId))).toContain(
+      "sp=r",
+    );
+  });
+
+  it("deletes a malicious blob but retains an unservable rejected row", async () => {
+    const { t, azure, reserve, file } = setup({ requireMalwareScan: true });
+    const fileId = await reserve();
+    stubBlob({});
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    stubScanResult("Malicious");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect(methods().slice(-2)).toEqual(["GET", "DELETE"]);
+    expect((await file(fileId))?.status).toBe("rejected");
+    expect(await t.action((ctx) => azure.getUrl(ctx, fileId))).toBeNull();
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, fileId)),
+    ).toMatchObject({
+      ok: false,
+      reason: "Malware scan detected a threat",
+    });
+  });
+
+  it("retries malicious-blob deletion failures without serving the file", async () => {
+    const { t, azure, reserve, file } = setup({ requireMalwareScan: true });
+    const fileId = await reserve();
+    stubBlob({}, 500);
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    stubScanResult("Malicious");
+    await expect(t.action((ctx) => azure.scanMalware(ctx))).rejects.toThrow(
+      "malware rejection delete failed with 500",
+    );
+    expect((await file(fileId))?.status).toBe("scanning");
+    expect(await t.action((ctx) => azure.getUrl(ctx, fileId))).toBeNull();
+
+    stubBlob({});
+    stubScanResult("Malicious");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect((await file(fileId))?.status).toBe("rejected");
+  });
+
+  it("times out unresolved scan results after 24 hours", async () => {
+    const { t, azure, reserve, file, advance } = setup({
+      requireMalwareScan: true,
+    });
+    const fileId = await reserve();
+    stubBlob({});
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    stubScanResult();
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect((await file(fileId))?.status).toBe("scanning");
+
+    advance(15_000);
+    stubScanResult("Error");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect((await file(fileId))?.status).toBe("scanning");
+    advance(DAY);
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect((await file(fileId))?.status).toBe("scan_timed_out");
+    expect(await t.action((ctx) => azure.getUrl(ctx, fileId))).toBeNull();
   });
 });
 
@@ -1627,6 +1735,19 @@ describe("clientApi", () => {
       onUpload: internal.callbacks.attach,
     }),
   });
+  const gatedAzure = new AzureBlob(app.components.azureBlob, {
+    config,
+    now: () => T0,
+    requireMalwareScan: true,
+  });
+  const { api: gatedApi, createTest: createGatedTest } = app.defineModules({
+    callbacks,
+    gatedFiles: gatedAzure.clientApi({
+      identify: async (ctx) =>
+        (await ctx.auth.getUserIdentity())?.subject ?? null,
+      onUpload: internal.callbacks.attach,
+    }),
+  });
 
   beforeEach(() => onUpload.mockReset());
 
@@ -1701,6 +1822,29 @@ describe("clientApi", () => {
       fileId: ticket.fileId,
       uploadedBy: "user1",
       fileName: "cat.png",
+      status: "ready",
+    });
+  });
+
+  it("runs onUpload only after the malware scan reports clean", async () => {
+    const t = createGatedTest().withIdentity({ subject: "user1" });
+    const ticket = await t.mutation(gatedApi.gatedFiles.generateUploadUrl, {
+      contentType: "image/png",
+    });
+    stubBlob({});
+    expect(
+      await t.action(gatedApi.gatedFiles.confirmUpload, {
+        fileId: ticket.fileId,
+      }),
+    ).toMatchObject({ ok: true });
+    expect(onUpload).not.toHaveBeenCalled();
+
+    stubScanResult("No threats found");
+    expect(await t.action((ctx) => gatedAzure.scanMalware(ctx))).toBe(1);
+    expect(onUpload).toHaveBeenCalledTimes(1);
+    expect(onUpload.mock.calls[0]?.[1]).toMatchObject({
+      fileId: ticket.fileId,
+      uploadedBy: "user1",
       status: "ready",
     });
   });

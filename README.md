@@ -416,6 +416,63 @@ SDK and expose a compatible `renewUploadUrl({ fileId })` mutation for the hook.
 `store` remains a single-PUT server-side upload; block mode is for browser
 upload sessions.
 
+### Defender for Storage malware scan gate
+
+For single-PUT uploads, opt in to keeping confirmed files private until Defender
+for Storage reports a clean scan:
+
+```ts
+export const azure = new AzureBlob(components.azureBlob, {
+  requireMalwareScan: true,
+});
+const uploadApi: ReturnType<AzureBlob["clientApi"]> = azure.clientApi({
+  identify: async (ctx) =>
+    (await ctx.auth.getUserIdentity())?.tokenIdentifier ?? null,
+});
+export const { generateUploadUrl, confirmUpload, scanMalware } = uploadApi;
+```
+
+`scanMalware` is an internal action. Schedule it from a Convex cron so pending
+scan jobs are polled:
+
+```ts
+crons.interval(
+  "check malware scan results",
+  { minutes: 1 },
+  internal.files.scanMalware,
+  {},
+);
+```
+
+Enable Defender for Storage **on-upload malware scanning** for the storage
+account and leave scan-result blob index tags enabled. Blob index tags aren't
+supported on accounts with hierarchical namespace enabled. The scanner reads the
+`Malware scanning scan result` tag (also accepts `Scan result`) using
+`Get Blob Tags`. `No threats found` is clean; `Malicious` deletes the blob and
+retains a `rejected` file row. Other outcomes, including `Not scanned` and
+errors, remain unservable and eventually time out. For account-key SAS this
+requires the `t` permission; in Entra mode, the identity needs the
+`Microsoft.Storage/storageAccounts/blobServices/containers/blobs/tags/read` data
+action. Files stay in `scanning` until a clean verdict or become
+`scan_timed_out` after 24 hours without a definitive result. `getUrl` only
+serves `ready` files, and `onUpload` runs only after a clean scan. Apps can read
+`getFile` to display the scanning, rejected, or timed-out state.
+
+Scanning is asynchronous: actual latency varies with file size, type and service
+load. Defender for Storage bills per GB scanned; configure its monthly scanning
+cap to control cost. If the cap is reached or tags are unavailable, the file
+remains unservable and eventually times out. The package polls in bounded
+batches with backoff; the cron interval controls how quickly new results are
+observed.
+
+Blob index tags are not tamper-resistant. Principals allowed to modify tags can
+alter the verdict, so do not treat tag polling as the sole security control for
+high-assurance workflows; use Defender's Event Grid events or alerts as
+appropriate. The option cannot be combined with `blockUploads`: the block upload
+SAS can change the mutable base blob after confirmation, while the library
+serves an immutable snapshot, and Defender's tag does not prove that snapshot
+was scanned.
+
 ### Writing your own upload functions
 
 `clientApi` is a shortcut. When the upload belongs to something in your schema
@@ -682,10 +739,12 @@ export const documents = new AzureBlob(components.azureBlob, {
   from the stored blob, against what was reserved, before `getUrl` returns
   anything. A SAS cannot cap the upload size, so an oversized blob exists until
   confirm (or the sweep) deletes it.
-- **Not checked:** what the bytes depict, and malware. If you accept arbitrary
-  documents, add scanning (for example
-  [Defender for Storage](https://learn.microsoft.com/azure/defender-for-cloud/defender-for-storage-introduction)).
-  SVG is not in the default allow-list, because it can carry script.
+- **Malware scanning is opt-in.** Use `requireMalwareScan` with Defender for
+  Storage to keep confirmed files unservable until a clean scan result arrives.
+  Without it, files are not checked for malware. See
+  [Defender for Storage](https://learn.microsoft.com/azure/defender-for-cloud/defender-for-storage-introduction)
+  and the scan-gate section above. SVG is not in the default allow-list, because
+  it can carry script.
 - **Signing secrets stay server-side.** The account key is read from deployment
   environment variables and is never stored in component tables, passed as a
   function argument, returned or logged. In Entra mode, client credentials stay
@@ -760,6 +819,7 @@ complete test with Azure stubbed.
 | `allowedContentTypes` | JPEG/PNG/WebP/GIF/AVIF          | Content type → blob-name extension.                                                                                                       |
 | `maxBytes`            | 10 MiB                          | Size ceiling. Callers can ask for less, never more.                                                                                       |
 | `blockUploads`        | `false`                         | Opt into resumable browser block uploads; requires `size` and a renewal mutation.                                                         |
+| `requireMalwareScan`  | `false`                         | Poll Defender scan tags before serving; requires the `clientApi` scan action cron and cannot be combined with `blockUploads`.             |
 | `pathPrefix`          | none                            | Virtual folder for new blobs, e.g. `"users/avatars"`.                                                                                     |
 | `uploadTtlSeconds`    | 300                             | Lifetime of upload URLs.                                                                                                                  |
 | `readWindowSeconds`   | 3600                            | Signing window for read URLs. Each URL is valid for one to two windows.                                                                   |
@@ -786,7 +846,8 @@ query methods from mutations and actions too.
 | `sweep(ctx, { pendingOlderThanMs?, limit? })`                                                 | action       | number of blobs removed                                                         |
 | `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
 | `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key  |
-| `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | `{ generateUploadUrl, renewUploadUrl, confirmUpload }` public functions         |
+| `scanMalware(ctx, limit?)`                                                                    | action       | number of due Defender scan jobs checked                                        |
+| `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | public upload functions and internal `scanMalware` action                       |
 
 ### `convex-azure-blob/react`
 

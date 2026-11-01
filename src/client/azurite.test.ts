@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import componentTest, { register } from "../test.js";
 import { AzureBlob } from "./index.js";
 import { blockId } from "./blocks.js";
+import { signBlobSas } from "./sas.js";
 
 const endpoint = process.env.AZURITE_BLOB_ENDPOINT;
 const config = {
@@ -106,6 +107,65 @@ describe.skipIf(!endpoint)("against Azurite", () => {
     expect((await fetch(url!, { method: "DELETE" })).status).toBe(403);
     expect(await t.action((ctx) => azure.purge(ctx, ticket.fileId))).toBe(true);
     expect((await fetch(url!)).status).toBe(404);
+  });
+
+  it("uses a tag-only SAS to gate reads on Defender's clean result", async () => {
+    const t = convexTest(defineSchema({}), componentTest.modules);
+    const azure = new AzureBlob(register(t), {
+      config,
+      requireMalwareScan: true,
+    });
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(
+      (
+        await fetch(ticket.uploadUrl, {
+          method: "PUT",
+          headers: ticket.headers,
+          body: PNG,
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+    ).toMatchObject({ ok: true });
+    expect(
+      await t.action((ctx) => azure.getUrl(ctx, ticket.fileId)),
+    ).toBeNull();
+
+    const now = Date.now();
+    const tagSas = await signBlobSas({
+      accountName: config.accountName,
+      accountKey: config.accountKey,
+      container: config.container,
+      blobName: new URL(ticket.uploadUrl).pathname.split("/").at(-1)!,
+      permissions: "t",
+      startsOn: now - 60_000,
+      expiresOn: now + 5 * 60_000,
+    });
+    const tagsUrl = new URL(ticket.uploadUrl);
+    tagsUrl.search = `comp=tags&${tagSas}`;
+    expect(
+      (
+        await fetch(tagsUrl, {
+          method: "PUT",
+          headers: {
+            "x-ms-version": "2022-11-02",
+            "content-type": "application/xml",
+          },
+          body: "<Tags><TagSet><Tag><Key>Scan result</Key><Value>No threats found</Value></Tag></TagSet></Tags>",
+        })
+      ).status,
+    ).toBe(204);
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect(
+      await t.action((ctx) => azure.getUrl(ctx, ticket.fileId)),
+    ).not.toBeNull();
+    expect(await t.action((ctx) => azure.purge(ctx, ticket.fileId))).toBe(true);
   });
   it("uploads with a create-only URL that cannot overwrite, then serves and downloads", async () => {
     const { t, azure } = setup();

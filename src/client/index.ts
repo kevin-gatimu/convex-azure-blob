@@ -1,6 +1,7 @@
 import {
   actionGeneric,
   createFunctionHandle,
+  internalActionGeneric,
   mutationGeneric,
 } from "convex/server";
 import type {
@@ -90,6 +91,8 @@ export type AzureBlobOptions = {
   maxBytes?: number;
   /** Stage sliced blocks and confirm an immutable snapshot. Default false. */
   blockUploads?: boolean;
+  /** Keep confirmed files unservable until Defender for Storage reports a clean scan. */
+  requireMalwareScan?: boolean;
   /** Virtual folder for new blobs, e.g. `"avatars"` gives `avatars/<uuid>.png`. */
   pathPrefix?: string;
   /** How long an upload URL stays valid. Default 300. */
@@ -149,6 +152,9 @@ export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_PENDING_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_UPLOAD_TTL_SECONDS = 5 * 60;
 const DEFAULT_READ_WINDOW_SECONDS = 60 * 60;
+const DEFAULT_MALWARE_SCAN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const MALWARE_SCAN_BACKOFF_MS = [15_000, 60_000, 5 * 60_000, 15 * 60_000];
+const MAX_MALWARE_SCAN_BATCH = 50;
 // Start times are backdated so a client whose clock runs slow is not refused.
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SERVER_SAS_TTL_MS = 60 * 1000;
@@ -157,6 +163,33 @@ const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
 
 const mediaType = (header: string | null | undefined) =>
   (header ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+
+function decodeXmlText(value: string) {
+  return value
+    .replace(/&#x([0-9a-f]+);/gi, (_, code: string) =>
+      String.fromCodePoint(Number.parseInt(code, 16)),
+    )
+    .replace(/&#(\d+);/g, (_, code: string) =>
+      String.fromCodePoint(Number.parseInt(code, 10)),
+    )
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function malwareScanResult(xml: string) {
+  for (const match of xml.matchAll(
+    /<Tag>\s*<Key>([\s\S]*?)<\/Key>\s*<Value>([\s\S]*?)<\/Value>\s*<\/Tag>/gi,
+  )) {
+    const key = decodeXmlText(match[1]!).trim().toLowerCase();
+    if (key === "scan result" || key === "malware scanning scan result") {
+      return decodeXmlText(match[2]!).trim().toLowerCase();
+    }
+  }
+  return undefined;
+}
 
 // Each path segment is encoded, so `/` keeps separating virtual folders.
 const encodeBlobPath = (blobName: string) =>
@@ -176,6 +209,10 @@ export class AzureBlob {
     public component: ComponentApi,
     private options: AzureBlobOptions = {},
   ) {
+    if (options.blockUploads && options.requireMalwareScan)
+      throw new Error(
+        "Malware scan gating cannot be combined with blockUploads because scan tags are not tied to the immutable snapshot",
+      );
     if (
       options.blockUploads &&
       (!Number.isFinite(
@@ -380,6 +417,7 @@ export class AzureBlob {
       uploadedBy: args.uploadedBy,
       fileName: args.fileName,
       metadata: args.metadata,
+      ...(this.options.requireMalwareScan ? { malwareScanRequired: true } : {}),
       createdAt,
       uploadExpiresAt,
       ...(blocks
@@ -684,7 +722,16 @@ export class AzureBlob {
     let file = await this.getFile(ctx, fileId);
     if (!file || file.status === "deleting")
       return { ok: false, reason: "Unknown upload" };
-    if (file.status === "ready") {
+    if (
+      file.status === "ready" ||
+      file.status === "scanning" ||
+      file.status === "rejected" ||
+      file.status === "scan_timed_out"
+    ) {
+      if (file.status === "rejected")
+        return { ok: false, reason: "Malware scan detected a threat" };
+      if (file.status === "scan_timed_out")
+        return { ok: false, reason: "Malware scan timed out" };
       return { ok: true, size: file.size ?? 0, contentType: file.contentType };
     }
     const config = this.config();
@@ -722,15 +769,158 @@ export class AzureBlob {
       await this.purge(ctx, fileId);
       return { ok: false, reason };
     }
-    const ready = await ctx.runMutation(this.component.lib.markReady, {
-      fileId,
-      size,
-      onUpload: onUpload ? await createFunctionHandle(onUpload) : undefined,
-      ...(file.snapshot ? { snapshot: file.snapshot } : {}),
-    });
-    return ready
-      ? { ok: true, size: ready.size ?? size, contentType: ready.contentType }
+    const onUploadHandle = onUpload
+      ? await createFunctionHandle(onUpload)
+      : undefined;
+    const scanNow = this.now();
+    const confirmed = file.malwareScanRequired
+      ? await ctx.runMutation(this.component.lib.markScanning, {
+          fileId,
+          size,
+          now: scanNow,
+          deadlineAt: scanNow + DEFAULT_MALWARE_SCAN_TIMEOUT_MS,
+          onUpload: onUploadHandle,
+          ...(file.snapshot ? { snapshot: file.snapshot } : {}),
+        })
+      : await ctx.runMutation(this.component.lib.markReady, {
+          fileId,
+          size,
+          onUpload: onUploadHandle,
+          ...(file.snapshot ? { snapshot: file.snapshot } : {}),
+        });
+    return confirmed
+      ? {
+          ok: true,
+          size: confirmed.size ?? size,
+          contentType: confirmed.contentType,
+        }
       : { ok: false, reason: "Unknown upload" };
+  }
+
+  /** Checks a bounded batch of due Defender scan jobs; run from the returned internal action. */
+  async scanMalware(ctx: RunActionCtx, limit = 20) {
+    if (!Number.isSafeInteger(limit) || limit <= 0)
+      throw new ConvexError("Malware scan limit must be a positive integer");
+    const now = this.now();
+    const jobs = await ctx.runQuery(this.component.lib.dueMalwareScans, {
+      now,
+      limit: Math.min(limit, MAX_MALWARE_SCAN_BATCH),
+    });
+    if (jobs.length === 0) return 0;
+    let config: AzureBlobConfig | undefined;
+    let accessToken: string | undefined;
+    let checked = 0;
+    for (const job of jobs) {
+      if (now >= job.deadlineAt) {
+        await ctx.runMutation(this.component.lib.markScanTimedOut, {
+          fileId: job.fileId,
+          now,
+        });
+        checked += 1;
+        continue;
+      }
+      if (!config) {
+        config = this.config();
+        accessToken = config.accountKey
+          ? undefined
+          : await getAccessToken(config);
+      }
+      const request = await this.serverRequest(
+        config,
+        job.container,
+        job.blobName,
+        "t",
+        undefined,
+        accessToken,
+        { comp: "tags" },
+      );
+      const response = await fetch(request.url, {
+        method: "GET",
+        ...(request.headers ? { headers: request.headers } : {}),
+      });
+      if (response.status === 404) {
+        await this.deferMalwareScan(
+          ctx,
+          job.fileId,
+          job.attempts,
+          now,
+          job.deadlineAt,
+        );
+        checked += 1;
+        continue;
+      }
+      if (!response.ok) {
+        await this.deferMalwareScan(
+          ctx,
+          job.fileId,
+          job.attempts,
+          now,
+          job.deadlineAt,
+        );
+        throw new Error(`Azure Blob tag read failed with ${response.status}`);
+      }
+      const result = malwareScanResult(await response.text());
+      if (result === "no threats found") {
+        await ctx.runMutation(this.component.lib.markReady, {
+          fileId: job.fileId,
+          size: job.size,
+          onUpload: job.onUpload,
+          ...(job.snapshot ? { snapshot: job.snapshot } : {}),
+        });
+      } else if (result === "malicious") {
+        const deletion = await this.serverRequest(
+          config,
+          job.container,
+          job.blobName,
+          "d",
+          undefined,
+          accessToken,
+        );
+        const deleted = await fetch(deletion.url, {
+          method: "DELETE",
+          headers: {
+            ...deletion.headers,
+            "x-ms-delete-snapshots": "include",
+          },
+        });
+        if (!deleted.ok && deleted.status !== 404)
+          throw new Error(
+            `Azure Blob malware rejection delete failed with ${deleted.status}`,
+          );
+        await ctx.runMutation(this.component.lib.markScanRejected, {
+          fileId: job.fileId,
+        });
+      } else {
+        await this.deferMalwareScan(
+          ctx,
+          job.fileId,
+          job.attempts,
+          now,
+          job.deadlineAt,
+        );
+      }
+      checked += 1;
+    }
+    return checked;
+  }
+
+  private async deferMalwareScan(
+    ctx: RunActionCtx,
+    fileId: string,
+    attempts: number,
+    now: number,
+    deadlineAt: number,
+  ) {
+    const delay =
+      MALWARE_SCAN_BACKOFF_MS[
+        Math.min(attempts, MALWARE_SCAN_BACKOFF_MS.length - 1)
+      ]!;
+    const nextCheckAt = Math.min(now + delay, deadlineAt);
+    await ctx.runMutation(this.component.lib.deferMalwareScan, {
+      fileId,
+      now,
+      nextCheckAt,
+    });
   }
 
   private async commitBlocks(
@@ -1038,11 +1228,11 @@ export class AzureBlob {
   }
 
   /**
-   * Ready-made public functions for the upload flow, for use with `useUploadFile` from
-   * `convex-azure-blob/react`. Export them from one of your modules:
+   * Ready-made upload functions for use with `useUploadFile` from
+   * `convex-azure-blob/react`. It also returns an internal `scanMalware` action for cron polling:
    *
    * ```ts
-   * export const { generateUploadUrl, confirmUpload } = azure.clientApi({
+   * export const { generateUploadUrl, confirmUpload, scanMalware } = azure.clientApi({
    *   identify: async (ctx) => (await ctx.auth.getUserIdentity())?.subject ?? null,
    * });
    * ```
@@ -1092,6 +1282,12 @@ export class AzureBlob {
           }
           return await this.confirmUpload(ctx, args.fileId, options.onUpload);
         },
+      }),
+      scanMalware: internalActionGeneric({
+        args: { limit: v.optional(v.number()) },
+        returns: v.number(),
+        handler: async (ctx, args): Promise<number> =>
+          await this.scanMalware(ctx, args.limit),
       }),
     };
   }

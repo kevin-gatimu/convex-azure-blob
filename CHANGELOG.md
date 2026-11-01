@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add opt-in Defender for Storage malware scanning with internal polling,
+  `scanning`/`rejected`/`scan_timed_out` statuses, and a 24-hour timeout.
+  `onUpload` runs only after a clean verdict; block uploads cannot enable this
+  gate because their mutable blob tags cannot verify the immutable snapshot.
+  Blob index tags must be enabled, and hierarchical-namespace accounts are not
+  supported.
 - Add opt-in resumable browser block uploads via `blockUploads`, block ticket
   metadata, owner-authorized `renewUploadUrl`, and React `pause`, `resume`, and
   `canResume`. The default single-PUT flow and server-side `store` remain

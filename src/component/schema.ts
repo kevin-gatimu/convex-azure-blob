@@ -1,10 +1,13 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
-/** A file moves `pending` -> `ready` -> `deleting`, and its row is removed once the blob is gone. */
+/** A file may pass through scanning before ready, or remain rejected/timed out until deleted. */
 export const fileStatus = v.union(
   v.literal("pending"),
+  v.literal("scanning"),
   v.literal("ready"),
+  v.literal("rejected"),
+  v.literal("scan_timed_out"),
   v.literal("deleting"),
 );
 
@@ -19,6 +22,8 @@ export const fileFields = {
   maxBytes: v.number(),
   /** Opaque to the component: the app decides who an uploader is. */
   uploadedBy: v.string(),
+  /** Whether this file must pass Defender for Storage scanning before serving. */
+  malwareScanRequired: v.optional(v.boolean()),
   /** The name the user gave the file, for display and downloads. Never used in the blob name. */
   fileName: v.optional(v.string()),
   /** App-defined string metadata. */
@@ -49,6 +54,15 @@ export default defineSchema({
     .index("by_status_createdAt", ["status", "createdAt"])
     .index("by_status_uploadExpiresAt", ["status", "uploadExpiresAt"])
     .index("by_uploadedBy_status", ["uploadedBy", "status"]),
+  malwareScans: defineTable({
+    fileId: v.id("files"),
+    nextCheckAt: v.number(),
+    deadlineAt: v.number(),
+    attempts: v.number(),
+    onUpload: v.optional(v.string()),
+  })
+    .index("by_nextCheckAt", ["nextCheckAt"])
+    .index("by_fileId", ["fileId"]),
   userDelegationKeys: defineTable({
     accountName: v.string(),
     ...userDelegationKeyFields,

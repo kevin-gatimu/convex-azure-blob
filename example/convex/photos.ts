@@ -38,7 +38,8 @@ const uploadApi: ReturnType<AzureBlob["clientApi"]> = azure.clientApi({
   },
   onUpload: internal.photos.attach,
 });
-export const { generateUploadUrl, confirmUpload, renewUploadUrl } = uploadApi;
+export const { generateUploadUrl, confirmUpload, renewUploadUrl, scanMalware } =
+  uploadApi;
 
 export const attach = internalMutation({
   args: { fileId: v.string() },

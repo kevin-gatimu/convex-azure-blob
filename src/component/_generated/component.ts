@@ -48,6 +48,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           createdAt: number;
           expectedSize?: number;
           fileName?: string;
+          malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
           uploadExpiresAt: number;
@@ -55,6 +56,29 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           uploadedBy: string;
         },
         string,
+        Name
+      >;
+      deferMalwareScan: FunctionReference<
+        "mutation",
+        "internal",
+        { fileId: string; nextCheckAt: number; now: number },
+        null,
+        Name
+      >;
+      dueMalwareScans: FunctionReference<
+        "query",
+        "internal",
+        { limit: number; now: number },
+        Array<{
+          attempts: number;
+          blobName: string;
+          container: string;
+          deadlineAt: number;
+          fileId: string;
+          onUpload?: string;
+          size: number;
+          snapshot?: string;
+        }>,
         Name
       >;
       get: FunctionReference<
@@ -70,11 +94,18 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           expectedSize?: number;
           fileId: string;
           fileName?: string;
+          malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
           size?: number;
           snapshot?: string;
-          status: "pending" | "ready" | "deleting";
+          status:
+            | "pending"
+            | "scanning"
+            | "ready"
+            | "rejected"
+            | "scan_timed_out"
+            | "deleting";
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -122,11 +153,18 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             expectedSize?: number;
             fileId: string;
             fileName?: string;
+            malwareScanRequired?: boolean;
             maxBytes: number;
             metadata?: Record<string, string>;
             size?: number;
             snapshot?: string;
-            status: "pending" | "ready" | "deleting";
+            status:
+              | "pending"
+              | "scanning"
+              | "ready"
+              | "rejected"
+              | "scan_timed_out"
+              | "deleting";
             uploadExpiresAt?: number;
             uploadMode?: "blocks";
             uploadedBy: string;
@@ -161,11 +199,118 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           expectedSize?: number;
           fileId: string;
           fileName?: string;
+          malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
           size?: number;
           snapshot?: string;
-          status: "pending" | "ready" | "deleting";
+          status:
+            | "pending"
+            | "scanning"
+            | "ready"
+            | "rejected"
+            | "scan_timed_out"
+            | "deleting";
+          uploadExpiresAt?: number;
+          uploadMode?: "blocks";
+          uploadedBy: string;
+        } | null,
+        Name
+      >;
+      markScanning: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          deadlineAt: number;
+          fileId: string;
+          now: number;
+          onUpload?: string;
+          size: number;
+          snapshot?: string;
+        },
+        {
+          blobName: string;
+          blockSize?: number;
+          container: string;
+          contentType: string;
+          createdAt: number;
+          expectedSize?: number;
+          fileId: string;
+          fileName?: string;
+          malwareScanRequired?: boolean;
+          maxBytes: number;
+          metadata?: Record<string, string>;
+          size?: number;
+          snapshot?: string;
+          status:
+            | "pending"
+            | "scanning"
+            | "ready"
+            | "rejected"
+            | "scan_timed_out"
+            | "deleting";
+          uploadExpiresAt?: number;
+          uploadMode?: "blocks";
+          uploadedBy: string;
+        } | null,
+        Name
+      >;
+      markScanRejected: FunctionReference<
+        "mutation",
+        "internal",
+        { fileId: string },
+        {
+          blobName: string;
+          blockSize?: number;
+          container: string;
+          contentType: string;
+          createdAt: number;
+          expectedSize?: number;
+          fileId: string;
+          fileName?: string;
+          malwareScanRequired?: boolean;
+          maxBytes: number;
+          metadata?: Record<string, string>;
+          size?: number;
+          snapshot?: string;
+          status:
+            | "pending"
+            | "scanning"
+            | "ready"
+            | "rejected"
+            | "scan_timed_out"
+            | "deleting";
+          uploadExpiresAt?: number;
+          uploadMode?: "blocks";
+          uploadedBy: string;
+        } | null,
+        Name
+      >;
+      markScanTimedOut: FunctionReference<
+        "mutation",
+        "internal",
+        { fileId: string; now: number },
+        {
+          blobName: string;
+          blockSize?: number;
+          container: string;
+          contentType: string;
+          createdAt: number;
+          expectedSize?: number;
+          fileId: string;
+          fileName?: string;
+          malwareScanRequired?: boolean;
+          maxBytes: number;
+          metadata?: Record<string, string>;
+          size?: number;
+          snapshot?: string;
+          status:
+            | "pending"
+            | "scanning"
+            | "ready"
+            | "rejected"
+            | "scan_timed_out"
+            | "deleting";
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -199,11 +344,18 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           expectedSize?: number;
           fileId: string;
           fileName?: string;
+          malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
           size?: number;
           snapshot?: string;
-          status: "pending" | "ready" | "deleting";
+          status:
+            | "pending"
+            | "scanning"
+            | "ready"
+            | "rejected"
+            | "scan_timed_out"
+            | "deleting";
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;

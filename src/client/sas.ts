@@ -7,7 +7,7 @@
 export const SAS_VERSION = "2022-11-02";
 
 // Azure requires blob permission letters in this order.
-const PERMISSION_ORDER = "racwd";
+const PERMISSION_ORDER = "racwdt";
 
 /** Response headers a read SAS can override for whoever uses it. */
 export type SasResponseHeaders = {
@@ -25,7 +25,7 @@ export type BlobSasInput = {
   container: string;
   /** Unencoded blob name, e.g. `avatars/3f1c.png`. */
   blobName: string;
-  /** Subset of "racwd" in that order, e.g. "r" or "c". */
+  /** Subset of "racwdt" in that order, e.g. "r", "c", or "t". */
   permissions: string;
   /** Epoch milliseconds. */
   startsOn: number;
