@@ -294,6 +294,36 @@ describe.skipIf(!endpoint)("against Azurite", () => {
     expect(file?.status).toBe("deleting");
   });
 
+  it("reads a stored file and a byte range from an action", async () => {
+    const { t, azure } = setup();
+    const stored = await t.action((ctx) =>
+      azure.store(ctx, {
+        data: PNG,
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(stored.ok).toBe(true);
+    if (!stored.ok) return;
+    const whole = await t.action(async (ctx) => {
+      const response = await azure.read(ctx, stored.fileId);
+      return Array.from(new Uint8Array(await response!.arrayBuffer()));
+    });
+    expect(whole).toEqual(Array.from(PNG));
+    const part = await t.action(async (ctx) => {
+      const response = await azure.read(ctx, stored.fileId, {
+        range: { start: 1, end: 3 },
+      });
+      return {
+        status: response!.status,
+        bytes: Array.from(new Uint8Array(await response!.arrayBuffer())),
+      };
+    });
+    expect(part.status).toBe(206);
+    expect(part.bytes).toEqual(Array.from(PNG.slice(1, 4)));
+    expect(await t.action((ctx) => azure.purge(ctx, stored.fileId))).toBe(true);
+  });
+
   it("stores from the server and sweeps the result", async () => {
     const { t, azure } = setup();
     const stored = await t.action((ctx) =>

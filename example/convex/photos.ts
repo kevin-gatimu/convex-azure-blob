@@ -139,9 +139,13 @@ export const purge = internalAction({
 });
 
 export const sweep = internalAction({
-  args: {},
+  args: { run: v.optional(v.number()) },
   returns: v.number(),
-  handler: async (ctx) => await azure.sweep(ctx),
+  handler: async (ctx, args): Promise<number> =>
+    await azure.sweep(ctx, {
+      continueWith: internal.photos.sweep,
+      run: args.run,
+    }),
 });
 
 export const refreshUserDelegationKey = internalAction({

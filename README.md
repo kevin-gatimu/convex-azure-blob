@@ -690,6 +690,35 @@ and `getUrl` returns `<base>/<blob name>` with no token. That makes URLs
 permanent and easy to cache at the edge. Download URLs are still signed, since
 they need a `Content-Disposition` override.
 
+## Reading files from actions
+
+`read` fetches a ready file's bytes inside an action, for thumbnails, parsing or
+re-uploading. It returns a `Response`, or `null` if the file is unknown or not
+`ready`. Check the caller's permission first.
+
+```ts
+export const thumbnail = action({
+  args: { fileId: v.string() },
+  handler: async (ctx, { fileId }) => {
+    await requireUserInAction(ctx);
+    const response = await azure.read(ctx, fileId);
+    if (!response) return null;
+    const image = new Uint8Array(await response.arrayBuffer());
+    // ...resize, then azure.store(ctx, { data, contentType, uploadedBy })
+  },
+});
+
+// Only the first kilobyte (end is inclusive); Azure answers 206.
+const head = await azure.read(ctx, fileId, { range: { start: 0, end: 1023 } });
+```
+
+`start` must be a non-negative integer and `end`, if given, an integer no
+smaller than `start`; otherwise `read` throws. Any other Azure status than 200
+(206 when `range` is given) throws an error with the status only, never the URL
+or SAS, and the returned `Response` has an empty `url`. The request uses a
+one-minute read-only SAS (or your Entra token) against the internal endpoint, so
+the bytes stream from Azure to the action, not through a browser URL.
+
 ## Listing files and metadata
 
 ```ts
@@ -763,8 +792,13 @@ export default crons;
 
 // convex/files.ts
 export const sweep = internalAction({
-  args: {},
-  handler: async (ctx) => await azure.sweep(ctx),
+  args: { run: v.optional(v.number()) },
+  returns: v.number(),
+  handler: async (ctx, args): Promise<number> =>
+    await azure.sweep(ctx, {
+      continueWith: internal.files.sweep,
+      run: args.run,
+    }),
 });
 
 export const refreshUserDelegationKey = internalAction({
@@ -786,6 +820,21 @@ so a confirmation that commits first is not swept. Each sweep examines at most
 1000 expired pending rows in expiry order while skipping those younger than the
 age cutoff; if more than 1000 young rows sort ahead of an older one, it waits
 until they age out.
+
+Sweep claims up to `limit` files (default 100, clamped to 1-200) and deletes
+with `concurrency` workers (default 8, a positive integer). A failed Azure
+delete is deferred for one minute, doubling on each failure up to 24 hours, so
+one failing blob does not monopolize later batches. A successful delete with a
+live upload URL is deferred until its recorded expiry plus the clock-skew
+allowance.
+
+Pass an internal action as `continueWith` to drain a backlog: a full claimed
+batch schedules it with `{ run: run + 1 }` at zero delay while
+`run + 1 < maxRuns`. `run` defaults to 0 and `maxRuns` to 10; the action must
+forward `run` and use the same sweep options on each invocation. A scheduler is
+required only when using `continueWith`; existing callers with just `runQuery`
+and `runMutation` still work. The return counts successful blob deletes
+(including 404), not removed rows. The cron starts a fresh chain with `{}`.
 
 ## Storing files from actions
 
@@ -810,6 +859,31 @@ export const importAvatar = internalAction({
 ```
 
 `store` runs the same checks as a browser upload.
+
+When a source is already available at an HTTPS URL, Azure can fetch it directly
+without passing the bytes through the Convex action:
+
+```ts
+const result = await azure.storeFromUrl(ctx, {
+  sourceUrl,
+  contentType: "image/png",
+  uploadedBy: userId,
+  fileName: "avatar",
+  maxBytes: 5 * 1024 * 1024,
+});
+if (!result.ok) throw new Error(result.reason);
+return result.fileId;
+```
+
+`storeFromUrl` accepts only HTTPS source URLs and applies the same size,
+content-type and file-signature checks as `store`. The source must be publicly
+readable or include a read SAS, and must return a valid `Content-Length`. Source
+URLs are limited to 2 KiB. Azure's synchronous operation is limited to 5,000
+MiB; an oversized source or one without a valid length is rejected. Azure
+fetches the source URL itself, so treat user-supplied URLs as an SSRF risk:
+validate them against your application's trusted-source policy before calling
+this method. HTTPS alone does not make an arbitrary URL safe. Do not log source
+URLs that contain SAS tokens.
 
 ## Several containers or folders
 
@@ -944,6 +1018,7 @@ query methods from mutations and actions too.
 | `renewUploadUrl(ctx, { fileId, uploadedBy })`                                                 | mutation     | Same pending upload ticket with a renewed expiry; authorize the uploader first. |
 | `confirmUpload(ctx, fileId, onUpload?)`                                                       | action       | `{ ok: true, size, contentType }` or `{ ok: false, reason }`                    |
 | `getFile(ctx, fileId)`                                                                        | query        | `FileDoc` or `null`                                                             |
+| `read(ctx, fileId, { range?: { start, end? } }?)`                                             | action       | `Response` (200, or 206 with `range`), or `null` unless the file is `ready`     |
 | `getUrl(ctx, fileId, { download?, cacheControl? })`                                           | query        | URL or `null`                                                                   |
 | `urlForFile(file, { download?, cacheControl? }, ctx?)`                                        | anywhere     | URL or `null`                                                                   |
 | `list(ctx, { uploadedBy?, paginationOpts })`                                                  | query        | `PaginationResult<FileDoc>`                                                     |
@@ -953,8 +1028,9 @@ query methods from mutations and actions too.
 | `refreshTier(ctx, fileId)`                                                                    | action       | `boolean`                                                                       |
 | `markForDeletion(ctx, fileId)`                                                                | mutation     | `boolean`                                                                       |
 | `purge(ctx, fileId)` / `delete(ctx, fileId)`                                                  | action       | `boolean`                                                                       |
-| `sweep(ctx, { pendingOlderThanMs?, limit? })`                                                 | action       | number of blobs removed                                                         |
+| `sweep(ctx, { pendingOlderThanMs?, limit?, concurrency?, continueWith?, run?, maxRuns? })`    | action       | number of blobs removed                                                         |
 | `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
+| `storeFromUrl(ctx, { sourceUrl, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`  | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
 | `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key  |
 | `scanMalware(ctx, limit?)`                                                                    | action       | number of due Defender scan jobs checked                                        |
 | `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | public upload functions and internal `scanMalware` action                       |

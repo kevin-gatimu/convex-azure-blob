@@ -64,6 +64,10 @@ type RunActionCtx = Pick<
   "runQuery" | "runMutation"
 >;
 
+type SweepCtx = RunActionCtx & {
+  scheduler?: Pick<GenericActionCtx<GenericDataModel>["scheduler"], "runAfter">;
+};
+
 /** A file as the component stores it. `fileId` is what the app keeps on its own documents. */
 export type FileDoc = { fileId: string } & ObjectType<typeof fileFields>;
 export type FileStatus = FileDoc["status"];
@@ -177,6 +181,7 @@ const MAX_MALWARE_SCAN_BATCH = 50;
 // Start times are backdated so a client whose clock runs slow is not refused.
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SERVER_SAS_TTL_MS = 60 * 1000;
+const MAX_PUT_BLOB_FROM_URL_BYTES = 5000 * 1024 * 1024;
 const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 2 * 24 * 60 * 60 * 1000;
 const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
 const isTransientAzureStatus = (status: number) =>
@@ -1066,6 +1071,68 @@ export class AzureBlob {
   }
 
   /**
+   * Streams a ready file's bytes from an action, or returns null if the file is unknown or not
+   * ready. `range` is an inclusive byte range and must yield a 206 response. The returned
+   * Response has no `url`, so the signed URL can't leak from it. Run your own permission
+   * checks first.
+   *
+   * @example
+   * ```ts
+   * const response = await azure.read(ctx, fileId, { range: { start: 0, end: 1023 } });
+   * const head = response ? new Uint8Array(await response.arrayBuffer()) : null;
+   * ```
+   */
+  async read(
+    ctx: RunActionCtx,
+    fileId: string,
+    options: { range?: { start: number; end?: number } } = {},
+  ): Promise<Response | null> {
+    const range = options.range;
+    if (range) {
+      if (!Number.isSafeInteger(range.start) || range.start < 0)
+        throw new ConvexError("Range start must be a non-negative integer");
+      if (
+        range.end !== undefined &&
+        (!Number.isSafeInteger(range.end) || range.end < range.start)
+      )
+        throw new ConvexError(
+          "Range end must be an integer no smaller than start",
+        );
+    }
+    const file = await this.getFile(ctx, fileId);
+    if (!file || file.status !== "ready") return null;
+    if (file.uploadMode === "blocks" && !file.snapshot) return null;
+    const request = await this.serverRequest(
+      this.config(),
+      file.container,
+      file.blobName,
+      "r",
+      undefined,
+      undefined,
+      file.snapshot ? { snapshot: file.snapshot } : {},
+    );
+    const response = await fetch(request.url, {
+      method: "GET",
+      headers: {
+        ...request.headers,
+        ...(range
+          ? { "x-ms-range": `bytes=${range.start}-${range.end ?? ""}` }
+          : {}),
+      },
+    });
+    if (response.status !== (range ? 206 : 200)) {
+      await response.body?.cancel();
+      throw new Error(`Azure Blob read failed with ${response.status}`);
+    }
+    // A fresh Response, because the original's `url` carries the SAS.
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
+
+  /**
    * Checks the uploaded blob's size, type and (by default) leading bytes against what was
    * reserved. A blob that fails is deleted and its file removed. Confirming twice is harmless.
    * An optional app mutation attaches the file atomically; a failure rolls back confirmation.
@@ -1571,35 +1638,86 @@ export class AzureBlob {
       method: "DELETE",
       headers: { ...request.headers, "x-ms-delete-snapshots": "include" },
     });
-    if (!response.ok && response.status !== 404) return false;
-    if (
-      this.now() >=
-      effectiveUploadExpiry(file, this.uploadTtlMs) + CLOCK_SKEW_MS
-    ) {
+    const now = this.now();
+    if (!response.ok && response.status !== 404) {
+      await ctx.runMutation(this.component.lib.deferSweep, {
+        fileId: file.fileId,
+        now,
+      });
+      return false;
+    }
+    const nextAttemptAt =
+      effectiveUploadExpiry(file, this.uploadTtlMs) + CLOCK_SKEW_MS;
+    if (now >= nextAttemptAt) {
       await ctx.runMutation(this.component.lib.remove, { fileId: file.fileId });
+    } else {
+      await ctx.runMutation(this.component.lib.deferSweep, {
+        fileId: file.fileId,
+        now,
+        nextAttemptAt,
+      });
     }
     return true;
   }
 
   /**
    * Deletes the blobs and rows of files marked for deletion and of uploads never confirmed
-   * (pending longer than `pendingOlderThanMs`, default one hour). Returns how many blobs it
-   * deleted (or found already gone).
-   * Run it from a cron.
+   * (pending longer than `pendingOlderThanMs`, default one hour), `concurrency` (default 8) at a
+   * time. Returns how many blobs it deleted (or found already gone). Run it from a cron; pass
+   * `continueWith` (the calling action) to keep draining a backlog for up to `maxRuns` runs.
    */
   async sweep(
-    ctx: RunActionCtx,
-    args: { pendingOlderThanMs?: number; limit?: number } = {},
-  ) {
+    ctx: SweepCtx,
+    args: {
+      pendingOlderThanMs?: number;
+      limit?: number;
+      concurrency?: number;
+      continueWith?: FunctionReference<"action", "internal", { run?: number }>;
+      run?: number;
+      maxRuns?: number;
+    } = {},
+  ): Promise<number> {
+    const concurrency = args.concurrency ?? 8;
+    const run = args.run ?? 0;
+    const maxRuns = args.maxRuns ?? 10;
+    for (const [name, value, minimum] of [
+      ["concurrency", concurrency, 1],
+      ["run", run, 0],
+      ["maxRuns", maxRuns, 1],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < minimum)
+        throw new ConvexError(`${name} must be an integer >= ${minimum}`);
+    }
+    const scheduler = ctx.scheduler;
+    if (args.continueWith && !scheduler)
+      throw new ConvexError("sweep continuation requires a scheduler");
+    if (!Number.isFinite(args.limit ?? 100))
+      throw new ConvexError("limit must be finite");
+    // Same clamp as claimSweepable, so a full claim reliably signals a remaining backlog.
+    const limit = Math.max(1, Math.min(Math.floor(args.limit ?? 100), 200));
+    const now = this.now();
     const stale = await ctx.runMutation(this.component.lib.claimSweepable, {
-      pendingBefore:
-        this.now() - (args.pendingOlderThanMs ?? DEFAULT_PENDING_TTL_MS),
-      limit: args.limit ?? 100,
-      now: this.now(),
+      pendingBefore: now - (args.pendingOlderThanMs ?? DEFAULT_PENDING_TTL_MS),
+      limit,
+      now,
     });
     let removed = 0;
-    for (const file of stale) {
-      if (await this.removeBlobAndRow(ctx, file)) removed += 1;
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, stale.length) }, async () => {
+        while (next < stale.length) {
+          const file = stale[next++];
+          if (await this.removeBlobAndRow(ctx, file)) removed += 1;
+        }
+      }),
+    );
+    if (
+      args.continueWith &&
+      scheduler &&
+      stale.length === limit &&
+      run + 1 < maxRuns
+    ) {
+      await scheduler.runAfter(0, args.continueWith, { run: run + 1 });
     }
     return removed;
   }
@@ -1651,6 +1769,97 @@ export class AzureBlob {
       return {
         ok: false,
         reason: `Azure Blob upload failed with ${response.status}`,
+      };
+    }
+    const confirmed = await this.confirmUpload(ctx, fileId);
+    return confirmed.ok ? { ok: true, fileId } : confirmed;
+  }
+
+  /** Copies an HTTPS source directly into Azure, then applies the normal upload checks. */
+  async storeFromUrl(
+    ctx: RunActionCtx,
+    args: {
+      sourceUrl: string;
+      contentType: string;
+      uploadedBy: string;
+      maxBytes?: number;
+      fileName?: string;
+      metadata?: Record<string, string>;
+    },
+  ): Promise<StoreResult> {
+    const { sourceUrl: sourceAddress, ...rest } = args;
+    let source: URL;
+    try {
+      source = new URL(sourceAddress);
+    } catch {
+      return { ok: false, reason: "Source URL must be a valid HTTPS URL" };
+    }
+    if (
+      source.protocol !== "https:" ||
+      source.username ||
+      source.password ||
+      source.href.includes("#")
+    ) {
+      return {
+        ok: false,
+        reason:
+          "Source URL must be HTTPS and cannot include credentials or a fragment",
+      };
+    }
+    if (source.href.length > 2 * 1024) {
+      return { ok: false, reason: "Source URL must be no longer than 2 KiB" };
+    }
+
+    const config = this.config();
+    const accessToken = config.accountKey
+      ? undefined
+      : await getAccessToken(config);
+    const { fileId, blobName, contentType, uploadExpiresAt } =
+      await this.reserve(
+        ctx,
+        config,
+        {
+          ...rest,
+          maxBytes: Math.min(
+            args.maxBytes ?? this.ceiling,
+            this.ceiling,
+            MAX_PUT_BLOB_FROM_URL_BYTES,
+          ),
+        },
+        SERVER_SAS_TTL_MS,
+      );
+    const request = await this.serverRequest(
+      config,
+      config.container,
+      blobName,
+      "c",
+      uploadExpiresAt,
+      accessToken,
+    );
+    let response: Response;
+    try {
+      response = await fetch(request.url, {
+        method: "PUT",
+        headers: {
+          ...request.headers,
+          "content-length": "0",
+          "x-ms-blob-type": "BlockBlob",
+          "x-ms-blob-content-type": contentType,
+          "x-ms-copy-source": source.href,
+        },
+      });
+    } catch {
+      await this.purge(ctx, fileId);
+      return { ok: false, reason: "Azure Blob URL copy request failed" };
+    }
+    if (response.status !== 201) {
+      await this.purge(ctx, fileId);
+      return {
+        ok: false,
+        reason:
+          response.status === 409
+            ? "Azure Blob URL copy failed with 409; the source must have a valid Content-Length and be no larger than 5,000 MiB"
+            : `Azure Blob URL copy failed with ${response.status}`,
       };
     }
     const confirmed = await this.confirmUpload(ctx, fileId);
