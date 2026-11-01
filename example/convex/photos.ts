@@ -144,10 +144,10 @@ export const sweep = internalAction({
 });
 
 export const refreshUserDelegationKey = internalAction({
-  args: {},
+  args: { force: v.optional(v.boolean()) },
   returns: v.null(),
-  handler: async (ctx) => {
-    await azure.refreshUserDelegationKey(ctx);
+  handler: async (ctx, args) => {
+    await azure.refreshUserDelegationKey(ctx, { force: args.force });
     return null;
   },
 });

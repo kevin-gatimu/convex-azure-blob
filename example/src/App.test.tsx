@@ -336,6 +336,19 @@ describe("App", () => {
       expect(h.fakes[0]!.upload).toHaveBeenCalledTimes(1);
     });
 
+    it("offers a fresh Retry when a resume fails but the hook still reports canResume", async () => {
+      await startOne();
+      await rejectUpload(0, abort(), true);
+      await click(button(row("a.png"), "Resume"));
+      await rejectUpload(0, new Error("Unknown upload"), true);
+      expect(row("a.png").props.className).toContain("failed");
+      h.fakes[0]!.upload.mockClear();
+      await click(button(row("a.png"), "Retry"));
+      expect(h.fakes[0]!.upload).toHaveBeenCalledTimes(1);
+      await resolveUpload(0);
+      expect(textOf(row("a.png"))).toContain("Uploaded and verified");
+    });
+
     it("shows percentage progress with a Pause button", async () => {
       await startOne();
       await setProgress(0, 0.5);

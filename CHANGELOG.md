@@ -21,6 +21,16 @@
   `urlForFile` to receive a query context so it can sign URLs without network
   calls. See the README for role assignments, configuration, and key-revocation
   guidance.
+- `AzureBlobConfig.authorityHost` is optional again, so existing config objects
+  still compile; Entra token requests default to
+  `https://login.microsoftonline.com`.
+- `refreshUserDelegationKey` accepts `{ force: true }` to replace a still-valid
+  cached key after revocation; the example action forwards `force`.
+- Renewing an upload never shortens the cleanup expiry tracked for an earlier
+  issued URL, and the sweep no longer lets young short-lived uploads starve
+  eligible older ones.
+- The example shows Retry for every failed upload, even when a resume cannot
+  continue.
 - Keep pre-release file records without `uploadExpiresAt` compatible with schema
   updates; cleanup applies a conservative expiry fallback without rewriting or
   deleting those records.

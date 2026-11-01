@@ -303,15 +303,23 @@ export class AzureBlob {
     return key;
   }
 
-  /** Refreshes the cached delegation key when it expires within two days. */
-  async refreshUserDelegationKey(ctx: RunActionCtx): Promise<void> {
+  /**
+   * Refreshes the cached delegation key when it expires within two days. Pass `{ force: true }`
+   * to replace a still-valid key, e.g. after revoking it in Azure.
+   */
+  async refreshUserDelegationKey(
+    ctx: RunActionCtx,
+    options: { force?: boolean } = {},
+  ): Promise<void> {
     const config = this.config();
     if (config.accountKey) return;
     const now = this.now();
-    const cached = await ctx.runQuery(this.component.lib.getUserDelegationKey, {
-      accountName: config.accountName,
-      now,
-    });
+    const cached = options.force
+      ? null
+      : await ctx.runQuery(this.component.lib.getUserDelegationKey, {
+          accountName: config.accountName,
+          now,
+        });
     if (
       cached &&
       Date.parse(cached.signedExpiry) - now >

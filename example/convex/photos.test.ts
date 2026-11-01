@@ -3,7 +3,7 @@ import azureBlobTest from "convex-azure-blob/test";
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { MAX_FILE_BYTES } from "../upload-policy";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import { azure } from "./photos";
 import schema from "./schema";
 
@@ -217,6 +217,24 @@ describe("photos", () => {
     const last = fetchMock.mock.calls.at(-1)?.[1];
     expect(last?.method).toBe("DELETE");
     expect(last?.headers).toMatchObject({ "x-ms-delete-snapshots": "include" });
+  });
+
+  test("forwards force to the internal refresh action and still accepts no args", async () => {
+    vi.stubEnv("AZURE_BLOB_KEY", "");
+    vi.stubEnv("AZURE_BLOB_TENANT_ID", "tenant");
+    vi.stubEnv("AZURE_BLOB_CLIENT_ID", "client");
+    vi.stubEnv("AZURE_BLOB_CLIENT_SECRET", "client-secret");
+    const t = initConvexTest();
+    const keyRequests = () =>
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("comp=userdelegationkey"),
+      ).length;
+    await t.action(internal.photos.refreshUserDelegationKey, {});
+    expect(keyRequests()).toBe(1);
+    await t.action(internal.photos.refreshUserDelegationKey, {});
+    expect(keyRequests()).toBe(1);
+    await t.action(internal.photos.refreshUserDelegationKey, { force: true });
+    expect(keyRequests()).toBe(2);
   });
 
   test("uses a cached user delegation key in queries and bearer auth for Azure requests", async () => {

@@ -5,8 +5,8 @@ export type AzureBlobConfig = {
   tenantId?: string;
   clientId?: string;
   clientSecret?: string;
-  /** Authority base URL for Microsoft Entra ID. */
-  authorityHost: string;
+  /** Authority base URL for Microsoft Entra ID. Defaults to https://login.microsoftonline.com. */
+  authorityHost?: string;
   container: string;
   /** Account URL the browser uses, e.g. https://acct.blob.core.windows.net or http://127.0.0.1:10000/devstoreaccount1. */
   endpoint: string;
@@ -28,6 +28,8 @@ const ENTRA_ENV_NAMES = {
   clientId: "AZURE_BLOB_CLIENT_ID",
   clientSecret: "AZURE_BLOB_CLIENT_SECRET",
 } as const;
+
+export const DEFAULT_AUTHORITY_HOST = "https://login.microsoftonline.com";
 
 const trimSlash = (value: string) => value.replace(/\/+$/, "");
 
@@ -75,7 +77,7 @@ export function resolveConfig(
   const authorityHost = trimSlash(
     explicit?.authorityHost ||
       env.AZURE_BLOB_AUTHORITY_HOST ||
-      "https://login.microsoftonline.com",
+      DEFAULT_AUTHORITY_HOST,
   );
   return {
     accountName: values.accountName ?? "",

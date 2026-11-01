@@ -51,6 +51,24 @@ describe("getAccessToken", () => {
     );
   });
 
+  it("defaults the authority for configs without authorityHost", async () => {
+    const legacy: AzureBlobConfig = {
+      accountName: "acct",
+      tenantId: "tenant",
+      clientId: "client",
+      clientSecret: "client-secret",
+      container: "uploads",
+      endpoint: "https://acct.blob.core.windows.net",
+    };
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ access_token: "access-token" })),
+    );
+    await getAccessToken(legacy);
+    expect(fetchMock.mock.calls[0]![0]).toBe(
+      "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+    );
+  });
+
   it("surfaces token endpoint and malformed-response errors", async () => {
     fetchMock.mockResolvedValueOnce(new Response(null, { status: 401 }));
     await expect(getAccessToken(config)).rejects.toThrow(

@@ -260,7 +260,17 @@ The cached delegation key is a signing secret stored in the component table.
 Treat access to the Convex deployment and its component data as privileged.
 Azure's **Revoke User Delegation Keys** operation invalidates the cached key and
 all SAS URLs signed with delegation keys; the cron must obtain a new key before
-Entra-backed SAS operations can continue.
+Entra-backed SAS operations can continue. The routine refresh keeps a cached key
+that is still valid, so after revoking, force a replacement. Check the
+revocation first, then run the example action with `force`:
+
+```sh
+npx convex run photos:refreshUserDelegationKey '{"force":true}'
+```
+
+`refreshUserDelegationKey(ctx, { force: true })` skips the cached key and stores
+the replacement. If the forced request fails, the cached key is kept and the
+error is thrown. Uploads that were in flight need a fresh upload URL.
 
 Pre-release deployments may contain file records created before
 `uploadExpiresAt` was stored. These records remain valid and are not rewritten;
@@ -609,7 +619,10 @@ export const refreshUserDelegationKey = internalAction({
 clock-skew allowance, because that URL could otherwise re-create the blob. A
 later sweep removes it. Changing client TTL settings does not shorten this
 retention. Sweep atomically claims stale pending uploads before deleting them,
-so a confirmation that commits first is not swept.
+so a confirmation that commits first is not swept. Each sweep examines at most
+1000 expired pending rows in expiry order while skipping those younger than the
+age cutoff; if more than 1000 young rows sort ahead of an older one, it waits
+until they age out.
 
 ## Storing files from actions
 
@@ -772,7 +785,7 @@ query methods from mutations and actions too.
 | `purge(ctx, fileId)` / `delete(ctx, fileId)`                                                  | action       | `boolean`                                                                       |
 | `sweep(ctx, { pendingOlderThanMs?, limit? })`                                                 | action       | number of blobs removed                                                         |
 | `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
-| `refreshUserDelegationKey(ctx)`                                                               | action       | `void`; refreshes the Entra delegation-key cache                                |
+| `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key  |
 | `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | `{ generateUploadUrl, renewUploadUrl, confirmUpload }` public functions         |
 
 ### `convex-azure-blob/react`

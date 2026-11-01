@@ -14,6 +14,7 @@ const MAX_METADATA_KEYS = 32;
 const MAX_METADATA_VALUE_LENGTH = 1024;
 const MAX_FILE_NAME_LENGTH = 255;
 const MAX_SWEEP_LIMIT = 200;
+const MAX_SWEEP_SCAN = 1000;
 
 export const fileDoc = v.object({ fileId: v.id("files"), ...fileFields });
 const metadataValidator = fileFields.metadata;
@@ -111,8 +112,10 @@ export const renewUpload = mutation({
       args.expiresAt > args.now + 7 * 24 * 60 * 60 * 1000
     )
       throw new ConvexError("Invalid upload expiry");
-    await ctx.db.patch("files", id, { uploadExpiresAt: args.expiresAt });
-    return toDoc({ ...row, uploadExpiresAt: args.expiresAt });
+    // Earlier-issued SAS URLs stay valid until their own expiry, so cleanup must not undercut it.
+    const uploadExpiresAt = Math.max(row.uploadExpiresAt, args.expiresAt);
+    await ctx.db.patch("files", id, { uploadExpiresAt });
+    return toDoc({ ...row, uploadExpiresAt });
   },
 });
 
@@ -330,18 +333,23 @@ export const claimSweepable = mutation({
       .query("files")
       .withIndex("by_status_createdAt", (q) => q.eq("status", "deleting"))
       .take(limit);
-    const stale =
-      deleting.length < limit
-        ? await ctx.db
-            .query("files")
-            .withIndex("by_status_uploadExpiresAt", (q) =>
-              q
-                .eq("status", "pending")
-                .lt("uploadExpiresAt", args.now ?? args.pendingBefore),
-            )
-            .take(limit - deleting.length)
-        : [];
-    const expired = stale.filter((row) => row.createdAt < args.pendingBefore);
+    const expired: Doc<"files">[] = [];
+    if (deleting.length < limit) {
+      const wanted = limit - deleting.length;
+      let scanned = 0;
+      // Young rows with short expiries sort first; skip them rather than letting them fill the limit.
+      for await (const row of ctx.db
+        .query("files")
+        .withIndex("by_status_uploadExpiresAt", (q) =>
+          q
+            .eq("status", "pending")
+            .lt("uploadExpiresAt", args.now ?? args.pendingBefore),
+        )) {
+        if (row.createdAt < args.pendingBefore) expired.push(row);
+        scanned += 1;
+        if (expired.length >= wanted || scanned >= MAX_SWEEP_SCAN) break;
+      }
+    }
     for (const row of expired) {
       await ctx.db.patch("files", row._id, { status: "deleting" });
     }

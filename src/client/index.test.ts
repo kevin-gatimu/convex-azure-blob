@@ -814,6 +814,49 @@ describe("purge and sweep", () => {
     expect(methods()).toEqual(["DELETE", "DELETE"]);
   });
 
+  it("sweeps an eligible old upload that sorts behind young short-lived ones", async () => {
+    const state = setup({
+      blockUploads: true,
+      uploadTtlSeconds: 2 * 60 * 60,
+    });
+    const old = (
+      await state.t.action((ctx) =>
+        state.azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+          size: PNG.length,
+        }),
+      )
+    ).fileId;
+    const shortLived = new AzureBlob(state.azure.component, {
+      config,
+      now: () => T0 + 10 * MINUTE,
+      blockUploads: true,
+      uploadTtlSeconds: 60,
+    });
+    const young: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const ticket = await state.t.action((ctx) =>
+        shortLived.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+          size: PNG.length,
+        }),
+      );
+      young.push(ticket.fileId);
+    }
+    state.advance(3 * 60 * MINUTE);
+    stubBlob({});
+    expect(
+      await state.t.action((ctx) =>
+        state.azure.sweep(ctx, { limit: 1, pendingOlderThanMs: 175 * MINUTE }),
+      ),
+    ).toBe(1);
+    expect(await state.file(old)).toBeNull();
+    for (const id of young)
+      expect((await state.file(id))?.status).toBe("pending");
+  });
+
   it("respects the sweep limit", async () => {
     const { t, azure, reserve, advance } = setup();
     for (let i = 0; i < 3; i++) await reserve();
@@ -917,6 +960,55 @@ describe("Microsoft Entra user-delegation SAS", () => {
     advance(6 * DAY);
     await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("force-replaces a still-valid key, and a failed forced refresh keeps the cached one", async () => {
+    const { t, azure } = setupEntra();
+    await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
+    const cachedKey = () =>
+      t.query(azure.component.lib.getUserDelegationKey, {
+        accountName: entraConfig.accountName,
+        now: T0,
+      });
+    const first = await cachedKey();
+    fetchMock.mockClear();
+    await t.action((ctx) => azure.refreshUserDelegationKey(ctx, {}));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const entra = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("comp=userdelegationkey"))
+        return new Response(
+          "<UserDelegationKey><SignedOid>99999999-2222-3333-4444-555555555555</SignedOid><SignedTid>aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</SignedTid><SignedStart>2026-01-01T11:55:00Z</SignedStart><SignedExpiry>2026-01-08T11:55:00Z</SignedExpiry><SignedService>b</SignedService><SignedVersion>2022-11-02</SignedVersion><Value>cmVwbGFjZW1lbnQ=</Value></UserDelegationKey>",
+        );
+      return await entra(url, init);
+    });
+    await t.action((ctx) =>
+      azure.refreshUserDelegationKey(ctx, { force: true }),
+    );
+    const replaced = await cachedKey();
+    expect(replaced?.signedObjectId).toBe(
+      "99999999-2222-3333-4444-555555555555",
+    );
+    expect(replaced?.keyValue).not.toBe(first?.keyValue);
+
+    fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("comp=userdelegationkey"))
+        return new Response("denied", { status: 403 });
+      return await entra(url, init);
+    });
+    await expect(
+      t.action((ctx) => azure.refreshUserDelegationKey(ctx, { force: true })),
+    ).rejects.toThrow("failed with 403");
+    expect((await cachedKey())?.keyValue).toBe(replaced?.keyValue);
+  });
+
+  it("does nothing for shared-key accounts even when forced", async () => {
+    const { t, azure } = setup();
+    await t.action((ctx) =>
+      azure.refreshUserDelegationKey(ctx, { force: true }),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("signs browser URLs from the cache and uses OAuth for server requests", async () => {
@@ -1320,6 +1412,38 @@ describe("block uploads", () => {
         }),
       ),
     ).rejects.toThrow("Unknown upload");
+  });
+
+  it("keeps cleanup tracking at the old expiry when a shorter renewal is issued", async () => {
+    const state = setup({
+      blockUploads: true,
+      uploadTtlSeconds: 24 * 60 * 60,
+    });
+    const ticket = await reserveBlock(state);
+    const renewer = new AzureBlob(state.azure.component, {
+      config,
+      now: () => T0 + MINUTE,
+      blockUploads: true,
+    });
+    const renewed = await state.t.action((ctx) =>
+      renewer.renewUploadUrl(ctx, { fileId: ticket.fileId, uploadedBy: "u1" }),
+    );
+    expect(renewed.expiresAt).toBe(T0 + 6 * MINUTE);
+    expect((await state.file(ticket.fileId))?.uploadExpiresAt).toBe(
+      T0 + 24 * 60 * MINUTE,
+    );
+    const direct = await state.t.mutation(
+      state.azure.component.lib.renewUpload,
+      {
+        fileId: ticket.fileId,
+        uploadedBy: "u1",
+        now: T0 + 2 * MINUTE,
+        expiresAt: T0 + 7 * MINUTE,
+      },
+    );
+    expect(direct?.uploadExpiresAt).toBe(T0 + 24 * 60 * MINUTE);
+    state.advance(2 * 60 * MINUTE);
+    expect(await state.t.action((ctx) => state.azure.sweep(ctx))).toBe(0);
   });
 
   it("guards component ready transitions and retains the first snapshot", async () => {

@@ -1,4 +1,4 @@
-import type { AzureBlobConfig } from "./config.js";
+import { DEFAULT_AUTHORITY_HOST, type AzureBlobConfig } from "./config.js";
 import { sasTime, SAS_VERSION } from "./sas.js";
 import type { UserDelegationKey } from "./sas.js";
 
@@ -15,7 +15,10 @@ export async function getAccessToken(config: AzureBlobConfig) {
       "Microsoft Entra client credentials are required when AZURE_BLOB_KEY is not set",
     );
   }
-  const tokenUrl = `${config.authorityHost}/${encodeURIComponent(config.tenantId)}/oauth2/v2.0/token`;
+  const authorityHost = (
+    config.authorityHost || DEFAULT_AUTHORITY_HOST
+  ).replace(/\/+$/, "");
+  const tokenUrl = `${authorityHost}/${encodeURIComponent(config.tenantId)}/oauth2/v2.0/token`;
   const response = await fetch(tokenUrl, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },

@@ -136,7 +136,8 @@ function UploadRow({
               Resume
             </button>
           )}
-        {["failed", "paused"].includes(item.status) && !canResume && (
+        {(item.status === "failed" ||
+          (item.status === "paused" && !canResume)) && (
           <button
             type="button"
             className="secondary"
