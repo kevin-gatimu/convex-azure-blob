@@ -104,6 +104,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { fileId: string },
         {
+          accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+          archiveStatus?:
+            | "rehydrate-pending-to-hot"
+            | "rehydrate-pending-to-cool"
+            | "rehydrate-pending-to-cold";
           blobName: string;
           blockSize?: number;
           container: string;
@@ -138,6 +143,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { blobName: string; container: string },
         {
+          accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+          archiveStatus?:
+            | "rehydrate-pending-to-hot"
+            | "rehydrate-pending-to-cool"
+            | "rehydrate-pending-to-cold";
           blobName: string;
           blockSize?: number;
           container: string;
@@ -200,6 +210,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           continueCursor: string;
           isDone: boolean;
           page: Array<{
+            accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+            archiveStatus?:
+              | "rehydrate-pending-to-hot"
+              | "rehydrate-pending-to-cool"
+              | "rehydrate-pending-to-cold";
             blobName: string;
             blockSize?: number;
             container: string;
@@ -249,6 +264,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { fileId: string; onUpload?: string; size: number; snapshot?: string },
         {
+          accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+          archiveStatus?:
+            | "rehydrate-pending-to-hot"
+            | "rehydrate-pending-to-cool"
+            | "rehydrate-pending-to-cold";
           blobName: string;
           blockSize?: number;
           container: string;
@@ -290,6 +310,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           snapshot?: string;
         },
         {
+          accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+          archiveStatus?:
+            | "rehydrate-pending-to-hot"
+            | "rehydrate-pending-to-cool"
+            | "rehydrate-pending-to-cold";
           blobName: string;
           blockSize?: number;
           container: string;
@@ -324,6 +349,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { cleanupUntil: number; fileId: string; now: number },
         {
+          accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+          archiveStatus?:
+            | "rehydrate-pending-to-hot"
+            | "rehydrate-pending-to-cool"
+            | "rehydrate-pending-to-cold";
           blobName: string;
           blockSize?: number;
           container: string;
@@ -358,6 +388,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { fileId: string; now: number },
         {
+          accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+          archiveStatus?:
+            | "rehydrate-pending-to-hot"
+            | "rehydrate-pending-to-cool"
+            | "rehydrate-pending-to-cold";
           blobName: string;
           blockSize?: number;
           container: string;
@@ -406,6 +441,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { expiresAt: number; fileId: string; now: number; uploadedBy: string },
         {
+          accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+          archiveStatus?:
+            | "rehydrate-pending-to-hot"
+            | "rehydrate-pending-to-cool"
+            | "rehydrate-pending-to-cold";
           blobName: string;
           blockSize?: number;
           container: string;
@@ -442,6 +482,20 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileId: string;
           fileName?: string;
           metadata?: Record<string, string>;
+        },
+        boolean,
+        Name
+      >;
+      updateTier: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          accessTier?: "Hot" | "Cool" | "Cold" | "Archive";
+          archiveStatus?:
+            | "rehydrate-pending-to-hot"
+            | "rehydrate-pending-to-cool"
+            | "rehydrate-pending-to-cold";
+          fileId: string;
         },
         boolean,
         Name
