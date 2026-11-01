@@ -35,11 +35,16 @@ import type { SasResponseHeaders } from "./sas.js";
 import type { UserDelegationKey } from "./sas.js";
 import { SNIFF_BYTES, sniffContentType } from "./sniff.js";
 import {
+  configHint,
   corsFailure,
+  DELEGATOR_HINT,
+  ENTRA_SIGNATURE_HINT,
   hintForError,
   hintForMessage,
+  KEY_FORMAT_HINT,
   NETWORK_HINT,
-  UPLOAD_HEADERS,
+  tokenHint,
+  uploadHeaders,
 } from "./setup.js";
 import type { SetupCheck, SetupResult } from "./setup.js";
 export type { SetupCheck, SetupResult } from "./setup.js";
@@ -604,15 +609,18 @@ export class AzureBlob {
 
   /**
    * Diagnoses the setup without changing anything: config, credentials, the container and,
-   * when `origin` is given, the browser CORS preflight. Hints never contain secrets or URLs.
+   * when `origin` is given, the browser CORS preflight. In Entra mode the container probe is
+   * signed with a user delegation key, so a wrong account name fails. The preflight asks for the
+   * headers the uploader sends in this mode; pass `checksum: true` when uploads send an `md5`.
+   * Hints never contain secrets or URLs.
    *
    * ```ts
    * const { ok, checks } = await azure.checkSetup(ctx, { origin: "https://app.example.com" });
    * ```
    */
   async checkSetup(
-    _ctx: RunActionCtx,
-    options: { origin?: string } = {},
+    ctx: RunActionCtx,
+    options: { origin?: string; checksum?: boolean } = {},
   ): Promise<SetupResult> {
     const checks: SetupCheck[] = [];
     const skipped = (name: string, prerequisite: string) =>
@@ -630,7 +638,7 @@ export class AzureBlob {
       checks.push({
         name: "config",
         ok: false,
-        hint: error instanceof Error ? error.message : "Invalid configuration",
+        hint: configHint(error),
       });
       skipped("credentials", "config");
       skipped("container", "config");
@@ -638,22 +646,22 @@ export class AzureBlob {
       return { ok: false, checks };
     }
 
-    // Entra only verifies the delegation key: a diagnostic must not write the cache.
-    let accessToken: string | undefined;
+    // Entra keeps the key only to sign the probe: a diagnostic must not write the cache.
+    let delegationKey: UserDelegationKey | undefined;
     let credentials: SetupCheck = { name: "credentials", ok: true };
     if (!config.accountKey) {
       try {
-        accessToken = await getAccessToken(config);
+        await getAccessToken(config);
       } catch (error) {
         credentials = {
           name: "credentials",
           ok: false,
-          hint: `Could not get a Microsoft Entra token: ${error instanceof Error ? error.message : "unknown error"}`,
+          hint: tokenHint(error),
         };
       }
-      if (accessToken) {
+      if (credentials.ok) {
         try {
-          await requestUserDelegationKey(config, this.now());
+          delegationKey = await requestUserDelegationKey(config, this.now());
         } catch (error) {
           const message = error instanceof Error ? error.message : "";
           credentials = {
@@ -661,10 +669,7 @@ export class AzureBlob {
             ok: false,
             hint: /fetch failed|network/i.test(message)
               ? NETWORK_HINT
-              : hintForMessage(
-                  message,
-                  "Azure refused the user delegation key request: assign Storage Blob Delegator to the identity",
-                ),
+              : hintForMessage(message, DELEGATOR_HINT),
           };
         }
       }
@@ -672,46 +677,82 @@ export class AzureBlob {
 
     let probe: Response | undefined;
     if (credentials.ok) {
+      let request:
+        { url: string; headers?: Record<string, string> } | undefined;
       try {
-        const request = await this.serverRequest(
-          config,
-          config.container,
-          `setup-check-${crypto.randomUUID()}`,
-          "r",
-          this.now() + 60_000,
-          accessToken,
-        );
-        probe = await fetch(request.url, {
-          method: "HEAD",
-          headers: { ...request.headers, "x-ms-version": SAS_VERSION },
-        });
-      } catch {
-        if (config.accountKey) {
-          credentials = {
-            name: "credentials",
-            ok: false,
-            hint: NETWORK_HINT,
+        const blobName = `setup-check-${crypto.randomUUID()}`;
+        if (delegationKey) {
+          const now = this.now();
+          const base = config.internalEndpoint ?? config.endpoint;
+          const sas = await this.signDelegationSas(
+            ctx,
+            config,
+            {
+              container: config.container,
+              blobName,
+              permissions: "r",
+              startsOn: now - CLOCK_SKEW_MS,
+              expiresOn: now + 60_000,
+              protocol: this.protocolFor(base),
+            },
+            delegationKey,
+          );
+          request = {
+            url: `${this.blobUrl(base, config.container, blobName)}?${sas}`,
           };
+        } else {
+          request = await this.serverRequest(
+            config,
+            config.container,
+            blobName,
+            "r",
+            this.now() + 60_000,
+          );
+        }
+      } catch {
+        credentials = {
+          name: "credentials",
+          ok: false,
+          hint: config.accountKey
+            ? KEY_FORMAT_HINT
+            : "Could not sign with the user delegation key: the key Azure returned is not usable",
+        };
+      }
+      if (request) {
+        try {
+          probe = await fetch(request.url, {
+            method: "HEAD",
+            headers: { ...request.headers, "x-ms-version": SAS_VERSION },
+          });
+        } catch {
+          if (config.accountKey) {
+            credentials = {
+              name: "credentials",
+              ok: false,
+              hint: NETWORK_HINT,
+            };
+          }
         }
       }
     }
     const probeCode = probe?.headers.get("x-ms-error-code") ?? null;
-    const isAuthError =
-      probeCode === "AuthenticationFailed" ||
-      probeCode === "KeyBasedAuthenticationNotPermitted" ||
-      probeCode === "AuthorizationFailure";
-    if (config.accountKey && probe && isAuthError) {
-      credentials = {
-        name: "credentials",
-        ok: false,
-        // Azure answers a SAS with a bad signature as AuthorizationFailure.
-        hint: hintForError(
-          probeCode === "AuthorizationFailure"
-            ? "AuthenticationFailed"
-            : probeCode,
-          probe.status,
-        ),
-      };
+    if (credentials.ok && probe) {
+      const signatureRejected =
+        probeCode === "AuthenticationFailed" ||
+        probeCode === "AuthorizationFailure";
+      if (
+        signatureRejected ||
+        (config.accountKey &&
+          probeCode === "KeyBasedAuthenticationNotPermitted")
+      ) {
+        credentials = {
+          name: "credentials",
+          ok: false,
+          hint: config.accountKey
+            ? hintForError(probeCode, probe.status)
+            : ENTRA_SIGNATURE_HINT,
+        };
+      }
     }
     checks.push(credentials);
 
@@ -731,6 +772,10 @@ export class AzureBlob {
 
     if (options.origin !== undefined) {
       const origin = options.origin;
+      const required = uploadHeaders(
+        this.options.blockUploads === true,
+        options.checksum === true,
+      );
       let hint: string | null;
       try {
         const response = await fetch(
@@ -744,11 +789,11 @@ export class AzureBlob {
             headers: {
               origin,
               "access-control-request-method": "PUT",
-              "access-control-request-headers": UPLOAD_HEADERS.join(","),
+              "access-control-request-headers": required.join(","),
             },
           },
         );
-        hint = corsFailure(response, origin);
+        hint = corsFailure(response, origin, required);
       } catch {
         hint = NETWORK_HINT;
       }

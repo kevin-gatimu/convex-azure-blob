@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-- Add `AzureBlob.checkSetup(ctx, { origin? })` and the exported `SetupCheck` and
-  `SetupResult` types. It checks the config, credentials, container and, given
-  an origin, the CORS preflight for uploads, and returns fix hints keyed on
-  Azure error codes. The result never contains the key, a SAS, a token, or a
-  URL. The example app exposes it as the internal `photos:checkSetup` action.
+- Add `AzureBlob.checkSetup(ctx, { origin?, checksum? })` and the exported
+  `SetupCheck` and `SetupResult` types. It checks the config, credentials,
+  container and, given an origin, the CORS preflight for the headers the
+  uploader sends, and returns fix hints keyed on Azure error codes. The result
+  never contains the key, a SAS, a token, or a URL. The example app exposes it
+  as the internal `photos:checkSetup` action.
 - Add server-side access tier defaults, `setTier`, `rehydrate`, and
   `refreshTier`, plus exported access-tier/archive-status validators and
   optional file properties. Archived files stay unservable through rehydration;

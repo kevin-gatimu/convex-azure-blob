@@ -971,7 +971,7 @@ check, each with a fix hint when it fails:
 
 ```ts
 export const checkSetup = internalAction({
-  args: { origin: v.optional(v.string()) },
+  args: { origin: v.optional(v.string()), checksum: v.optional(v.boolean()) },
   handler: async (ctx, args) => await azure.checkSetup(ctx, args),
 });
 ```
@@ -985,12 +985,22 @@ example app.
 | `config`      | the required environment variables resolve (the hint names the missing ones)                                   |
 | `credentials` | Azure accepts a signed request (shared key), or a Microsoft Entra token and a user delegation key are obtained |
 | `container`   | a read probe for a random blob name answers `BlobNotFound`, so the container exists and the identity can read  |
-| `cors`        | with `origin`, a `PUT` preflight for the upload headers is allowed on the endpoint browsers use                |
+| `cors`        | with `origin`, a `PUT` preflight for the headers the uploader sends is allowed on the endpoint browsers use    |
 
 A check is skipped, with the hint `skipped: <check> failed`, when an earlier one
 it depends on fails. The Entra check only verifies that a delegation key can be
 requested; it does not cache it, so run `refreshUserDelegationKey` separately.
-The result never contains the key, a SAS, a token, or a URL.
+In Entra mode the container probe uses a 60-second user-delegation SAS, so a
+wrong `AZURE_BLOB_ACCOUNT` fails the `credentials` check. A malformed
+`AZURE_BLOB_KEY` also fails `credentials`, not as an unreachable endpoint.
+
+The `cors` preflight asks for `x-ms-blob-type` and `content-type`; with
+`blockUploads` it asks for `content-type` only, and `checksum: true` (uploads
+that send an `md5`) adds `content-md5` unless `blockUploads` is on, since block
+uploads don't support `md5`. Azure answers a bad signature or a storage account
+firewall block as `AuthorizationFailure`, so that hint names the account key,
+the clock, and the firewall or network rules (for example Convex's egress). The
+result never contains the key, a SAS, a token, or a URL.
 
 ## Local development with Azurite
 
@@ -1086,7 +1096,7 @@ query methods from mutations and actions too.
 | `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                                        |
 | `storeFromUrl(ctx, { sourceUrl, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`  | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                                        |
 | `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key           |
-| `checkSetup(ctx, { origin? }?)`                                                               | action       | `{ ok, checks: [{ name, ok, hint? }] }`; see [Checking your setup](#checking-your-setup) |
+| `checkSetup(ctx, { origin?, checksum? }?)`                                                    | action       | `{ ok, checks: [{ name, ok, hint? }] }`; see [Checking your setup](#checking-your-setup) |
 | `scanMalware(ctx, limit?)`                                                                    | action       | number of due Defender scan jobs checked                                                 |
 | `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | public upload functions and internal `scanMalware` action                                |
 | `eventGridHandler({ secret, onUpload? })`                                                     | module scope | HTTP action for standard-schema Event Grid BlobCreated events                            |

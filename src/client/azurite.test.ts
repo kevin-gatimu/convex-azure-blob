@@ -86,7 +86,11 @@ describe.skipIf(!endpoint)("against Azurite", () => {
       config: { ...config, accountKey: btoa("not-the-azurite-key") },
     });
     const bad = await t.action((ctx) => wrongKey.checkSetup(ctx));
-    expect(bad.checks[1]).toMatchObject({ name: "credentials", ok: false });
+    expect(bad.checks[1]).toMatchObject({
+      name: "credentials",
+      ok: false,
+      hint: expect.stringMatching(/key.*clock/),
+    });
   });
 
   it("checkSetup reports an origin without a CORS rule as failed", async () => {

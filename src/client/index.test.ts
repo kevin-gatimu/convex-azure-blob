@@ -3460,6 +3460,165 @@ describe("checkSetup", () => {
     });
   });
 
+  it("keeps only the status of the package's own token error", async () => {
+    const { t, azure } = setupEntra();
+    const entra = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("/oauth2/v2.0/token"))
+        return new Response("nope", { status: 401 });
+      return await entra(url, init);
+    });
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[1]?.hint).toBe(
+      "Could not get a Microsoft Entra token: the token request failed with 401",
+    );
+  });
+
+  it("uses a generic hint when the token request rejects or returns malformed JSON", async () => {
+    for (const respond of [
+      () => {
+        throw new Error(
+          "connect failed https://login.example.com/t?code=s3cret",
+        );
+      },
+      () => new Response("{not json s3cret", { status: 200 }),
+    ]) {
+      const { t, azure } = setupEntra();
+      const entra = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url, init) => {
+        if (String(url).includes("/oauth2/v2.0/token")) return respond();
+        return await entra(url, init);
+      });
+      const result = await t.action((ctx) => azure.checkSetup(ctx));
+      const text = JSON.stringify(result.checks);
+      expect(result.checks[1]).toMatchObject({
+        name: "credentials",
+        ok: false,
+      });
+      expect(text).not.toMatch(/s3cret|login\.example|https?:\/\/|\?/);
+      expect(text).toContain("tenant id, client id, client secret");
+    }
+  });
+
+  it("probes with a user delegation SAS and no bearer header in Entra mode", async () => {
+    const { t, azure } = setupEntra();
+    stubSetup(blobNotFound);
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.ok).toBe(true);
+    const head = fetchMock.mock.calls.find(([, i]) => i?.method === "HEAD");
+    const query = params(String(head?.[0]));
+    expect(query.get("sp")).toBe("r");
+    expect(query.get("skoid")).toBe("11111111-2222-3333-4444-555555555555");
+    expect(query.get("sktid")).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    expect(
+      Object.keys(head?.[1]?.headers ?? {}).map((name) => name.toLowerCase()),
+    ).not.toContain("authorization");
+    expect(Date.parse(query.get("se")!) - T0).toBeLessThanOrEqual(MINUTE);
+  });
+
+  it.each(["AuthenticationFailed", "AuthorizationFailure"])(
+    "points at AZURE_BLOB_ACCOUNT when Entra mode answers %s",
+    async (code) => {
+      const { t, azure } = setupEntra();
+      stubSetup(() => azureError(403, code));
+      const result = await t.action((ctx) => azure.checkSetup(ctx));
+      expect(result.checks[1]).toMatchObject({
+        name: "credentials",
+        ok: false,
+        hint: expect.stringMatching(/AZURE_BLOB_ACCOUNT.*storage account/),
+      });
+      expect(result.checks[2]?.hint).toBe("skipped: credentials failed");
+    },
+  );
+
+  it("reports a malformed account key as a credentials failure, not an unreachable endpoint", async () => {
+    const { t, azure } = setup({
+      config: { ...config, accountKey: "***not base64***" },
+    });
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[1]).toEqual({
+      name: "credentials",
+      ok: false,
+      hint: expect.stringContaining("not a valid base64 account key"),
+    });
+    expect(JSON.stringify(result.checks)).not.toContain("unreachable");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("covers both a bad key or clock and the firewall for AuthorizationFailure", async () => {
+    const { t, azure } = setup();
+    stubSetup(() => azureError(403, "AuthorizationFailure"));
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[1]?.hint).toMatch(/key.*clock.*firewall/);
+  });
+
+  it.each([
+    ["default", {}, {}, "x-ms-blob-type,content-type"],
+    [
+      "checksum",
+      {},
+      { checksum: true },
+      "x-ms-blob-type,content-type,content-md5",
+    ],
+    ["block uploads", { blockUploads: true }, {}, "content-type"],
+    [
+      "block uploads, ignoring checksum",
+      { blockUploads: true },
+      { checksum: true },
+      "content-type",
+    ],
+  ])(
+    "requests the %s upload headers in the preflight",
+    async (_name, azureOptions, checkOptions, expected) => {
+      const { t, azure } = setup(azureOptions);
+      const requested: string[] = [];
+      stubSetup(blobNotFound, () => {
+        const headers = fetchMock.mock.calls.at(-1)?.[1]?.headers as Record<
+          string,
+          string
+        >;
+        requested.push(headers["access-control-request-headers"]!);
+        return new Response(null, {
+          headers: {
+            "access-control-allow-origin": ORIGIN,
+            "access-control-allow-methods": "PUT",
+            "access-control-allow-headers": expected,
+          },
+        });
+      });
+      const ok = await t.action((ctx) =>
+        azure.checkSetup(ctx, { origin: ORIGIN, ...checkOptions }),
+      );
+      expect(ok.ok).toBe(true);
+      expect(requested).toEqual([expected]);
+
+      stubSetup(blobNotFound, () => azureError(403, "CorsPreflightFailure"));
+      const failed = await t.action((ctx) =>
+        azure.checkSetup(ctx, { origin: ORIGIN, ...checkOptions }),
+      );
+      expect(failed.checks.at(-1)?.hint).toContain(
+        `allowed headers ${expected.replaceAll(",", ", ")}`,
+      );
+    },
+  );
+
+  it("rejects a preflight missing content-md5 when checksum is true", async () => {
+    const { t, azure } = setup();
+    stubSetup(blobNotFound);
+    const result = await t.action((ctx) =>
+      azure.checkSetup(ctx, { origin: ORIGIN, checksum: true }),
+    );
+    expect(result.checks.at(-1)).toMatchObject({ name: "cors", ok: false });
+  });
+
+  it("states the Delegator and Contributor scopes separately", async () => {
+    const { t, azure } = setupEntra();
+    stubSetup(() => azureError(403, "AuthorizationPermissionMismatch"));
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result.checks[2]?.hint).toMatch(
+      /Contributor at the storage account or container scope.*Delegator at the storage account scope or above/,
+    );
+  });
   it("reports an unreachable endpoint without throwing", async () => {
     const { t, azure } = setup();
     fetchMock.mockRejectedValue(new TypeError("fetch failed"));
