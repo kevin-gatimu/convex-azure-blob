@@ -639,6 +639,35 @@ and `getUrl` returns `<base>/<blob name>` with no token. That makes URLs
 permanent and easy to cache at the edge. Download URLs are still signed, since
 they need a `Content-Disposition` override.
 
+## Reading files from actions
+
+`read` fetches a ready file's bytes inside an action, for thumbnails, parsing or
+re-uploading. It returns a `Response`, or `null` if the file is unknown or not
+`ready`. Check the caller's permission first.
+
+```ts
+export const thumbnail = action({
+  args: { fileId: v.string() },
+  handler: async (ctx, { fileId }) => {
+    await requireUserInAction(ctx);
+    const response = await azure.read(ctx, fileId);
+    if (!response) return null;
+    const image = new Uint8Array(await response.arrayBuffer());
+    // ...resize, then azure.store(ctx, { data, contentType, uploadedBy })
+  },
+});
+
+// Only the first kilobyte (end is inclusive); Azure answers 206.
+const head = await azure.read(ctx, fileId, { range: { start: 0, end: 1023 } });
+```
+
+`start` must be a non-negative integer and `end`, if given, an integer no
+smaller than `start`; otherwise `read` throws. Any other Azure status than 200
+(206 when `range` is given) throws an error with the status only, never the URL
+or SAS, and the returned `Response` has an empty `url`. The request uses a
+one-minute read-only SAS (or your Entra token) against the internal endpoint, so
+the bytes stream from Azure to the action, not through a browser URL.
+
 ## Listing files and metadata
 
 ```ts
@@ -937,6 +966,7 @@ query methods from mutations and actions too.
 | `renewUploadUrl(ctx, { fileId, uploadedBy })`                                                 | mutation     | Same pending upload ticket with a renewed expiry; authorize the uploader first. |
 | `confirmUpload(ctx, fileId, onUpload?)`                                                       | action       | `{ ok: true, size, contentType }` or `{ ok: false, reason }`                    |
 | `getFile(ctx, fileId)`                                                                        | query        | `FileDoc` or `null`                                                             |
+| `read(ctx, fileId, { range?: { start, end? } }?)`                                             | action       | `Response` (200, or 206 with `range`), or `null` unless the file is `ready`     |
 | `getUrl(ctx, fileId, { download?, cacheControl? })`                                           | query        | URL or `null`                                                                   |
 | `urlForFile(file, { download?, cacheControl? }, ctx?)`                                        | anywhere     | URL or `null`                                                                   |
 | `list(ctx, { uploadedBy?, paginationOpts })`                                                  | query        | `PaginationResult<FileDoc>`                                                     |

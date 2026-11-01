@@ -901,6 +901,68 @@ export class AzureBlob {
   }
 
   /**
+   * Streams a ready file's bytes from an action, or returns null if the file is unknown or not
+   * ready. `range` is an inclusive byte range and must yield a 206 response. The returned
+   * Response has no `url`, so the signed URL can't leak from it. Run your own permission
+   * checks first.
+   *
+   * @example
+   * ```ts
+   * const response = await azure.read(ctx, fileId, { range: { start: 0, end: 1023 } });
+   * const head = response ? new Uint8Array(await response.arrayBuffer()) : null;
+   * ```
+   */
+  async read(
+    ctx: RunActionCtx,
+    fileId: string,
+    options: { range?: { start: number; end?: number } } = {},
+  ): Promise<Response | null> {
+    const range = options.range;
+    if (range) {
+      if (!Number.isSafeInteger(range.start) || range.start < 0)
+        throw new ConvexError("Range start must be a non-negative integer");
+      if (
+        range.end !== undefined &&
+        (!Number.isSafeInteger(range.end) || range.end < range.start)
+      )
+        throw new ConvexError(
+          "Range end must be an integer no smaller than start",
+        );
+    }
+    const file = await this.getFile(ctx, fileId);
+    if (!file || file.status !== "ready") return null;
+    if (file.uploadMode === "blocks" && !file.snapshot) return null;
+    const request = await this.serverRequest(
+      this.config(),
+      file.container,
+      file.blobName,
+      "r",
+      undefined,
+      undefined,
+      file.snapshot ? { snapshot: file.snapshot } : {},
+    );
+    const response = await fetch(request.url, {
+      method: "GET",
+      headers: {
+        ...request.headers,
+        ...(range
+          ? { "x-ms-range": `bytes=${range.start}-${range.end ?? ""}` }
+          : {}),
+      },
+    });
+    if (response.status !== (range ? 206 : 200)) {
+      await response.body?.cancel();
+      throw new Error(`Azure Blob read failed with ${response.status}`);
+    }
+    // A fresh Response, because the original's `url` carries the SAS.
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
+
+  /**
    * Checks the uploaded blob's size, type and (by default) leading bytes against what was
    * reserved. A blob that fails is deleted and its file removed. Confirming twice is harmless.
    * An optional app mutation attaches the file atomically; a failure rolls back confirmation.

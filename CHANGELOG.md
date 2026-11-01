@@ -8,6 +8,10 @@
   cleanup until expiry plus clock skew. File records gain optional
   `nextAttemptAt` and `sweepAttempts`; the component adds `deferSweep` and an
   indexed due-time selection. The README documents the options and cron wrapper.
+- Add `AzureBlob.read(ctx, fileId, { range? })` to read a ready file's bytes
+  from an action, optionally an inclusive byte range (206). It returns null for
+  an unknown or not-ready file, and throws without exposing the URL or SAS when
+  Azure answers with an error.
 - Add `storeFromUrl` to copy HTTPS sources directly into Azure Blob Storage,
   then apply the normal size, content-type and signature checks. Azure's
   synchronous copy is limited to 5,000 MiB; the README documents source URL
