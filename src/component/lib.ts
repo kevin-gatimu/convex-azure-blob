@@ -571,8 +571,10 @@ export const deferSweep = mutation({
     const row = await ctx.db.get("files", args.fileId);
     if (!row || row.status !== "deleting") return null;
     if (args.nextAttemptAt !== undefined) {
+      // Not a failure: reset the count so a later real failure starts at the shortest backoff.
       await ctx.db.patch("files", row._id, {
         nextAttemptAt: args.nextAttemptAt,
+        sweepAttempts: undefined,
       });
     } else {
       const sweepAttempts = (row.sweepAttempts ?? 0) + 1;

@@ -638,7 +638,7 @@ export class AzureBlob {
       fileName: args.fileName,
       metadata: args.metadata,
       ...(this.options.requireMalwareScan ? { malwareScanRequired: true } : {}),
-      ...(args.md5 ? { md5: args.md5 } : {}),
+      ...(args.md5 !== undefined ? { md5: args.md5 } : {}),
       createdAt,
       uploadExpiresAt,
       ...(blocks
