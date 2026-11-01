@@ -1535,6 +1535,36 @@ describe("purge and sweep", () => {
     expect(await file(id)).toBeNull();
   });
 
+  it("resets failure attempts when a delete is deferred for a live upload URL", async () => {
+    const t = convexTest(componentTest.schema, componentTest.modules);
+    const fileId = await t.run((ctx) =>
+      ctx.db.insert("files", {
+        container: "uploads",
+        blobName: crypto.randomUUID(),
+        contentType: "image/png",
+        maxBytes: 1024,
+        uploadedBy: "u1",
+        status: "deleting",
+        createdAt: T0,
+        sweepAttempts: 4,
+        nextAttemptAt: T0,
+      }),
+    );
+    await t.mutation(componentApi.lib.deferSweep, {
+      fileId,
+      now: T0,
+      nextAttemptAt: T0 + MINUTE,
+    });
+    const row = await t.run((ctx) => ctx.db.get("files", fileId));
+    expect(row).toMatchObject({ nextAttemptAt: T0 + MINUTE });
+    expect(row?.sweepAttempts).toBeUndefined();
+    await t.mutation(componentApi.lib.deferSweep, { fileId, now: T0 });
+    expect(await t.run((ctx) => ctx.db.get("files", fileId))).toMatchObject({
+      sweepAttempts: 1,
+      nextAttemptAt: T0 + MINUTE,
+    });
+  });
+
   it("includes undefined and due nextAttemptAt in the bounded index range, including legacy calls", async () => {
     const t = convexTest(componentTest.schema, componentTest.modules);
     const insert = (nextAttemptAt?: number) =>
@@ -1707,7 +1737,7 @@ describe("storeFromUrl", () => {
     ],
   ])(
     "rejects unsafe source URL %s before Azure requests",
-    async (sourceUrl) => {
+    async (sourceUrl, reason) => {
       const { t, azure } = setup();
       expect(
         await t.action((ctx) =>
@@ -1719,7 +1749,7 @@ describe("storeFromUrl", () => {
         ),
       ).toMatchObject({
         ok: false,
-        reason: expect.stringContaining("Source URL"),
+        reason: expect.stringContaining(reason),
       });
       expect(fetchMock).not.toHaveBeenCalled();
     },
