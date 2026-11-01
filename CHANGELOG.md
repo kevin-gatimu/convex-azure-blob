@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add bounded sweep concurrency (default 8) and optional internal-action drain
+  scheduling with `continueWith`, `run`, and `maxRuns` (default 10). Failed blob
+  deletes use exponential backoff capped at 24 hours; live upload URLs defer
+  cleanup until expiry plus clock skew. File records gain optional
+  `nextAttemptAt` and `sweepAttempts`; the component adds `deferSweep` and an
+  indexed due-time selection. The README documents the options and cron wrapper.
+
 - Add `eventGridHandler({ secret, onUpload? })` for standard-schema Azure Event
   Grid `BlobCreated` events. It handles subscription validation, confirms
   tracked uploads through the normal checks, and makes repeated delivery safe.

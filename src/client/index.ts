@@ -63,6 +63,10 @@ type RunActionCtx = Pick<
   "runQuery" | "runMutation"
 >;
 
+type SweepCtx = RunActionCtx & {
+  scheduler?: Pick<GenericActionCtx<GenericDataModel>["scheduler"], "runAfter">;
+};
+
 /** A file as the component stores it. `fileId` is what the app keeps on its own documents. */
 export type FileDoc = { fileId: string } & ObjectType<typeof fileFields>;
 export type FileStatus = FileDoc["status"];
@@ -1396,35 +1400,86 @@ export class AzureBlob {
       method: "DELETE",
       headers: { ...request.headers, "x-ms-delete-snapshots": "include" },
     });
-    if (!response.ok && response.status !== 404) return false;
-    if (
-      this.now() >=
-      effectiveUploadExpiry(file, this.uploadTtlMs) + CLOCK_SKEW_MS
-    ) {
+    const now = this.now();
+    if (!response.ok && response.status !== 404) {
+      await ctx.runMutation(this.component.lib.deferSweep, {
+        fileId: file.fileId,
+        now,
+      });
+      return false;
+    }
+    const nextAttemptAt =
+      effectiveUploadExpiry(file, this.uploadTtlMs) + CLOCK_SKEW_MS;
+    if (now >= nextAttemptAt) {
       await ctx.runMutation(this.component.lib.remove, { fileId: file.fileId });
+    } else {
+      await ctx.runMutation(this.component.lib.deferSweep, {
+        fileId: file.fileId,
+        now,
+        nextAttemptAt,
+      });
     }
     return true;
   }
 
   /**
    * Deletes the blobs and rows of files marked for deletion and of uploads never confirmed
-   * (pending longer than `pendingOlderThanMs`, default one hour). Returns how many blobs it
-   * deleted (or found already gone).
-   * Run it from a cron.
+   * (pending longer than `pendingOlderThanMs`, default one hour), `concurrency` (default 8) at a
+   * time. Returns how many blobs it deleted (or found already gone). Run it from a cron; pass
+   * `continueWith` (the calling action) to keep draining a backlog for up to `maxRuns` runs.
    */
   async sweep(
-    ctx: RunActionCtx,
-    args: { pendingOlderThanMs?: number; limit?: number } = {},
-  ) {
+    ctx: SweepCtx,
+    args: {
+      pendingOlderThanMs?: number;
+      limit?: number;
+      concurrency?: number;
+      continueWith?: FunctionReference<"action", "internal", { run?: number }>;
+      run?: number;
+      maxRuns?: number;
+    } = {},
+  ): Promise<number> {
+    const concurrency = args.concurrency ?? 8;
+    const run = args.run ?? 0;
+    const maxRuns = args.maxRuns ?? 10;
+    for (const [name, value, minimum] of [
+      ["concurrency", concurrency, 1],
+      ["run", run, 0],
+      ["maxRuns", maxRuns, 1],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < minimum)
+        throw new ConvexError(`${name} must be an integer >= ${minimum}`);
+    }
+    const scheduler = ctx.scheduler;
+    if (args.continueWith && !scheduler)
+      throw new ConvexError("sweep continuation requires a scheduler");
+    if (!Number.isFinite(args.limit ?? 100))
+      throw new ConvexError("limit must be finite");
+    // Same clamp as claimSweepable, so a full claim reliably signals a remaining backlog.
+    const limit = Math.max(1, Math.min(Math.floor(args.limit ?? 100), 200));
+    const now = this.now();
     const stale = await ctx.runMutation(this.component.lib.claimSweepable, {
-      pendingBefore:
-        this.now() - (args.pendingOlderThanMs ?? DEFAULT_PENDING_TTL_MS),
-      limit: args.limit ?? 100,
-      now: this.now(),
+      pendingBefore: now - (args.pendingOlderThanMs ?? DEFAULT_PENDING_TTL_MS),
+      limit,
+      now,
     });
     let removed = 0;
-    for (const file of stale) {
-      if (await this.removeBlobAndRow(ctx, file)) removed += 1;
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, stale.length) }, async () => {
+        while (next < stale.length) {
+          const file = stale[next++];
+          if (await this.removeBlobAndRow(ctx, file)) removed += 1;
+        }
+      }),
+    );
+    if (
+      args.continueWith &&
+      scheduler &&
+      stale.length === limit &&
+      run + 1 < maxRuns
+    ) {
+      await scheduler.runAfter(0, args.continueWith, { run: run + 1 });
     }
     return removed;
   }
