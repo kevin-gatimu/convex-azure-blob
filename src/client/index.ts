@@ -166,6 +166,7 @@ const MAX_MALWARE_SCAN_BATCH = 50;
 // Start times are backdated so a client whose clock runs slow is not refused.
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SERVER_SAS_TTL_MS = 60 * 1000;
+const MAX_PUT_BLOB_FROM_URL_BYTES = 5000 * 1024 * 1024;
 const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 2 * 24 * 60 * 60 * 1000;
 const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
 const isTransientAzureStatus = (status: number) =>
@@ -1538,6 +1539,97 @@ export class AzureBlob {
       return {
         ok: false,
         reason: `Azure Blob upload failed with ${response.status}`,
+      };
+    }
+    const confirmed = await this.confirmUpload(ctx, fileId);
+    return confirmed.ok ? { ok: true, fileId } : confirmed;
+  }
+
+  /** Copies an HTTPS source directly into Azure, then applies the normal upload checks. */
+  async storeFromUrl(
+    ctx: RunActionCtx,
+    args: {
+      sourceUrl: string;
+      contentType: string;
+      uploadedBy: string;
+      maxBytes?: number;
+      fileName?: string;
+      metadata?: Record<string, string>;
+    },
+  ): Promise<StoreResult> {
+    const { sourceUrl: sourceAddress, ...rest } = args;
+    let source: URL;
+    try {
+      source = new URL(sourceAddress);
+    } catch {
+      return { ok: false, reason: "Source URL must be a valid HTTPS URL" };
+    }
+    if (
+      source.protocol !== "https:" ||
+      source.username ||
+      source.password ||
+      source.href.includes("#")
+    ) {
+      return {
+        ok: false,
+        reason:
+          "Source URL must be HTTPS and cannot include credentials or a fragment",
+      };
+    }
+    if (source.href.length > 2 * 1024) {
+      return { ok: false, reason: "Source URL must be no longer than 2 KiB" };
+    }
+
+    const config = this.config();
+    const accessToken = config.accountKey
+      ? undefined
+      : await getAccessToken(config);
+    const { fileId, blobName, contentType, uploadExpiresAt } =
+      await this.reserve(
+        ctx,
+        config,
+        {
+          ...rest,
+          maxBytes: Math.min(
+            args.maxBytes ?? this.ceiling,
+            this.ceiling,
+            MAX_PUT_BLOB_FROM_URL_BYTES,
+          ),
+        },
+        SERVER_SAS_TTL_MS,
+      );
+    const request = await this.serverRequest(
+      config,
+      config.container,
+      blobName,
+      "c",
+      uploadExpiresAt,
+      accessToken,
+    );
+    let response: Response;
+    try {
+      response = await fetch(request.url, {
+        method: "PUT",
+        headers: {
+          ...request.headers,
+          "content-length": "0",
+          "x-ms-blob-type": "BlockBlob",
+          "x-ms-blob-content-type": contentType,
+          "x-ms-copy-source": source.href,
+        },
+      });
+    } catch {
+      await this.purge(ctx, fileId);
+      return { ok: false, reason: "Azure Blob URL copy request failed" };
+    }
+    if (response.status !== 201) {
+      await this.purge(ctx, fileId);
+      return {
+        ok: false,
+        reason:
+          response.status === 409
+            ? "Azure Blob URL copy failed with 409; the source must have a valid Content-Length and be no larger than 5,000 MiB"
+            : `Azure Blob URL copy failed with ${response.status}`,
       };
     }
     const confirmed = await this.confirmUpload(ctx, fileId);

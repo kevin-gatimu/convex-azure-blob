@@ -1335,6 +1335,169 @@ describe("store", () => {
   });
 });
 
+describe("storeFromUrl", () => {
+  it("copies an HTTPS source as a block blob and confirms it", async () => {
+    const maxBytes = 6000 * 1024 * 1024;
+    const state = setup({ maxBytes });
+    stubBlob({ length: PNG.length });
+    const blobFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "PUT") return new Response(null, { status: 201 });
+      return await blobFetch(url, init);
+    });
+    const sourceUrl = "https://source.example/image.png?sig=fake";
+    const result = await state.t.action((ctx) =>
+      state.azure.storeFromUrl(ctx, {
+        sourceUrl,
+        contentType: "IMAGE/PNG; charset=binary",
+        uploadedBy: "u1",
+        maxBytes,
+        fileName: "import.png",
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    expect(methods()).toEqual(["PUT", "HEAD", "GET"]);
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(params(String(url)).get("sp")).toBe("c");
+    expect(init?.headers).toMatchObject({
+      "content-length": "0",
+      "x-ms-blob-type": "BlockBlob",
+      "x-ms-blob-content-type": "image/png",
+      "x-ms-copy-source": sourceUrl,
+    });
+    if (result.ok)
+      expect(await state.file(result.fileId)).toMatchObject({
+        status: "ready",
+        fileName: "import.png",
+        maxBytes: 5000 * 1024 * 1024,
+      });
+  });
+
+  it.each([
+    ["not a URL", "Source URL must be a valid HTTPS URL"],
+    ["http://source.example/image.png", "Source URL must be HTTPS"],
+    ["https://source.example/image.png#fragment", "cannot include credentials"],
+    [
+      `https://source.example/${"a".repeat(2048)}`,
+      "Source URL must be no longer than 2 KiB",
+    ],
+  ])(
+    "rejects unsafe source URL %s before Azure requests",
+    async (sourceUrl) => {
+      const { t, azure } = setup();
+      expect(
+        await t.action((ctx) =>
+          azure.storeFromUrl(ctx, {
+            sourceUrl,
+            contentType: "image/png",
+            uploadedBy: "u1",
+          }),
+        ),
+      ).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining("Source URL"),
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reports the 409 source limit and attempts cleanup", async () => {
+    const state = setup();
+    fetchMock.mockImplementation(async (_url, init) =>
+      init?.method === "DELETE"
+        ? new Response(null, { status: 202 })
+        : new Response(null, { status: 409 }),
+    );
+    const result = await state.t.action((ctx) =>
+      state.azure.storeFromUrl(ctx, {
+        sourceUrl: "https://source.example/large.bin",
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        "Azure Blob URL copy failed with 409; the source must have a valid Content-Length and be no larger than 5,000 MiB",
+    });
+    expect(methods()).toEqual(["PUT", "DELETE"]);
+  });
+
+  it("cleans up an Azure copy failure without exposing the source URL", async () => {
+    const state = setup();
+    const sourceUrl = "https://source.example/file.png?sig=private";
+    fetchMock.mockImplementation(async (_url, init) =>
+      init?.method === "DELETE"
+        ? new Response(null, { status: 202 })
+        : new Response(null, { status: 403 }),
+    );
+    const result = await state.t.action((ctx) =>
+      state.azure.storeFromUrl(ctx, {
+        sourceUrl,
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Azure Blob URL copy failed with 403",
+    });
+    expect(methods()).toEqual(["PUT", "DELETE"]);
+    expect(JSON.stringify(result)).not.toContain(sourceUrl);
+  });
+
+  it("cleans up when the Azure copy request rejects", async () => {
+    const state = setup();
+    const sourceUrl = "https://source.example/file.png?sig=private";
+    fetchMock.mockImplementation(async (_url, init) => {
+      if (init?.method === "PUT") throw new Error(`unreachable ${sourceUrl}`);
+      return new Response(null, { status: 202 });
+    });
+
+    const result = await state.t.action((ctx) =>
+      state.azure.storeFromUrl(ctx, {
+        sourceUrl,
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Azure Blob URL copy request failed",
+    });
+    expect(methods()).toEqual(["PUT", "DELETE"]);
+    expect(JSON.stringify(result)).not.toContain(sourceUrl);
+  });
+
+  it("deletes a copied blob rejected by the normal signature check", async () => {
+    const state = setup();
+    stubBlob({ length: PNG.length, bytes: new Uint8Array([1, 2, 3]) });
+    const blobFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "PUT") return new Response(null, { status: 201 });
+      return await blobFetch(url, init);
+    });
+
+    expect(
+      await state.t.action((ctx) =>
+        state.azure.storeFromUrl(ctx, {
+          sourceUrl: "https://source.example/not-a-png",
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      ),
+    ).toEqual({
+      ok: false,
+      reason: "The file content does not match its type",
+    });
+    expect(methods()).toEqual(["PUT", "HEAD", "GET", "DELETE"]);
+  });
+});
+
 describe("Microsoft Entra user-delegation SAS", () => {
   it("refreshes only when the cached key has less than two days remaining", async () => {
     const { t, azure, advance } = setupEntra();
@@ -1495,6 +1658,31 @@ describe("Microsoft Entra user-delegation SAS", () => {
       expect(params(String(url)).has("sig")).toBe(false);
       expect(init?.headers).toMatchObject({
         authorization: "Bearer access-token",
+        "x-ms-version": "2022-11-02",
+      });
+    }
+
+    fetchMock.mockClear();
+    const storedFromUrl = await t.action((ctx) =>
+      azure.storeFromUrl(ctx, {
+        sourceUrl: "https://source.example/image.png",
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(storedFromUrl.ok).toBe(true);
+    const copyCalls = fetchMock.mock.calls.filter(
+      ([url]) => !String(url).includes("/oauth2/v2.0/token"),
+    );
+    expect(copyCalls.map(([, init]) => init?.method ?? "GET")).toEqual([
+      "PUT",
+      "HEAD",
+      "GET",
+    ]);
+    for (const [url, init] of copyCalls) {
+      expect(params(String(url)).has("sig")).toBe(false);
+      expect(init?.headers).toMatchObject({
+        authorization: expect.stringMatching(/^Bearer /),
         "x-ms-version": "2022-11-02",
       });
     }
