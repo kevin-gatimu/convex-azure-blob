@@ -4,6 +4,7 @@
 //
 //   docker compose up -d azurite && npm run azurite:setup
 //   AZURITE_BLOB_ENDPOINT=http://127.0.0.1:10000/devstoreaccount1 npm test
+import { createHash } from "node:crypto";
 import { convexTest } from "convex-test";
 import { defineSchema } from "convex/server";
 import { describe, expect, it } from "vitest";
@@ -123,6 +124,45 @@ describe.skipIf(!endpoint)("against Azurite", () => {
     }
   });
 
+  it("refuses a PUT whose body does not match the ticket's Content-MD5", async () => {
+    const { t, azure } = setup();
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        md5: "AAAAAAAAAAAAAAAAAAAAAA==",
+      }),
+    );
+    expect(ticket.headers["Content-MD5"]).toBe("AAAAAAAAAAAAAAAAAAAAAA==");
+    const put = await fetch(ticket.uploadUrl, {
+      method: "PUT",
+      headers: ticket.headers,
+      body: PNG,
+    });
+    expect(put.status).toBe(400);
+    await t.action((ctx) => azure.purge(ctx, ticket.fileId));
+  });
+  it("accepts a PUT whose body matches the ticket's Content-MD5 and confirms it", async () => {
+    const { t, azure } = setup();
+    const md5 = createHash("md5").update(PNG).digest("base64");
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        md5,
+      }),
+    );
+    const put = await fetch(ticket.uploadUrl, {
+      method: "PUT",
+      headers: ticket.headers,
+      body: PNG,
+    });
+    expect(put.status).toBe(201);
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+    ).toEqual({ ok: true, size: PNG.length, contentType: "image/png" });
+    await t.action((ctx) => azure.purge(ctx, ticket.fileId));
+  });
   it("stages blocks and reads an immutable snapshot after the staging SAS overwrites the base", async () => {
     const t = convexTest(defineSchema({}), componentTest.modules);
     const azure = new AzureBlob(register(t), {

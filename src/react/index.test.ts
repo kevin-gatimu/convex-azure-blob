@@ -127,6 +127,67 @@ describe("useUploadFile", () => {
     expect(hook.error).toBeNull();
   });
 
+  it("forwards an app-supplied md5 and sends the ticket's Content-MD5 with the PUT", async () => {
+    const md5 = "1B2M2Y8AsgTpgAmY7PhCfg==";
+    generateUploadUrl.mockResolvedValue({
+      fileId: "f1",
+      uploadUrl: "https://x/y",
+      headers: {
+        "x-ms-blob-type": "BlockBlob",
+        "content-type": "image/png",
+        "Content-MD5": md5,
+      },
+    });
+    confirmUpload.mockResolvedValue({
+      ok: true,
+      size: 3,
+      contentType: "image/png",
+    });
+    const md5Api = {} as UploadApi<{
+      contentType: string;
+      fileName?: string;
+      size?: number;
+      md5?: string;
+    }>;
+    let md5Hook!: ReturnType<
+      typeof useUploadFile<{ contentType: string; md5?: string }>
+    >;
+    function Md5Harness() {
+      md5Hook = useUploadFile(md5Api);
+      return null;
+    }
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    await act(async () => {
+      renderer = create(createElement(Md5Harness));
+    });
+    await act(async () => {
+      expect(await md5Hook.upload(file, { md5 })).toBe("f1");
+    });
+    expect(generateUploadUrl).toHaveBeenCalledWith(
+      expect.objectContaining({ md5, contentType: "image/png", size: 3 }),
+    );
+    expect(FakeXhr.last?.headers["Content-MD5"]).toBe(md5);
+  });
+
+  it("omits md5 when the app supplies none", async () => {
+    generateUploadUrl.mockResolvedValue({
+      fileId: "f1",
+      uploadUrl: "https://x/y",
+      headers: {},
+    });
+    confirmUpload.mockResolvedValue({
+      ok: true,
+      size: 3,
+      contentType: "image/png",
+    });
+    await mount();
+    await act(async () => {
+      await hook.upload(file);
+    });
+    expect(generateUploadUrl.mock.calls[0]![0]).not.toHaveProperty("md5");
+    expect(FakeXhr.last?.headers).not.toHaveProperty("Content-MD5");
+  });
+
   it("cancels while waiting for a ticket without starting the PUT", async () => {
     let ticket!: (value: {
       fileId: string;

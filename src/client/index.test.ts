@@ -142,6 +142,7 @@ type Blob = {
   status?: number;
   length?: number;
   type?: string;
+  md5?: string;
   bytes?: Uint8Array<ArrayBuffer>;
 };
 
@@ -192,6 +193,7 @@ function stubBlob(blob: Blob, deleteStatus = 202) {
         headers: {
           "content-length": String(blob.length ?? 1000),
           "content-type": blob.type ?? "image/png",
+          ...(blob.md5 ? { "content-md5": blob.md5 } : {}),
         },
       });
     }
@@ -252,6 +254,118 @@ describe("constructor", () => {
           requireMalwareScan: true,
         }),
     ).toThrow("cannot be combined with blockUploads");
+  });
+});
+
+describe("md5 integrity", () => {
+  const md5 = "1B2M2Y8AsgTpgAmY7PhCfg==";
+  const other = "AAAAAAAAAAAAAAAAAAAAAA==";
+  const reserveWith = (
+    state: ReturnType<typeof setup>,
+    value: string | undefined,
+  ) =>
+    state.t.action((ctx) =>
+      state.azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        ...(value === undefined ? {} : { md5: value }),
+      }),
+    );
+
+  it("adds Content-MD5 to the ticket and stores the digest on the row", async () => {
+    const state = setup();
+    const ticket = await reserveWith(state, md5);
+    expect(ticket.headers).toEqual({
+      "x-ms-blob-type": "BlockBlob",
+      "content-type": "image/png",
+      "Content-MD5": md5,
+    });
+    expect((await state.file(ticket.fileId))?.md5).toBe(md5);
+  });
+
+  it("keeps Content-MD5 on a renewed ticket", async () => {
+    const state = setup();
+    const { fileId } = await reserveWith(state, md5);
+    state.advance(MINUTE);
+    const renewed = await state.t.action((ctx) =>
+      state.azure.renewUploadUrl(ctx, { fileId, uploadedBy: "u1" }),
+    );
+    expect(renewed.headers["Content-MD5"]).toBe(md5);
+  });
+
+  it("rejects an md5 that is not base64 of 16 bytes", async () => {
+    const state = setup();
+    for (const bad of [
+      "",
+      "abc",
+      "AAAAAAAAAAAAAAAAAAAAAA",
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "AAAAAAAAAAAAAAAAAAAAAB==",
+      "AAAAAAAAAAAAAAAAAAAA!A==",
+      "d41d8cd98f00b204e9800998ecf8427e",
+    ]) {
+      await expect(reserveWith(state, bad)).rejects.toThrow("md5");
+    }
+  });
+
+  it("accepts a matching Content-MD5 at confirm", async () => {
+    const state = setup();
+    const { fileId } = await reserveWith(state, md5);
+    stubBlob({ md5 });
+    const result = await state.t.action((ctx) =>
+      state.azure.confirmUpload(ctx, fileId),
+    );
+    expect(result.ok).toBe(true);
+    expect((await state.file(fileId))?.status).toBe("ready");
+  });
+
+  it("rejects and deletes the blob on a checksum mismatch", async () => {
+    const state = setup();
+    const { fileId } = await reserveWith(state, md5);
+    stubBlob({ md5: other });
+    const result = await state.t.action((ctx) =>
+      state.azure.confirmUpload(ctx, fileId),
+    );
+    expect(result).toEqual({ ok: false, reason: "Checksum mismatch" });
+    expect(methods()).toContain("DELETE");
+    expect((await state.file(fileId))?.status).not.toBe("ready");
+  });
+
+  it("rejects and deletes the blob when Content-MD5 is missing", async () => {
+    const state = setup();
+    const { fileId } = await reserveWith(state, md5);
+    stubBlob({});
+    const result = await state.t.action((ctx) =>
+      state.azure.confirmUpload(ctx, fileId),
+    );
+    expect(result).toEqual({ ok: false, reason: "Checksum mismatch" });
+    expect(methods()).toContain("DELETE");
+  });
+
+  it("keeps today's behavior without an md5", async () => {
+    const state = setup();
+    const ticket = await reserveWith(state, undefined);
+    expect(ticket.headers).not.toHaveProperty("Content-MD5");
+    expect((await state.file(ticket.fileId))?.md5).toBeUndefined();
+    stubBlob({});
+    const result = await state.t.action((ctx) =>
+      state.azure.confirmUpload(ctx, ticket.fileId),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("throws for md5 with block uploads", async () => {
+    const state = setup({ blockUploads: true });
+    await expect(
+      state.t.action((ctx) =>
+        state.azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+          size: 1000,
+          md5,
+        }),
+      ),
+    ).rejects.toThrow("md5 is not supported with block uploads");
   });
 });
 
@@ -2437,6 +2551,27 @@ describe("clientApi", () => {
   beforeEach(() => {
     onUpload.mockReset();
     gatedNow = T0;
+  });
+
+  it("accepts md5 through the public mutation and refuses a mismatched blob", async () => {
+    const t = createTest().withIdentity({ subject: "user1" });
+    const md5 = "1B2M2Y8AsgTpgAmY7PhCfg==";
+    const ticket = await t.mutation(api.files.generateUploadUrl, {
+      contentType: "image/png",
+      md5,
+    });
+    expect(ticket.headers["Content-MD5"]).toBe(md5);
+    await expect(
+      t.mutation(api.files.generateUploadUrl, {
+        contentType: "image/png",
+        md5: "not-a-digest",
+      }),
+    ).rejects.toThrow("md5");
+    stubBlob({ md5: "AAAAAAAAAAAAAAAAAAAAAA==" });
+    expect(
+      await t.action(api.files.confirmUpload, { fileId: ticket.fileId }),
+    ).toMatchObject({ ok: false });
+    expect(onUpload).not.toHaveBeenCalled();
   });
 
   it("commits one attachment for simultaneous confirmations", async () => {
