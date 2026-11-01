@@ -13,6 +13,7 @@ const PDF = new TextEncoder().encode("%PDF-1.7\n%test");
 const BLOCK = 8 * 1024 * 1024;
 const ETAG = '"0x8DC0000000000001"';
 const SNAPSHOT = "2026-01-01T12:00:00.0000000Z";
+const EVENT_GRID_SECRET = "test-event-grid-secret-not-a-real-secret";
 const blockId = (index: number) => btoa(String(index).padStart(8, "0"));
 
 type Stored = { size: number; type: string; bytes: Uint8Array<ArrayBuffer> };
@@ -109,6 +110,41 @@ const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
 
 const blobNameOf = (ticket: { uploadUrl: string }) =>
   new URL(ticket.uploadUrl).pathname.split("/").at(-1)!;
+function blobCreatedEvent(
+  ticket: { uploadUrl: string },
+  container = "uploads",
+  eventType = "Microsoft.Storage.BlobCreated",
+) {
+  const url = new URL(ticket.uploadUrl);
+  const blobName = url.pathname.split("/").filter(Boolean).slice(1).join("/");
+  return {
+    id: `event-${blobName}`,
+    topic: "/subscriptions/test/resourceGroups/test",
+    subject: `/blobServices/default/containers/${container}/blobs/${blobName}`,
+    eventType,
+    eventTime: "2026-01-01T12:00:00Z",
+    data: {
+      api: "PutBlockList",
+      url: `${url.origin}/${container}/${blobName}`,
+    },
+    dataVersion: "1",
+    metadataVersion: "1",
+  };
+}
+function postEventGrid(
+  client: Client,
+  body: unknown,
+  secret: string | null = EVENT_GRID_SECRET,
+) {
+  return client.fetch(
+    `/azure-blob/events${secret === null ? "" : `?secret=${encodeURIComponent(secret)}`}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    },
+  );
+}
 const blobCalls = () =>
   fetchMock.mock.calls
     .filter(([url]) => !String(url).includes("/oauth2/v2.0/token"))
@@ -141,6 +177,7 @@ beforeEach(() => {
   vi.stubEnv("AZURE_BLOB_ACCOUNT", "devstoreaccount1");
   vi.stubEnv("AZURE_BLOB_KEY", btoa("test-key"));
   vi.stubEnv("AZURE_BLOB_CONTAINER", "uploads");
+  vi.stubEnv("AZURE_BLOB_EVENT_GRID_SECRET", EVENT_GRID_SECRET);
   vi.stubEnv(
     "AZURE_BLOB_ENDPOINT",
     "https://devstoreaccount1.blob.core.windows.net",
@@ -154,6 +191,157 @@ afterEach(() => {
   stored.clear();
   delete failures.blockList;
   delete failures.commit;
+});
+
+describe("Event Grid confirmation", () => {
+  test("answers the standard subscription validation handshake", async () => {
+    const t = initConvexTest();
+    const response = await postEventGrid(t, [
+      {
+        id: "validation",
+        topic: "/subscriptions/test",
+        subject: "",
+        eventType: "Microsoft.EventGrid.SubscriptionValidationEvent",
+        eventTime: "2026-01-01T12:00:00Z",
+        data: { validationCode: "validation-code" },
+        dataVersion: "1",
+        metadataVersion: "1",
+      },
+    ]);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      validationResponse: "validation-code",
+    });
+  });
+
+  test("requires a configured high-entropy secret and rejects unauthenticated calls", async () => {
+    expect(() => azure.eventGridHandler({ secret: "too-short" })).toThrow(
+      "Event Grid secret must be at least 32 characters",
+    );
+
+    const t = initConvexTest();
+    const ticket = await t.mutation(api.photos.generateUploadUrl, {
+      contentType: "image/png",
+      size: 8,
+    });
+    const response = await postEventGrid(t, [blobCreatedEvent(ticket)], null);
+    const wrongSecret = await postEventGrid(
+      t,
+      [blobCreatedEvent(ticket)],
+      `${EVENT_GRID_SECRET}-wrong`,
+    );
+
+    expect(response.status).toBe(401);
+    expect(wrongSecret.status).toBe(401);
+    expect(await t.run((ctx) => ctx.db.query("photos").take(10))).toEqual([]);
+  });
+
+  test("rejects malformed JSON and standard-schema event bodies", async () => {
+    const t = initConvexTest();
+
+    expect((await postEventGrid(t, "{")).status).toBe(400);
+    expect((await postEventGrid(t, [{}])).status).toBe(400);
+
+    const ticket = await t.mutation(api.photos.generateUploadUrl, {
+      contentType: "image/png",
+      size: 8,
+    });
+    const invalidUrl = blobCreatedEvent(ticket);
+    invalidUrl.data.url = "not-an-absolute-url";
+    expect((await postEventGrid(t, [invalidUrl])).status).toBe(400);
+  });
+
+  test("acknowledges untracked blobs, other containers, and other event types", async () => {
+    const t = initConvexTest();
+    const ticket = await t.mutation(api.photos.generateUploadUrl, {
+      contentType: "image/png",
+      size: 8,
+    });
+    const untracked = blobCreatedEvent(ticket);
+    untracked.data.url =
+      "https://devstoreaccount1.blob.core.windows.net/uploads/not-tracked.png";
+    const response = await postEventGrid(t, [
+      untracked,
+      blobCreatedEvent(ticket, "other-container"),
+      blobCreatedEvent(ticket, "uploads", "Microsoft.Storage.BlobDeleted"),
+    ]);
+
+    expect(response.status).toBe(200);
+    expect(await t.run((ctx) => ctx.db.query("photos").take(10))).toEqual([]);
+  });
+
+  test("confirms a BlobCreated event and attaches the photo once across retries", async () => {
+    const t = initConvexTest().withIdentity({ subject: "alice" });
+    const ticket = await t.mutation(api.photos.generateUploadUrl, {
+      contentType: "image/png",
+      size: 8,
+    });
+    const event = [blobCreatedEvent(ticket)];
+
+    expect((await postEventGrid(t, event)).status).toBe(200);
+    expect((await postEventGrid(t, event)).status).toBe(200);
+    await expect(
+      t.action(api.photos.confirmUpload, { fileId: ticket.fileId }),
+    ).resolves.toMatchObject({ ok: true });
+
+    const photos = await t.query(api.photos.list, {});
+    expect(photos.map((photo) => photo.fileId)).toEqual([ticket.fileId]);
+  });
+
+  test("acknowledges an event after the browser has already confirmed", async () => {
+    const t = initConvexTest().withIdentity({ subject: "alice" });
+    const ticket = await t.mutation(api.photos.generateUploadUrl, {
+      contentType: "image/png",
+      size: 8,
+    });
+
+    await expect(
+      t.action(api.photos.confirmUpload, { fileId: ticket.fileId }),
+    ).resolves.toMatchObject({ ok: true });
+    expect((await postEventGrid(t, [blobCreatedEvent(ticket)])).status).toBe(
+      200,
+    );
+    const photos = await t.query(api.photos.list, {});
+    expect(photos.map((photo) => photo.fileId)).toEqual([ticket.fileId]);
+  });
+
+  test("returns a retryable status after a transient Azure failure", async () => {
+    const t = initConvexTest();
+    const ticket = await t.mutation(api.photos.generateUploadUrl, {
+      contentType: "image/png",
+      size: 8,
+    });
+    const event = [blobCreatedEvent(ticket)];
+    failures.blockList = 503;
+    const failed = await postEventGrid(t, event);
+
+    expect(failed.status).toBe(503);
+    expect(await t.run((ctx) => ctx.db.query("photos").take(10))).toEqual([]);
+
+    delete failures.blockList;
+    expect((await postEventGrid(t, event)).status).toBe(200);
+    expect(await t.run((ctx) => ctx.db.query("photos").take(10))).toHaveLength(
+      1,
+    );
+  });
+
+  test("commits the upload callback once when browser and Event Grid confirm concurrently", async () => {
+    const t = initConvexTest().withIdentity({ subject: "alice" });
+    const ticket = await t.mutation(api.photos.generateUploadUrl, {
+      contentType: "image/png",
+      size: 8,
+    });
+    const [browserResult, eventResponse] = await Promise.all([
+      t.action(api.photos.confirmUpload, { fileId: ticket.fileId }),
+      postEventGrid(t, [blobCreatedEvent(ticket)]),
+    ]);
+
+    expect(browserResult).toMatchObject({ ok: true });
+    expect(eventResponse.status).toBe(200);
+    const photos = await t.query(api.photos.list, {});
+    expect(photos.map((photo) => photo.fileId)).toEqual([ticket.fileId]);
+  });
 });
 
 describe("photos", () => {

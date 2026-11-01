@@ -147,6 +147,20 @@ export const get = query({
   },
 });
 
+export const getByBlobName = query({
+  args: { container: v.string(), blobName: v.string() },
+  returns: v.union(fileDoc, v.null()),
+  handler: async (ctx, args) => {
+    const row = await ctx.db
+      .query("files")
+      .withIndex("by_container_blobName", (q) =>
+        q.eq("container", args.container).eq("blobName", args.blobName),
+      )
+      .unique();
+    return row ? toDoc(row) : null;
+  },
+});
+
 export const getUserDelegationKey = query({
   args: { accountName: v.string(), now: v.number() },
   returns: v.union(userDelegationKeyValidator, v.null()),

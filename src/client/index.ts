@@ -1,6 +1,7 @@
 import {
   actionGeneric,
   createFunctionHandle,
+  httpActionGeneric,
   internalActionGeneric,
   mutationGeneric,
 } from "convex/server";
@@ -110,6 +111,13 @@ export type AzureBlobOptions = {
   now?: () => number;
 };
 
+export type EventGridHandlerOptions = {
+  /** Shared secret of at least 32 characters, supplied in the Event Grid endpoint query string. */
+  secret: string;
+  /** An internal mutation invoked atomically when the upload becomes ready. */
+  onUpload?: UploadCallback;
+};
+
 /** What the browser needs to upload: PUT the bytes to `uploadUrl` with `headers`. */
 export type UploadTicket = {
   fileId: string;
@@ -191,6 +199,92 @@ function malwareScanResult(xml: string) {
   return undefined;
 }
 
+type EventGridEvent = {
+  eventType: string;
+  data: Record<string, unknown>;
+  validationCode?: string;
+  blobUrl?: string;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseEventGridEvents(value: unknown): EventGridEvent[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const events: EventGridEvent[] = [];
+  for (const event of value) {
+    if (
+      !isRecord(event) ||
+      typeof event.id !== "string" ||
+      event.id.length === 0 ||
+      typeof event.eventType !== "string" ||
+      event.eventType.length === 0 ||
+      typeof event.subject !== "string" ||
+      typeof event.eventTime !== "string" ||
+      !Number.isFinite(Date.parse(event.eventTime)) ||
+      typeof event.dataVersion !== "string" ||
+      typeof event.metadataVersion !== "string" ||
+      (event.topic !== undefined && typeof event.topic !== "string") ||
+      !isRecord(event.data)
+    )
+      return null;
+    let validationCode: string | undefined;
+    let blobUrl: string | undefined;
+    if (event.eventType === "Microsoft.EventGrid.SubscriptionValidationEvent") {
+      if (
+        typeof event.data.validationCode !== "string" ||
+        event.data.validationCode.length === 0
+      )
+        return null;
+      validationCode = event.data.validationCode;
+    }
+    if (event.eventType === "Microsoft.Storage.BlobCreated") {
+      if (typeof event.data.url !== "string") return null;
+      try {
+        const url = new URL(event.data.url);
+        if (url.protocol !== "https:") return null;
+        url.pathname
+          .split("/")
+          .filter(Boolean)
+          .forEach((segment) => decodeURIComponent(segment));
+      } catch {
+        return null;
+      }
+      blobUrl = event.data.url;
+    }
+    events.push({
+      eventType: event.eventType,
+      data: event.data,
+      ...(validationCode !== undefined ? { validationCode } : {}),
+      ...(blobUrl !== undefined ? { blobUrl } : {}),
+    });
+  }
+  return events;
+}
+
+function blobAddressFromEventUrl(
+  eventUrl: string,
+  endpoint: string,
+): { container: string; blobName: string } | null {
+  const segments = (path: string) =>
+    path
+      .split("/")
+      .filter(Boolean)
+      .map((segment) => decodeURIComponent(segment));
+  const endpointSegments = segments(new URL(endpoint).pathname);
+  const eventSegments = segments(new URL(eventUrl).pathname);
+  if (
+    endpointSegments.some((segment, index) => eventSegments[index] !== segment)
+  )
+    return null;
+  const [container, ...blobSegments] = eventSegments.slice(
+    endpointSegments.length,
+  );
+  if (!container || blobSegments.length === 0) return null;
+  return { container, blobName: blobSegments.join("/") };
+}
+
 // Each path segment is encoded, so `/` keeps separating virtual folders.
 const encodeBlobPath = (blobName: string) =>
   blobName.split("/").map(encodeURIComponent).join("/");
@@ -231,6 +325,94 @@ export class AzureBlob {
         `Invalid pathPrefix "${options.pathPrefix}": use letters, digits, "-", "_" and "/" separators`,
       );
     }
+  }
+
+  /**
+   * Creates an HTTP action for standard-schema Event Grid BlobCreated events.
+   * Use a cryptographically random secret of at least 32 characters.
+   *
+   * @example
+   * ```ts
+   * const handler = azure.eventGridHandler({
+   *   secret: process.env.AZURE_BLOB_EVENT_GRID_SECRET ?? "",
+   *   onUpload: internal.files.attach,
+   * });
+   * ```
+   */
+  eventGridHandler(options: EventGridHandlerOptions) {
+    if (options.secret.length < 32) {
+      throw new Error("Event Grid secret must be at least 32 characters");
+    }
+    return httpActionGeneric(async (ctx, request) => {
+      if (request.method !== "POST")
+        return new Response("Method not allowed", {
+          status: 405,
+          headers: { Allow: "POST" },
+        });
+      const requestUrl = new URL(request.url);
+      if (requestUrl.protocol !== "https:")
+        return new Response("HTTPS is required", { status: 400 });
+      if (requestUrl.searchParams.get("secret") !== options.secret)
+        return new Response("Unauthorized", { status: 401 });
+
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("Invalid Event Grid request body", { status: 400 });
+      }
+      const events = parseEventGridEvents(body);
+      if (!events) {
+        return new Response("Invalid Event Grid event schema", { status: 400 });
+      }
+      const validations = events.filter(
+        (event) =>
+          event.eventType === "Microsoft.EventGrid.SubscriptionValidationEvent",
+      );
+      if (validations.length > 0) {
+        if (events.length !== 1) {
+          return new Response("Invalid subscription validation batch", {
+            status: 400,
+          });
+        }
+        const validationCode = validations[0]!.validationCode;
+        if (!validationCode)
+          return new Response("Invalid subscription validation event", {
+            status: 400,
+          });
+        return new Response(
+          JSON.stringify({
+            validationResponse: validationCode,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+
+      let config: AzureBlobConfig | undefined;
+      for (const event of events) {
+        if (event.eventType !== "Microsoft.Storage.BlobCreated") continue;
+        const blobUrl = event.blobUrl;
+        if (!blobUrl) continue;
+        config ??= this.config();
+        const address = blobAddressFromEventUrl(blobUrl, config.endpoint);
+        if (!address || address.container !== config.container) continue;
+        try {
+          const file = await ctx.runQuery(this.component.lib.getByBlobName, {
+            ...address,
+          });
+          if (!file) continue;
+          await this.confirmUpload(ctx, file.fileId, options.onUpload);
+        } catch {
+          console.error(
+            "Event Grid upload confirmation failed; returning 503 for retry",
+          );
+          return new Response("Upload confirmation failed; retry delivery", {
+            status: 503,
+          });
+        }
+      }
+      return new Response(null, { status: 200 });
+    });
   }
 
   private config() {

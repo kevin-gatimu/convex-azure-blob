@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `eventGridHandler({ secret, onUpload? })` for standard-schema Azure Event
+  Grid `BlobCreated` events. It handles subscription validation, confirms
+  tracked uploads through the normal checks, and makes repeated delivery safe.
+  Transient confirmation failures return a retryable status. The README covers
+  the HTTPS route, shared-secret setup, Azure CLI subscription, and rotation.
 - Add opt-in Defender for Storage malware scanning with internal polling,
   `scanning`/`rejected`/`scan_timed_out` statuses, and a 24-hour timeout.
   `onUpload` runs only after a clean verdict; block uploads cannot enable this

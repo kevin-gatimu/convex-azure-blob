@@ -122,6 +122,37 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         } | null,
         Name
       >;
+      getByBlobName: FunctionReference<
+        "query",
+        "internal",
+        { blobName: string; container: string },
+        {
+          blobName: string;
+          blockSize?: number;
+          container: string;
+          contentType: string;
+          createdAt: number;
+          expectedSize?: number;
+          fileId: string;
+          fileName?: string;
+          malwareScanRequired?: boolean;
+          maxBytes: number;
+          metadata?: Record<string, string>;
+          size?: number;
+          snapshot?: string;
+          status:
+            | "pending"
+            | "scanning"
+            | "ready"
+            | "rejected"
+            | "scan_timed_out"
+            | "deleting";
+          uploadExpiresAt?: number;
+          uploadMode?: "blocks";
+          uploadedBy: string;
+        } | null,
+        Name
+      >;
       getUserDelegationKey: FunctionReference<
         "query",
         "internal",
