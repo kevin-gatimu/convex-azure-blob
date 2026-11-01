@@ -148,6 +148,22 @@ export const sweep = internalAction({
     }),
 });
 
+export const checkSetup = internalAction({
+  args: { origin: v.optional(v.string()) },
+  returns: v.object({
+    ok: v.boolean(),
+    checks: v.array(
+      v.object({
+        name: v.string(),
+        ok: v.boolean(),
+        hint: v.optional(v.string()),
+      }),
+    ),
+  }),
+  handler: async (ctx, args) =>
+    await azure.checkSetup(ctx, { origin: args.origin }),
+});
+
 export const refreshUserDelegationKey = internalAction({
   args: { force: v.optional(v.boolean()) },
   returns: v.null(),

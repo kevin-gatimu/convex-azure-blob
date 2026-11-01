@@ -59,6 +59,48 @@ async function browserUpload(
 }
 
 describe.skipIf(!endpoint)("against Azurite", () => {
+  it("checkSetup passes config, credentials and container, and fails a missing container", async () => {
+    const { t, azure } = setup();
+    const result = await t.action((ctx) => azure.checkSetup(ctx));
+    expect(result).toEqual({
+      ok: true,
+      checks: [
+        { name: "config", ok: true },
+        { name: "credentials", ok: true },
+        { name: "container", ok: true },
+      ],
+    });
+
+    const missing = new AzureBlob(register(t), {
+      config: { ...config, container: "no-such-container" },
+    });
+    const failed = await t.action((ctx) => missing.checkSetup(ctx));
+    expect(failed.ok).toBe(false);
+    expect(failed.checks[2]).toMatchObject({
+      name: "container",
+      ok: false,
+      hint: expect.stringContaining("container does not exist"),
+    });
+
+    const wrongKey = new AzureBlob(register(t), {
+      config: { ...config, accountKey: btoa("not-the-azurite-key") },
+    });
+    const bad = await t.action((ctx) => wrongKey.checkSetup(ctx));
+    expect(bad.checks[1]).toMatchObject({
+      name: "credentials",
+      ok: false,
+      hint: expect.stringMatching(/key.*clock/),
+    });
+  });
+
+  it("checkSetup reports an origin without a CORS rule as failed", async () => {
+    const { t, azure } = setup();
+    const result = await t.action((ctx) =>
+      azure.checkSetup(ctx, { origin: "https://no-rule.example.com" }),
+    );
+    expect(result.checks.at(-1)).toMatchObject({ name: "cors", ok: false });
+  });
+
   it("sets and refreshes tiers using a real write SAS and denies a read SAS", async () => {
     const t = convexTest(defineSchema({}), componentTest.modules);
     const azure = new AzureBlob(register(t), { config, accessTier: "Cool" });

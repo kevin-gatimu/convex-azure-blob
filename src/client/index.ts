@@ -34,6 +34,20 @@ import {
 import type { SasResponseHeaders } from "./sas.js";
 import type { UserDelegationKey } from "./sas.js";
 import { SNIFF_BYTES, sniffContentType } from "./sniff.js";
+import {
+  configHint,
+  corsFailure,
+  DELEGATOR_HINT,
+  ENTRA_SIGNATURE_HINT,
+  hintForError,
+  hintForMessage,
+  KEY_FORMAT_HINT,
+  NETWORK_HINT,
+  tokenHint,
+  uploadHeaders,
+} from "./setup.js";
+import type { SetupCheck, SetupResult } from "./setup.js";
+export type { SetupCheck, SetupResult } from "./setup.js";
 
 export { resolveConfig } from "./config.js";
 export type { AzureBlobConfig } from "./config.js";
@@ -591,6 +605,205 @@ export class AzureBlob {
       accountName: config.accountName,
       ...key,
     });
+  }
+
+  /**
+   * Diagnoses the setup without changing anything: config, credentials, the container and,
+   * when `origin` is given, the browser CORS preflight. In Entra mode the container probe is
+   * signed with a user delegation key, so a wrong account name fails. The preflight asks for the
+   * headers the uploader sends in this mode; pass `checksum: true` when uploads send an `md5`.
+   * Hints never contain secrets or URLs.
+   *
+   * ```ts
+   * const { ok, checks } = await azure.checkSetup(ctx, { origin: "https://app.example.com" });
+   * ```
+   */
+  async checkSetup(
+    ctx: RunActionCtx,
+    options: { origin?: string; checksum?: boolean } = {},
+  ): Promise<SetupResult> {
+    const checks: SetupCheck[] = [];
+    const skipped = (name: string, prerequisite: string) =>
+      checks.push({
+        name,
+        ok: false,
+        hint: `skipped: ${prerequisite} failed`,
+      });
+
+    let config: AzureBlobConfig;
+    try {
+      config = this.config();
+      checks.push({ name: "config", ok: true });
+    } catch (error) {
+      checks.push({
+        name: "config",
+        ok: false,
+        hint: configHint(error),
+      });
+      skipped("credentials", "config");
+      skipped("container", "config");
+      if (options.origin !== undefined) skipped("cors", "config");
+      return { ok: false, checks };
+    }
+
+    // Entra keeps the key only to sign the probe: a diagnostic must not write the cache.
+    let delegationKey: UserDelegationKey | undefined;
+    let credentials: SetupCheck = { name: "credentials", ok: true };
+    if (!config.accountKey) {
+      try {
+        await getAccessToken(config);
+      } catch (error) {
+        credentials = {
+          name: "credentials",
+          ok: false,
+          hint: tokenHint(error),
+        };
+      }
+      if (credentials.ok) {
+        try {
+          delegationKey = await requestUserDelegationKey(config, this.now());
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          credentials = {
+            name: "credentials",
+            ok: false,
+            hint: /fetch failed|network/i.test(message)
+              ? NETWORK_HINT
+              : hintForMessage(message, DELEGATOR_HINT),
+          };
+        }
+      }
+    }
+
+    let probe: Response | undefined;
+    if (credentials.ok) {
+      let request:
+        { url: string; headers?: Record<string, string> } | undefined;
+      try {
+        const blobName = `setup-check-${crypto.randomUUID()}`;
+        if (delegationKey) {
+          const now = this.now();
+          const base = config.internalEndpoint ?? config.endpoint;
+          const sas = await this.signDelegationSas(
+            ctx,
+            config,
+            {
+              container: config.container,
+              blobName,
+              permissions: "r",
+              startsOn: now - CLOCK_SKEW_MS,
+              expiresOn: now + 60_000,
+              protocol: this.protocolFor(base),
+            },
+            delegationKey,
+          );
+          request = {
+            url: `${this.blobUrl(base, config.container, blobName)}?${sas}`,
+          };
+        } else {
+          request = await this.serverRequest(
+            config,
+            config.container,
+            blobName,
+            "r",
+            this.now() + 60_000,
+          );
+        }
+      } catch {
+        credentials = {
+          name: "credentials",
+          ok: false,
+          hint: config.accountKey
+            ? KEY_FORMAT_HINT
+            : "Could not sign with the user delegation key: the key Azure returned is not usable",
+        };
+      }
+      if (request) {
+        try {
+          probe = await fetch(request.url, {
+            method: "HEAD",
+            headers: { ...request.headers, "x-ms-version": SAS_VERSION },
+          });
+        } catch {
+          if (config.accountKey) {
+            credentials = {
+              name: "credentials",
+              ok: false,
+              hint: NETWORK_HINT,
+            };
+          }
+        }
+      }
+    }
+    const probeCode = probe?.headers.get("x-ms-error-code") ?? null;
+    if (credentials.ok && probe) {
+      const signatureRejected =
+        probeCode === "AuthenticationFailed" ||
+        probeCode === "AuthorizationFailure";
+      if (
+        signatureRejected ||
+        (config.accountKey &&
+          probeCode === "KeyBasedAuthenticationNotPermitted")
+      ) {
+        credentials = {
+          name: "credentials",
+          ok: false,
+          hint: config.accountKey
+            ? hintForError(probeCode, probe.status)
+            : ENTRA_SIGNATURE_HINT,
+        };
+      }
+    }
+    checks.push(credentials);
+
+    if (!credentials.ok) {
+      skipped("container", "credentials");
+    } else if (!probe) {
+      checks.push({ name: "container", ok: false, hint: NETWORK_HINT });
+    } else if (probe.status === 404 && probeCode === "BlobNotFound") {
+      checks.push({ name: "container", ok: true });
+    } else {
+      checks.push({
+        name: "container",
+        ok: false,
+        hint: hintForError(probeCode, probe.status),
+      });
+    }
+
+    if (options.origin !== undefined) {
+      const origin = options.origin;
+      const required = uploadHeaders(
+        this.options.blockUploads === true,
+        options.checksum === true,
+      );
+      let hint: string | null;
+      try {
+        const response = await fetch(
+          this.blobUrl(
+            config.endpoint,
+            config.container,
+            `setup-check-${crypto.randomUUID()}`,
+          ),
+          {
+            method: "OPTIONS",
+            headers: {
+              origin,
+              "access-control-request-method": "PUT",
+              "access-control-request-headers": required.join(","),
+            },
+          },
+        );
+        hint = corsFailure(response, origin, required);
+      } catch {
+        hint = NETWORK_HINT;
+      }
+      checks.push(
+        hint === null
+          ? { name: "cors", ok: true }
+          : { name: "cors", ok: false, hint },
+      );
+    }
+    return { ok: checks.every((check) => check.ok), checks };
   }
 
   private async reserve(
