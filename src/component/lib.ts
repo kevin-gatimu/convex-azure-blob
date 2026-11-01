@@ -64,6 +64,7 @@ export const create = mutation({
     uploadMode: fileFields.uploadMode,
     expectedSize: fileFields.expectedSize,
     blockSize: fileFields.blockSize,
+    md5: fileFields.md5,
   },
   returns: v.id("files"),
   handler: async (ctx, args) => {

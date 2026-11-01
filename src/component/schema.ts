@@ -36,6 +36,8 @@ export const fileFields = {
   expectedSize: v.optional(v.number()),
   blockSize: v.optional(v.number()),
   snapshot: v.optional(v.string()),
+  /** Base64 MD5 the uploader promised; confirm checks it against the blob's Content-MD5. */
+  md5: v.optional(v.string()),
 };
 
 export const userDelegationKeyFields = {
