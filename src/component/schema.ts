@@ -59,6 +59,8 @@ export default defineSchema({
     nextCheckAt: v.number(),
     deadlineAt: v.number(),
     attempts: v.number(),
+    phase: v.optional(v.literal("cleanup")),
+    cleanupUntil: v.optional(v.number()),
     onUpload: v.optional(v.string()),
   })
     .index("by_nextCheckAt", ["nextCheckAt"])

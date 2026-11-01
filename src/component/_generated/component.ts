@@ -72,13 +72,23 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         Array<{
           attempts: number;
           blobName: string;
+          cleanupUntil?: number;
           container: string;
           deadlineAt: number;
           fileId: string;
           onUpload?: string;
+          phase?: "cleanup";
           size: number;
           snapshot?: string;
+          uploadExpiresAt?: number;
         }>,
+        Name
+      >;
+      finishMalwareCleanup: FunctionReference<
+        "mutation",
+        "internal",
+        { fileId: string },
+        null,
         Name
       >;
       get: FunctionReference<
@@ -258,7 +268,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       markScanRejected: FunctionReference<
         "mutation",
         "internal",
-        { fileId: string },
+        { cleanupUntil: number; fileId: string; now: number },
         {
           blobName: string;
           blockSize?: number;

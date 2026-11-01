@@ -810,98 +810,158 @@ export class AzureBlob {
     let config: AzureBlobConfig | undefined;
     let accessToken: string | undefined;
     let checked = 0;
+    const failures: unknown[] = [];
     for (const job of jobs) {
-      if (now >= job.deadlineAt) {
-        await ctx.runMutation(this.component.lib.markScanTimedOut, {
-          fileId: job.fileId,
-          now,
-        });
-        checked += 1;
-        continue;
-      }
-      if (!config) {
-        config = this.config();
-        accessToken = config.accountKey
-          ? undefined
-          : await getAccessToken(config);
-      }
-      const request = await this.serverRequest(
-        config,
-        job.container,
-        job.blobName,
-        "t",
-        undefined,
-        accessToken,
-        { comp: "tags" },
-      );
-      const response = await fetch(request.url, {
-        method: "GET",
-        ...(request.headers ? { headers: request.headers } : {}),
-      });
-      if (response.status === 404) {
-        await this.deferMalwareScan(
-          ctx,
-          job.fileId,
-          job.attempts,
-          now,
-          job.deadlineAt,
-        );
-        checked += 1;
-        continue;
-      }
-      if (!response.ok) {
-        await this.deferMalwareScan(
-          ctx,
-          job.fileId,
-          job.attempts,
-          now,
-          job.deadlineAt,
-        );
-        throw new Error(`Azure Blob tag read failed with ${response.status}`);
-      }
-      const result = malwareScanResult(await response.text());
-      if (result === "no threats found") {
-        await ctx.runMutation(this.component.lib.markReady, {
-          fileId: job.fileId,
-          size: job.size,
-          onUpload: job.onUpload,
-          ...(job.snapshot ? { snapshot: job.snapshot } : {}),
-        });
-      } else if (result === "malicious") {
-        const deletion = await this.serverRequest(
+      checked += 1;
+      let cleanup = job.phase === "cleanup";
+      let cleanupAttempts = cleanup ? job.attempts : 0;
+      try {
+        if (now >= job.deadlineAt && !cleanup) {
+          await ctx.runMutation(this.component.lib.markScanTimedOut, {
+            fileId: job.fileId,
+            now,
+          });
+          continue;
+        }
+        if (!config) config = this.config();
+        if (!config.accountKey && !accessToken)
+          accessToken = await getAccessToken(config);
+        if (cleanup) {
+          if (job.cleanupUntil === undefined)
+            throw new ConvexError("Malware cleanup job has no expiry");
+          await this.deleteMaliciousBlob(config, accessToken, job);
+          if (now >= job.cleanupUntil) {
+            await ctx.runMutation(this.component.lib.finishMalwareCleanup, {
+              fileId: job.fileId,
+            });
+          } else {
+            await this.deferMalwareScan(
+              ctx,
+              job.fileId,
+              job.attempts,
+              now,
+              job.deadlineAt,
+              true,
+            );
+          }
+          continue;
+        }
+        const request = await this.serverRequest(
           config,
           job.container,
           job.blobName,
-          "d",
+          "t",
           undefined,
           accessToken,
+          { comp: "tags" },
         );
-        const deleted = await fetch(deletion.url, {
-          method: "DELETE",
-          headers: {
-            ...deletion.headers,
-            "x-ms-delete-snapshots": "include",
-          },
+        const response = await fetch(request.url, {
+          method: "GET",
+          ...(request.headers ? { headers: request.headers } : {}),
         });
-        if (!deleted.ok && deleted.status !== 404)
-          throw new Error(
-            `Azure Blob malware rejection delete failed with ${deleted.status}`,
+        if (response.status === 404) {
+          await this.deferMalwareScan(
+            ctx,
+            job.fileId,
+            job.attempts,
+            now,
+            job.deadlineAt,
           );
-        await ctx.runMutation(this.component.lib.markScanRejected, {
-          fileId: job.fileId,
-        });
-      } else {
-        await this.deferMalwareScan(
-          ctx,
-          job.fileId,
-          job.attempts,
-          now,
-          job.deadlineAt,
-        );
+          continue;
+        }
+        if (!response.ok)
+          throw new Error(`Azure Blob tag read failed with ${response.status}`);
+        const result = malwareScanResult(await response.text());
+        if (result === "no threats found") {
+          await ctx.runMutation(this.component.lib.markReady, {
+            fileId: job.fileId,
+            size: job.size,
+            onUpload: job.onUpload,
+            ...(job.snapshot ? { snapshot: job.snapshot } : {}),
+          });
+        } else if (result === "malicious") {
+          const cleanupUntil = (job.uploadExpiresAt ?? now) + CLOCK_SKEW_MS;
+          await ctx.runMutation(this.component.lib.markScanRejected, {
+            fileId: job.fileId,
+            now,
+            cleanupUntil,
+          });
+          cleanup = true;
+          cleanupAttempts = 0;
+          await this.deleteMaliciousBlob(config, accessToken, job);
+          if (now >= cleanupUntil) {
+            await ctx.runMutation(this.component.lib.finishMalwareCleanup, {
+              fileId: job.fileId,
+            });
+          } else {
+            await this.deferMalwareScan(
+              ctx,
+              job.fileId,
+              0,
+              now,
+              job.deadlineAt,
+              true,
+            );
+          }
+        } else {
+          await this.deferMalwareScan(
+            ctx,
+            job.fileId,
+            job.attempts,
+            now,
+            job.deadlineAt,
+          );
+        }
+      } catch (error) {
+        failures.push(error);
+        if (cleanup || now < job.deadlineAt) {
+          try {
+            await this.deferMalwareScan(
+              ctx,
+              job.fileId,
+              cleanup ? cleanupAttempts : job.attempts,
+              now,
+              job.deadlineAt,
+              cleanup,
+            );
+          } catch (deferError) {
+            failures.push(deferError);
+          }
+        }
       }
-      checked += 1;
     }
+    if (failures.length > 0)
+      throw new AggregateError(
+        failures,
+        `Failed to process ${failures.length} malware scan job operation(s)`,
+      );
     return checked;
+  }
+
+  private async deleteMaliciousBlob(
+    config: AzureBlobConfig,
+    accessToken: string | undefined,
+    job: { container: string; blobName: string },
+  ) {
+    const deletion = await this.serverRequest(
+      config,
+      job.container,
+      job.blobName,
+      "d",
+      undefined,
+      accessToken,
+    );
+    const deleted = await fetch(deletion.url, {
+      method: "DELETE",
+      headers: {
+        ...deletion.headers,
+        "x-ms-delete-snapshots": "include",
+      },
+    });
+    if (!deleted.ok && deleted.status !== 404)
+      throw new Error(
+        `Azure Blob malware rejection delete failed with ${deleted.status}`,
+      );
   }
 
   private async deferMalwareScan(
@@ -910,12 +970,15 @@ export class AzureBlob {
     attempts: number,
     now: number,
     deadlineAt: number,
+    cleanup = false,
   ) {
     const delay =
       MALWARE_SCAN_BACKOFF_MS[
         Math.min(attempts, MALWARE_SCAN_BACKOFF_MS.length - 1)
       ]!;
-    const nextCheckAt = Math.min(now + delay, deadlineAt);
+    const nextCheckAt = cleanup
+      ? now + delay
+      : Math.min(now + delay, deadlineAt);
     await ctx.runMutation(this.component.lib.deferMalwareScan, {
       fileId,
       now,

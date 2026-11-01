@@ -580,6 +580,50 @@ describe("malware scan gate", () => {
     );
   });
 
+  it("keeps a concurrent confirmation successful if scanning finishes first", async () => {
+    const { t, azure, reserve, file } = setup({ requireMalwareScan: true });
+    const fileId = await reserve();
+    stubBlob({});
+    const blobFetch = fetchMock.getMockImplementation()!;
+    const firstHeadStarted = deferred();
+    const secondHeadStarted = deferred();
+    const releaseFirstHead = deferred();
+    const releaseSecondHead = deferred();
+    let heads = 0;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "HEAD") {
+        if (++heads === 1) {
+          firstHeadStarted.resolve();
+          await releaseFirstHead.promise;
+        } else {
+          secondHeadStarted.resolve();
+          await releaseSecondHead.promise;
+        }
+      }
+      return await blobFetch(url, init);
+    });
+
+    const firstConfirmation = t.action((ctx) =>
+      azure.confirmUpload(ctx, fileId),
+    );
+    await firstHeadStarted.promise;
+    const secondConfirmation = t.action((ctx) =>
+      azure.confirmUpload(ctx, fileId),
+    );
+    await secondHeadStarted.promise;
+    releaseFirstHead.resolve();
+    expect(await firstConfirmation).toMatchObject({ ok: true });
+
+    stubScanResult("No threats found");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect((await file(fileId))?.status).toBe("ready");
+    releaseSecondHead.resolve();
+    expect(await secondConfirmation).toMatchObject({
+      ok: true,
+      size: 1000,
+    });
+  });
+
   it("deletes a malicious blob but retains an unservable rejected row", async () => {
     const { t, azure, reserve, file } = setup({ requireMalwareScan: true });
     const fileId = await reserve();
@@ -598,22 +642,132 @@ describe("malware scan gate", () => {
     });
   });
 
-  it("retries malicious-blob deletion failures without serving the file", async () => {
-    const { t, azure, reserve, file } = setup({ requireMalwareScan: true });
+  it("keeps retrying malicious-blob deletion after the scan deadline", async () => {
+    const { t, azure, reserve, file, advance } = setup({
+      requireMalwareScan: true,
+    });
     const fileId = await reserve();
     stubBlob({}, 500);
     await t.action((ctx) => azure.confirmUpload(ctx, fileId));
     stubScanResult("Malicious");
     await expect(t.action((ctx) => azure.scanMalware(ctx))).rejects.toThrow(
-      "malware rejection delete failed with 500",
+      "Failed to process",
     );
-    expect((await file(fileId))?.status).toBe("scanning");
+    expect((await file(fileId))?.status).toBe("rejected");
     expect(await t.action((ctx) => azure.getUrl(ctx, fileId))).toBeNull();
 
     stubBlob({});
-    stubScanResult("Malicious");
+    advance(DAY);
     expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
     expect((await file(fileId))?.status).toBe("rejected");
+    expect(methods().at(-1)).toBe("DELETE");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(0);
+  });
+
+  it("deletes a recreated malicious blob after the upload SAS expires", async () => {
+    const { t, azure, file, advance } = setup({ requireMalwareScan: true });
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    stubBlob({});
+    await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId));
+    stubScanResult("Malicious");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect((await file(ticket.fileId))?.status).toBe("rejected");
+
+    expect(
+      (
+        await fetch(ticket.uploadUrl, {
+          method: "PUT",
+          headers: ticket.headers,
+          body: PNG,
+        })
+      ).status,
+    ).toBe(201);
+    stubBlob({});
+    advance(10 * MINUTE);
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect(methods().at(-1)).toBe("DELETE");
+    expect((await file(ticket.fileId))?.status).toBe("rejected");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(0);
+  });
+
+  it("defers a failed job and continues processing the rest of the batch", async () => {
+    const { t, azure, reserve, file, advance } = setup({
+      requireMalwareScan: true,
+    });
+    const first = await reserve();
+    const second = await reserve();
+    stubBlob({});
+    await t.action((ctx) => azure.confirmUpload(ctx, first));
+    await t.action((ctx) => azure.confirmUpload(ctx, second));
+
+    const blobFetch = fetchMock.getMockImplementation()!;
+    let tagReads = 0;
+    fetchMock.mockImplementation(async (url, init) => {
+      const parsed = new URL(String(url));
+      if (
+        init?.method === "GET" &&
+        parsed.searchParams.get("comp") === "tags"
+      ) {
+        if (++tagReads === 1) return new Response(null, { status: 503 });
+        return new Response(
+          "<Tags><TagSet><Tag><Key>Scan result</Key><Value>No threats found</Value></Tag></TagSet></Tags>",
+        );
+      }
+      return await blobFetch(url, init);
+    });
+
+    await expect(t.action((ctx) => azure.scanMalware(ctx))).rejects.toThrow(
+      "Failed to process",
+    );
+    expect((await file(first))?.status).toBe("scanning");
+    expect((await file(second))?.status).toBe("ready");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(0);
+    advance(15_000);
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect((await file(first))?.status).toBe("ready");
+  });
+
+  it("continues the batch after a malicious-blob deletion fails", async () => {
+    const { t, azure, reserve, file, advance } = setup({
+      requireMalwareScan: true,
+    });
+    const first = await reserve();
+    const second = await reserve();
+    stubBlob({}, 500);
+    await t.action((ctx) => azure.confirmUpload(ctx, first));
+    await t.action((ctx) => azure.confirmUpload(ctx, second));
+
+    const blobFetch = fetchMock.getMockImplementation()!;
+    let tagReads = 0;
+    fetchMock.mockImplementation(async (url, init) => {
+      const parsed = new URL(String(url));
+      if (
+        init?.method === "GET" &&
+        parsed.searchParams.get("comp") === "tags"
+      ) {
+        const result = ++tagReads === 1 ? "Malicious" : "No threats found";
+        return new Response(
+          `<Tags><TagSet><Tag><Key>Scan result</Key><Value>${result}</Value></Tag></TagSet></Tags>`,
+        );
+      }
+      return await blobFetch(url, init);
+    });
+
+    await expect(t.action((ctx) => azure.scanMalware(ctx))).rejects.toThrow(
+      "Failed to process",
+    );
+    expect((await file(first))?.status).toBe("rejected");
+    expect((await file(second))?.status).toBe("ready");
+
+    stubBlob({});
+    advance(15_000);
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect((await file(first))?.status).toBe("rejected");
   });
 
   it("times out unresolved scan results after 24 hours", async () => {
@@ -1696,6 +1850,7 @@ describe("block clientApi", () => {
 
 describe("clientApi", () => {
   const onUpload = vi.fn();
+  let gatedNow = T0;
   const app = defineTestApp({
     schema: defineSchema({
       attachments: defineTable({ fileId: v.string(), uploadedBy: v.string() }),
@@ -1737,7 +1892,7 @@ describe("clientApi", () => {
   });
   const gatedAzure = new AzureBlob(app.components.azureBlob, {
     config,
-    now: () => T0,
+    now: () => gatedNow,
     requireMalwareScan: true,
   });
   const { api: gatedApi, createTest: createGatedTest } = app.defineModules({
@@ -1749,7 +1904,10 @@ describe("clientApi", () => {
     }),
   });
 
-  beforeEach(() => onUpload.mockReset());
+  beforeEach(() => {
+    onUpload.mockReset();
+    gatedNow = T0;
+  });
 
   it("commits one attachment for simultaneous confirmations", async () => {
     const t = createTest().withIdentity({ subject: "user1" });
@@ -1847,6 +2005,59 @@ describe("clientApi", () => {
       uploadedBy: "user1",
       status: "ready",
     });
+  });
+
+  it("retries a failed scan callback without blocking other clean files", async () => {
+    const t = createGatedTest().withIdentity({ subject: "user1" });
+    const first = await t.mutation(gatedApi.gatedFiles.generateUploadUrl, {
+      contentType: "image/png",
+    });
+    const second = await t.mutation(gatedApi.gatedFiles.generateUploadUrl, {
+      contentType: "image/png",
+    });
+    stubBlob({});
+    await t.action(gatedApi.gatedFiles.confirmUpload, {
+      fileId: first.fileId,
+    });
+    await t.action(gatedApi.gatedFiles.confirmUpload, {
+      fileId: second.fileId,
+    });
+    onUpload.mockRejectedValueOnce(new Error("Temporary callback failure"));
+    stubScanResult("No threats found");
+
+    await expect(
+      t.action((ctx) => gatedAzure.scanMalware(ctx)),
+    ).rejects.toThrow("Failed to process");
+    expect(
+      (
+        await t.query(app.components.azureBlob.lib.get, {
+          fileId: first.fileId,
+        })
+      )?.status,
+    ).toBe("scanning");
+    expect(
+      (
+        await t.query(app.components.azureBlob.lib.get, {
+          fileId: second.fileId,
+        })
+      )?.status,
+    ).toBe("ready");
+    expect(
+      await t.run((ctx) => ctx.db.query("attachments").take(10)),
+    ).toHaveLength(1);
+
+    gatedNow += 15_000;
+    expect(await t.action((ctx) => gatedAzure.scanMalware(ctx))).toBe(1);
+    expect(
+      (
+        await t.query(app.components.azureBlob.lib.get, {
+          fileId: first.fileId,
+        })
+      )?.status,
+    ).toBe("ready");
+    expect(
+      await t.run((ctx) => ctx.db.query("attachments").take(10)),
+    ).toHaveLength(2);
   });
 
   it("refuses anonymous callers and checkUpload rejections", async () => {

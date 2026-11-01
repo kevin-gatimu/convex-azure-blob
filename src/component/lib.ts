@@ -284,6 +284,9 @@ const malwareScanCandidate = v.object({
   size: v.number(),
   deadlineAt: v.number(),
   attempts: v.number(),
+  phase: v.optional(v.literal("cleanup")),
+  cleanupUntil: v.optional(v.number()),
+  uploadExpiresAt: v.optional(v.number()),
   snapshot: v.optional(v.string()),
   onUpload: v.optional(v.string()),
 });
@@ -303,7 +306,7 @@ export const markScanning = mutation({
     const row = await ctx.db.get("files", args.fileId);
     if (!row || !row.malwareScanRequired || row.status === "deleting")
       return null;
-    if (row.status === "scanning") return toDoc(row);
+    if (row.status === "scanning" || row.status === "ready") return toDoc(row);
     if (row.status !== "pending") return null;
     if (
       !Number.isFinite(args.now) ||
@@ -349,9 +352,15 @@ export const dueMalwareScans = query({
     const candidates = [];
     for (const job of jobs) {
       const row = await ctx.db.get("files", job.fileId);
-      if (!row || row.status !== "scanning") continue;
+      if (!row) continue;
+      if (
+        job.phase === "cleanup"
+          ? row.status !== "rejected" || job.cleanupUntil === undefined
+          : row.status !== "scanning"
+      )
+        continue;
       if (row.size === undefined)
-        throw new ConvexError("Scanning file has no confirmed size");
+        throw new ConvexError("Malware scan file has no confirmed size");
       candidates.push({
         fileId: job.fileId,
         container: row.container,
@@ -359,6 +368,13 @@ export const dueMalwareScans = query({
         size: row.size,
         deadlineAt: job.deadlineAt,
         attempts: job.attempts,
+        ...(job.phase ? { phase: job.phase } : {}),
+        ...(job.cleanupUntil !== undefined
+          ? { cleanupUntil: job.cleanupUntil }
+          : {}),
+        ...(row.uploadExpiresAt !== undefined
+          ? { uploadExpiresAt: row.uploadExpiresAt }
+          : {}),
         ...(row.snapshot ? { snapshot: row.snapshot } : {}),
         ...(job.onUpload ? { onUpload: job.onUpload } : {}),
       });
@@ -392,18 +408,49 @@ export const deferMalwareScan = mutation({
 });
 
 export const markScanRejected = mutation({
-  args: { fileId: v.id("files") },
+  args: {
+    fileId: v.id("files"),
+    now: v.number(),
+    cleanupUntil: v.number(),
+  },
   returns: v.union(fileDoc, v.null()),
   handler: async (ctx, args) => {
     const row = await ctx.db.get("files", args.fileId);
-    if (!row || row.status !== "scanning") return null;
+    if (!row || row.status === "deleting") return null;
+    if (row.status === "rejected") return toDoc(row);
+    if (row.status !== "scanning") return null;
+    if (!Number.isFinite(args.now) || !Number.isFinite(args.cleanupUntil))
+      throw new ConvexError("Invalid malware cleanup schedule");
     const job = await ctx.db
       .query("malwareScans")
       .withIndex("by_fileId", (q) => q.eq("fileId", args.fileId))
       .unique();
-    if (job) await ctx.db.delete("malwareScans", job._id);
+    if (!job) throw new ConvexError("Malware scan cleanup job not found");
+    await ctx.db.patch("malwareScans", job._id, {
+      phase: "cleanup",
+      cleanupUntil: args.cleanupUntil,
+      nextCheckAt: args.now,
+      attempts: 0,
+    });
     await ctx.db.patch("files", args.fileId, { status: "rejected" });
     return toDoc({ ...row, status: "rejected" });
+  },
+});
+
+export const finishMalwareCleanup = mutation({
+  args: { fileId: v.id("files") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const row = await ctx.db.get("files", args.fileId);
+    if (!row || row.status !== "rejected") return null;
+    const job = await ctx.db
+      .query("malwareScans")
+      .withIndex("by_fileId", (q) => q.eq("fileId", args.fileId))
+      .unique();
+    if (job?.phase === "cleanup") {
+      await ctx.db.delete("malwareScans", job._id);
+    }
+    return null;
   },
 });
 
@@ -418,7 +465,8 @@ export const markScanTimedOut = mutation({
       .query("malwareScans")
       .withIndex("by_fileId", (q) => q.eq("fileId", args.fileId))
       .unique();
-    if (!job || args.now < job.deadlineAt) return null;
+    if (!job || job.phase === "cleanup" || args.now < job.deadlineAt)
+      return null;
     await ctx.db.delete("malwareScans", job._id);
     await ctx.db.patch("files", args.fileId, { status: "scan_timed_out" });
     return toDoc({ ...row, status: "scan_timed_out" });

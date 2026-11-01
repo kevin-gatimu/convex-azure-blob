@@ -456,7 +456,9 @@ requires the `t` permission; in Entra mode, the identity needs the
 action. Files stay in `scanning` until a clean verdict or become
 `scan_timed_out` after 24 hours without a definitive result. `getUrl` only
 serves `ready` files, and `onUpload` runs only after a clean scan. Apps can read
-`getFile` to display the scanning, rejected, or timed-out state.
+`getFile` to display the scanning, rejected, or timed-out state. Rejected-blob
+cleanup continues through the upload ticket's expiry and a clock-skew grace
+period, so a still-valid create-only SAS cannot recreate it.
 
 Scanning is asynchronous: actual latency varies with file size, type and service
 load. Defender for Storage bills per GB scanned; configure its monthly scanning

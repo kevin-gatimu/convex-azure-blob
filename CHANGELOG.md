@@ -7,7 +7,8 @@
   `onUpload` runs only after a clean verdict; block uploads cannot enable this
   gate because their mutable blob tags cannot verify the immutable snapshot.
   Blob index tags must be enabled, and hierarchical-namespace accounts are not
-  supported.
+  supported. Rejected-blob cleanup persists through upload SAS expiry, and
+  scanner failures are retried independently without blocking the batch.
 - Add opt-in resumable browser block uploads via `blockUploads`, block ticket
   metadata, owner-authorized `renewUploadUrl`, and React `pause`, `resume`, and
   `canResume`. The default single-PUT flow and server-side `store` remain
