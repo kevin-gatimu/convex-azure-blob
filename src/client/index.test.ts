@@ -2878,6 +2878,37 @@ describe("access tiers", () => {
     );
   });
 
+  it("refuses to rehydrate a file known not to be archived, without calling Azure", async () => {
+    const { t, azure, reserve } = setup();
+    const fileId = await reserve();
+    stubTier("Cool");
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    fetchMock.mockClear();
+    await expect(
+      t.action((ctx) => azure.rehydrate(ctx, fileId, { tier: "Hot" })),
+    ).rejects.toThrow("File is not archived");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("records the confirm-time tier of a scanned file without an extra HEAD", async () => {
+    const { t, azure, reserve, file } = setup({ requireMalwareScan: true });
+    const fileId = await reserve();
+    stubTier("Cold");
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    expect(await file(fileId)).toMatchObject({
+      status: "scanning",
+      accessTier: "Cold",
+    });
+    stubScanResult("No threats found");
+    fetchMock.mockClear();
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect(await file(fileId)).toMatchObject({
+      status: "ready",
+      accessTier: "Cold",
+    });
+    expect(methods()).not.toContain("HEAD");
+  });
+
   it("applies the default only after a clean malware verdict", async () => {
     const { t, azure, reserve, file } = setup({
       requireMalwareScan: true,

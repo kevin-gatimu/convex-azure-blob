@@ -614,7 +614,8 @@ await azure.refreshTier(ctx, fileId); // poll from an internal action or cron
 `accessTier` and `archiveStatus` validators are exported for app validators.
 `setTier`, `rehydrate`, and `refreshTier` return false for unknown or non-ready
 files, and throw a `ConvexError` with the HTTP status on Azure non-2xx
-responses, without including the request URL. Authorize callers and ownership
+responses, without including the request URL. `rehydrate` also throws when the
+file's recorded tier is known and not `Archive`. Authorize callers and ownership
 before invoking these server methods; they are not exposed by `clientApi`.
 
 Archived files return null from both `getUrl` and `urlForFile`, even for public

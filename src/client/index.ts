@@ -18,7 +18,8 @@ import { ConvexError, v } from "convex/values";
 import type { ObjectType } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 import type { fileFields } from "../component/schema.js";
-export { accessTier, archiveStatus } from "../component/schema.js";
+import { accessTier, archiveStatus } from "../component/schema.js";
+export { accessTier, archiveStatus };
 import { getAccessToken, requestUserDelegationKey } from "./auth.js";
 import { resolveConfig } from "./config.js";
 import type { AzureBlobConfig } from "./config.js";
@@ -184,6 +185,18 @@ const SERVER_SAS_TTL_MS = 60 * 1000;
 const MAX_PUT_BLOB_FROM_URL_BYTES = 5000 * 1024 * 1024;
 const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 2 * 24 * 60 * 60 * 1000;
 const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
+// Derived from the schema validators so runtime checks can't drift from the stored values.
+const ACCESS_TIERS: readonly string[] = accessTier.members.map((m) => m.value);
+const ARCHIVE_STATUSES: readonly string[] = archiveStatus.members.map(
+  (m) => m.value,
+);
+const isAccessTier = (value: unknown): value is AccessTier =>
+  typeof value === "string" && ACCESS_TIERS.includes(value);
+const isArchiveStatus = (
+  value: unknown,
+): value is NonNullable<FileDoc["archiveStatus"]> =>
+  typeof value === "string" && ARCHIVE_STATUSES.includes(value);
+
 const isTransientAzureStatus = (status: number) =>
   status === 408 || status === 429 || status >= 500;
 
@@ -887,13 +900,16 @@ export class AzureBlob {
     return await this.changeTier(ctx, file, tier);
   }
 
-  /** Starts archive rehydration from an action; poll {@link refreshTier} until it completes. */
+  /**
+   * Starts archive rehydration from an action; poll {@link refreshTier} until it completes.
+   * False if the file is unknown or not ready; throws if it is known not to be archived.
+   */
   async rehydrate(
     ctx: RunActionCtx,
     fileId: string,
     options: RehydrateOptions,
   ) {
-    if (!["Hot", "Cool", "Cold"].includes(options.tier))
+    if (!isAccessTier(options.tier) || (options.tier as string) === "Archive")
       throw new ConvexError("Invalid rehydration tier");
     if (
       options.priority !== undefined &&
@@ -902,6 +918,9 @@ export class AzureBlob {
       throw new ConvexError("Invalid rehydration priority");
     const file = await this.getFile(ctx, fileId);
     if (!file || file.status !== "ready") return false;
+    // An unrecorded tier may still be Archive (e.g. set by a lifecycle rule), so only a known one blocks.
+    if (file.accessTier && file.accessTier !== "Archive")
+      throw new ConvexError("File is not archived");
     return await this.changeTier(
       ctx,
       file,
@@ -948,19 +967,8 @@ export class AzureBlob {
     const status = headers.get("x-ms-archive-status");
     return await ctx.runMutation(this.component.lib.updateTier, {
       fileId,
-      accessTier:
-        tier && ["Hot", "Cool", "Cold", "Archive"].includes(tier)
-          ? (tier as AccessTier)
-          : undefined,
-      archiveStatus:
-        status &&
-        [
-          "rehydrate-pending-to-hot",
-          "rehydrate-pending-to-cool",
-          "rehydrate-pending-to-cold",
-        ].includes(status)
-          ? (status as NonNullable<FileDoc["archiveStatus"]>)
-          : undefined,
+      accessTier: isAccessTier(tier) ? tier : undefined,
+      archiveStatus: isArchiveStatus(status) ? status : undefined,
     });
   }
 
@@ -970,8 +978,7 @@ export class AzureBlob {
     tier: AccessTier,
     priority?: RehydrateOptions["priority"],
   ) {
-    if (!["Hot", "Cool", "Cold", "Archive"].includes(tier))
-      throw new ConvexError("Invalid access tier");
+    if (!isAccessTier(tier)) throw new ConvexError("Invalid access tier");
     const request = await this.serverRequest(
       this.config(),
       file.container,
@@ -1026,15 +1033,15 @@ export class AzureBlob {
           "Automatic Azure Blob tier change failed; retaining ready file and refreshing its actual tier",
         );
       }
-      // The file is already ready, so recording the actual tier is best-effort and never throws.
+    }
+    // The file is already ready, so recording the actual tier is best-effort and never throws.
+    if (headers || this.options.accessTier) {
       try {
         if (headers) await this.recordTier(ctx, file.fileId, headers);
         else await this.refreshTier(ctx, file.fileId);
       } catch {
         console.error("Azure Blob tier refresh failed after becoming ready");
       }
-    } else if (headers) {
-      await this.recordTier(ctx, file.fileId, headers);
     }
   }
 
@@ -1213,6 +1220,11 @@ export class AzureBlob {
         });
     if (confirmed?.status === "ready")
       await this.applyReadyTier(ctx, confirmed, head.headers);
+    else if (confirmed?.status === "scanning")
+      // Record the tier now, so the scan path needs no extra HEAD when no default tier is set.
+      await this.recordTier(ctx, confirmed.fileId, head.headers).catch(() =>
+        console.error("Azure Blob tier record failed while scanning"),
+      );
     return confirmed
       ? {
           ok: true,

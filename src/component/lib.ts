@@ -206,7 +206,7 @@ export const upsertUserDelegationKey = mutation({
   },
 });
 
-/** Records Azure tier properties only while the file remains ready. */
+/** Records Azure tier properties only while the file is ready or awaiting its scan. */
 export const updateTier = mutation({
   args: {
     fileId: v.string(),
@@ -217,7 +217,8 @@ export const updateTier = mutation({
   handler: async (ctx, args) => {
     const id = ctx.db.normalizeId("files", args.fileId);
     const row = id ? await ctx.db.get("files", id) : null;
-    if (!id || !row || row.status !== "ready") return false;
+    if (!id || !row || (row.status !== "ready" && row.status !== "scanning"))
+      return false;
     await ctx.db.patch("files", id, {
       accessTier: args.accessTier,
       archiveStatus: args.archiveStatus,
