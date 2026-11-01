@@ -8,7 +8,7 @@ import {
 import { ConvexError, v } from "convex/values";
 import type { Doc } from "./_generated/dataModel.js";
 import { mutation, query } from "./_generated/server.js";
-import schema, { fileFields } from "./schema.js";
+import schema, { fileFields, userDelegationKeyFields } from "./schema.js";
 
 const MAX_METADATA_KEYS = 32;
 const MAX_METADATA_VALUE_LENGTH = 1024;
@@ -17,6 +17,7 @@ const MAX_SWEEP_LIMIT = 200;
 
 export const fileDoc = v.object({ fileId: v.id("files"), ...fileFields });
 const metadataValidator = fileFields.metadata;
+const userDelegationKeyValidator = v.object(userDelegationKeyFields);
 
 function toDoc(row: Doc<"files">) {
   const { _id, _creationTime: _, ...rest } = row;
@@ -58,12 +59,76 @@ export const create = mutation({
     metadata: metadataValidator,
     createdAt: v.number(),
     uploadExpiresAt: v.number(),
+    uploadMode: fileFields.uploadMode,
+    expectedSize: fileFields.expectedSize,
+    blockSize: fileFields.blockSize,
   },
   returns: v.id("files"),
   handler: async (ctx, args) => {
     assertFileName(args.fileName);
     assertMetadata(args.metadata);
+    if (
+      args.uploadMode === "blocks" &&
+      (!Number.isSafeInteger(args.expectedSize) ||
+        !args.expectedSize ||
+        args.expectedSize <= 0 ||
+        args.expectedSize > args.maxBytes ||
+        !Number.isSafeInteger(args.blockSize) ||
+        !args.blockSize ||
+        args.blockSize < 8 * 1024 * 1024 ||
+        args.blockSize > 4000 * 1024 * 1024 ||
+        Math.ceil(args.expectedSize / args.blockSize) > 50_000)
+    )
+      throw new ConvexError("Invalid block upload size");
     return await ctx.db.insert("files", { ...args, status: "pending" });
+  },
+});
+
+/** Extends only a pending session, never a file already claimed for deletion. */
+export const renewUpload = mutation({
+  args: {
+    fileId: v.string(),
+    uploadedBy: v.string(),
+    now: v.number(),
+    expiresAt: v.number(),
+  },
+  returns: v.union(fileDoc, v.null()),
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("files", args.fileId);
+    const row = id ? await ctx.db.get("files", id) : null;
+    if (
+      !id ||
+      !row ||
+      row.uploadedBy !== args.uploadedBy ||
+      row.status !== "pending" ||
+      row.uploadExpiresAt === undefined
+    )
+      return null;
+    if (
+      !Number.isFinite(args.now) ||
+      !Number.isFinite(args.expiresAt) ||
+      args.expiresAt <= args.now ||
+      args.expiresAt > args.now + 7 * 24 * 60 * 60 * 1000
+    )
+      throw new ConvexError("Invalid upload expiry");
+    await ctx.db.patch("files", id, { uploadExpiresAt: args.expiresAt });
+    return toDoc({ ...row, uploadExpiresAt: args.expiresAt });
+  },
+});
+
+/** Records the first immutable snapshot so confirmation retries validate the same bytes. */
+export const recordSnapshot = mutation({
+  args: { fileId: v.id("files"), snapshot: v.string() },
+  returns: v.union(v.string(), v.null()),
+  handler: async (ctx, args) => {
+    const row = await ctx.db.get("files", args.fileId);
+    if (!row || row.status === "deleting" || row.uploadMode !== "blocks")
+      return null;
+    if (row.snapshot) return row.snapshot;
+    if (row.status !== "pending" || !Number.isFinite(Date.parse(args.snapshot)))
+      throw new ConvexError("Invalid upload snapshot");
+    await ctx.db.patch("files", args.fileId, { snapshot: args.snapshot });
+    return args.snapshot;
   },
 });
 
@@ -75,6 +140,51 @@ export const get = query({
     const id = ctx.db.normalizeId("files", args.fileId);
     const row = id ? await ctx.db.get("files", id) : null;
     return row ? toDoc(row) : null;
+  },
+});
+
+export const getUserDelegationKey = query({
+  args: { accountName: v.string(), now: v.number() },
+  returns: v.union(userDelegationKeyValidator, v.null()),
+  handler: async (ctx, args) => {
+    const row = await ctx.db
+      .query("userDelegationKeys")
+      .withIndex("by_accountName", (q) => q.eq("accountName", args.accountName))
+      .unique();
+    if (!row) return null;
+    const startsAt = Date.parse(row.signedStart);
+    const expiresAt = Date.parse(row.signedExpiry);
+    if (
+      !Number.isFinite(startsAt) ||
+      startsAt > args.now ||
+      !Number.isFinite(expiresAt) ||
+      expiresAt <= args.now
+    ) {
+      return null;
+    }
+    const { _id, _creationTime, accountName: _, ...key } = row;
+    return key;
+  },
+});
+
+export const upsertUserDelegationKey = mutation({
+  args: {
+    accountName: v.string(),
+    ...userDelegationKeyFields,
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const { accountName, ...key } = args;
+    const existing = await ctx.db
+      .query("userDelegationKeys")
+      .withIndex("by_accountName", (q) => q.eq("accountName", accountName))
+      .unique();
+    if (existing) {
+      await ctx.db.patch("userDelegationKeys", existing._id, key);
+    } else {
+      await ctx.db.insert("userDelegationKeys", { accountName, ...key });
+    }
+    return null;
   },
 });
 
@@ -127,12 +237,21 @@ export const markReady = mutation({
     fileId: v.id("files"),
     size: v.number(),
     onUpload: v.optional(v.string()),
+    snapshot: v.optional(v.string()),
   },
   returns: v.union(fileDoc, v.null()),
   handler: async (ctx, args) => {
     const row = await ctx.db.get("files", args.fileId);
     if (!row || row.status === "deleting") return null;
     if (row.status === "ready") return toDoc(row);
+    if (
+      row.uploadMode === "blocks" &&
+      (!row.snapshot ||
+        args.snapshot !== row.snapshot ||
+        args.size !== row.expectedSize ||
+        args.size > row.maxBytes)
+    )
+      throw new ConvexError("Unverified block upload");
     await ctx.db.patch("files", args.fileId, {
       status: "ready",
       size: args.size,
@@ -155,7 +274,7 @@ export const markDeleting = mutation({
       container: v.string(),
       blobName: v.string(),
       createdAt: v.number(),
-      uploadExpiresAt: v.number(),
+      uploadExpiresAt: v.optional(v.number()),
     }),
     v.null(),
   ),
@@ -169,7 +288,9 @@ export const markDeleting = mutation({
       container: row.container,
       blobName: row.blobName,
       createdAt: row.createdAt,
-      uploadExpiresAt: row.uploadExpiresAt,
+      ...(row.uploadExpiresAt !== undefined
+        ? { uploadExpiresAt: row.uploadExpiresAt }
+        : {}),
     };
   },
 });
@@ -186,14 +307,18 @@ export const remove = mutation({
 
 /** Atomically claims stale pending uploads, so confirmation cannot race the selection. */
 export const claimSweepable = mutation({
-  args: { pendingBefore: v.number(), limit: v.number() },
+  args: {
+    pendingBefore: v.number(),
+    limit: v.number(),
+    now: v.optional(v.number()),
+  },
   returns: v.array(
     v.object({
       fileId: v.id("files"),
       container: v.string(),
       blobName: v.string(),
       createdAt: v.number(),
-      uploadExpiresAt: v.number(),
+      uploadExpiresAt: v.optional(v.number()),
     }),
   ),
   handler: async (ctx, args) => {
@@ -209,20 +334,25 @@ export const claimSweepable = mutation({
       deleting.length < limit
         ? await ctx.db
             .query("files")
-            .withIndex("by_status_createdAt", (q) =>
-              q.eq("status", "pending").lt("createdAt", args.pendingBefore),
+            .withIndex("by_status_uploadExpiresAt", (q) =>
+              q
+                .eq("status", "pending")
+                .lt("uploadExpiresAt", args.now ?? args.pendingBefore),
             )
             .take(limit - deleting.length)
         : [];
-    for (const row of stale) {
+    const expired = stale.filter((row) => row.createdAt < args.pendingBefore);
+    for (const row of expired) {
       await ctx.db.patch("files", row._id, { status: "deleting" });
     }
-    return [...deleting, ...stale].map((row) => ({
+    return [...deleting, ...expired].map((row) => ({
       fileId: row._id,
       container: row.container,
       blobName: row.blobName,
       createdAt: row.createdAt,
-      uploadExpiresAt: row.uploadExpiresAt,
+      ...(row.uploadExpiresAt !== undefined
+        ? { uploadExpiresAt: row.uploadExpiresAt }
+        : {}),
     }));
   },
 });

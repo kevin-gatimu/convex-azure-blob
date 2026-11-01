@@ -9,6 +9,7 @@ import { defineSchema } from "convex/server";
 import { describe, expect, it } from "vitest";
 import componentTest, { register } from "../test.js";
 import { AzureBlob } from "./index.js";
+import { blockId } from "./blocks.js";
 
 const endpoint = process.env.AZURITE_BLOB_ENDPOINT;
 const config = {
@@ -56,6 +57,56 @@ async function browserUpload(
 }
 
 describe.skipIf(!endpoint)("against Azurite", () => {
+  it("stages blocks and reads an immutable snapshot after the staging SAS overwrites the base", async () => {
+    const t = convexTest(defineSchema({}), componentTest.modules);
+    const azure = new AzureBlob(register(t), {
+      config,
+      blockUploads: true,
+      pathPrefix: "integration",
+    });
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        size: PNG.length,
+      }),
+    );
+    const stage = new URL(ticket.uploadUrl);
+    stage.searchParams.set("comp", "block");
+    stage.searchParams.set("blockid", blockId(0));
+    expect((await fetch(stage, { method: "PUT", body: PNG })).status).toBe(201);
+    expect((await fetch(ticket.uploadUrl)).status).toBe(403);
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+    ).toEqual({
+      ok: true,
+      size: PNG.length,
+      contentType: "image/png",
+    });
+    const url = await t.action((ctx) =>
+      azure.getUrl(ctx, ticket.fileId, { download: true }),
+    );
+    expect(new URL(url!).searchParams.get("sr")).toBe("bs");
+    expect(new URL(url!).searchParams.has("snapshot")).toBe(true);
+    expect(
+      (
+        await fetch(ticket.uploadUrl, {
+          method: "PUT",
+          headers: ticket.headers,
+          body: "changed",
+        })
+      ).status,
+    ).toBe(201);
+    expect(new Uint8Array(await (await fetch(url!)).arrayBuffer())).toEqual(
+      PNG,
+    );
+    const tampered = new URL(url!);
+    tampered.searchParams.delete("snapshot");
+    expect((await fetch(tampered)).status).toBe(403);
+    expect((await fetch(url!, { method: "DELETE" })).status).toBe(403);
+    expect(await t.action((ctx) => azure.purge(ctx, ticket.fileId))).toBe(true);
+    expect((await fetch(url!)).status).toBe(404);
+  });
   it("uploads with a create-only URL that cannot overwrite, then serves and downloads", async () => {
     const { t, azure } = setup();
     const { ticket, put } = await browserUpload(azure, t, PNG);

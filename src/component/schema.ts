@@ -25,13 +25,32 @@ export const fileFields = {
   metadata: v.optional(v.record(v.string(), v.string())),
   status: fileStatus,
   createdAt: v.number(),
-  /** Expiry of the create-only SAS issued for this file, independent of later client settings. */
-  uploadExpiresAt: v.number(),
+  /** Expiry of the create-only SAS; optional for files created before this field existed. */
+  uploadExpiresAt: v.optional(v.number()),
+  uploadMode: v.optional(v.literal("blocks")),
+  expectedSize: v.optional(v.number()),
+  blockSize: v.optional(v.number()),
+  snapshot: v.optional(v.string()),
+};
+
+export const userDelegationKeyFields = {
+  keyValue: v.string(),
+  signedObjectId: v.string(),
+  signedTenantId: v.string(),
+  signedStart: v.string(),
+  signedExpiry: v.string(),
+  signedService: v.string(),
+  signedVersion: v.string(),
 };
 
 export default defineSchema({
   files: defineTable(fileFields)
     .index("by_container_blobName", ["container", "blobName"])
     .index("by_status_createdAt", ["status", "createdAt"])
+    .index("by_status_uploadExpiresAt", ["status", "uploadExpiresAt"])
     .index("by_uploadedBy_status", ["uploadedBy", "status"]),
+  userDelegationKeys: defineTable({
+    accountName: v.string(),
+    ...userDelegationKeyFields,
+  }).index("by_accountName", ["accountName"]),
 });

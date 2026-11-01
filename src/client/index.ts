@@ -16,10 +16,19 @@ import { ConvexError, v } from "convex/values";
 import type { ObjectType } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 import type { fileFields } from "../component/schema.js";
+import { getAccessToken, requestUserDelegationKey } from "./auth.js";
 import { resolveConfig } from "./config.js";
 import type { AzureBlobConfig } from "./config.js";
-import { attachmentDisposition, signBlobSas } from "./sas.js";
+import { effectiveUploadExpiry } from "./upload-expiry.js";
+import { blockId, blockSizeFor, MAX_BLOCKS, parseBlockList } from "./blocks.js";
+import {
+  attachmentDisposition,
+  SAS_VERSION,
+  signBlobSas,
+  signUserDelegationSas,
+} from "./sas.js";
 import type { SasResponseHeaders } from "./sas.js";
+import type { UserDelegationKey } from "./sas.js";
 import { SNIFF_BYTES, sniffContentType } from "./sniff.js";
 
 export { resolveConfig } from "./config.js";
@@ -28,15 +37,25 @@ export {
   attachmentDisposition,
   blobStringToSign,
   signBlobSas,
+  signUserDelegationSas,
+  userDelegationStringToSign,
   SAS_VERSION,
 } from "./sas.js";
-export type { BlobSasInput, SasResponseHeaders } from "./sas.js";
+export type {
+  BlobSasInput,
+  SasResponseHeaders,
+  UserDelegationKey,
+  UserDelegationSasInput,
+} from "./sas.js";
 export { SNIFFABLE_CONTENT_TYPES, sniffContentType } from "./sniff.js";
 export type { ComponentApi };
 
 // The narrowest contexts each method needs; query, mutation and action contexts all fit them.
 type RunQueryCtx = Pick<GenericActionCtx<GenericDataModel>, "runQuery">;
-type RunMutationCtx = Pick<GenericActionCtx<GenericDataModel>, "runMutation">;
+type RunMutationCtx = Pick<
+  GenericActionCtx<GenericDataModel>,
+  "runQuery" | "runMutation"
+>;
 type RunActionCtx = Pick<
   GenericActionCtx<GenericDataModel>,
   "runQuery" | "runMutation"
@@ -69,6 +88,8 @@ export type AzureBlobOptions = {
   allowedContentTypes?: Readonly<Record<string, string>>;
   /** Upper bound for every file in bytes; callers can ask for less. Default 10 MiB. */
   maxBytes?: number;
+  /** Stage sliced blocks and confirm an immutable snapshot. Default false. */
+  blockUploads?: boolean;
   /** Virtual folder for new blobs, e.g. `"avatars"` gives `avatars/<uuid>.png`. */
   pathPrefix?: string;
   /** How long an upload URL stays valid. Default 300. */
@@ -91,6 +112,9 @@ export type UploadTicket = {
   fileId: string;
   uploadUrl: string;
   headers: Record<string, string>;
+  kind?: "blocks";
+  blockSize?: number;
+  expiresAt?: number;
 };
 
 export type ConfirmResult =
@@ -116,6 +140,9 @@ export const uploadTicketValidator = v.object({
   fileId: v.string(),
   uploadUrl: v.string(),
   headers: v.record(v.string(), v.string()),
+  kind: v.optional(v.literal("blocks")),
+  blockSize: v.optional(v.number()),
+  expiresAt: v.optional(v.number()),
 });
 
 export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
@@ -125,6 +152,7 @@ const DEFAULT_READ_WINDOW_SECONDS = 60 * 60;
 // Start times are backdated so a client whose clock runs slow is not refused.
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SERVER_SAS_TTL_MS = 60 * 1000;
+const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 2 * 24 * 60 * 60 * 1000;
 const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
 
 const mediaType = (header: string | null | undefined) =>
@@ -148,6 +176,16 @@ export class AzureBlob {
     public component: ComponentApi,
     private options: AzureBlobOptions = {},
   ) {
+    if (
+      options.blockUploads &&
+      (!Number.isFinite(
+        options.uploadTtlSeconds ?? DEFAULT_UPLOAD_TTL_SECONDS,
+      ) ||
+        (options.uploadTtlSeconds ?? DEFAULT_UPLOAD_TTL_SECONDS) <= 0 ||
+        (options.uploadTtlSeconds ?? DEFAULT_UPLOAD_TTL_SECONDS) >
+          7 * 24 * 60 * 60)
+    )
+      throw new Error("Block upload TTL must be between 0 and 604800 seconds");
     if (
       options.pathPrefix !== undefined &&
       !PATH_PREFIX.test(options.pathPrefix)
@@ -190,7 +228,11 @@ export class AzureBlob {
     blobName: string,
     permissions: string,
     expiresOn?: number,
+    snapshot?: string,
   ) {
+    if (!config.accountKey) {
+      throw new Error("Account-key signing requires AZURE_BLOB_KEY");
+    }
     const base = config.internalEndpoint ?? config.endpoint;
     const now = this.now();
     const sas = await signBlobSas({
@@ -202,8 +244,89 @@ export class AzureBlob {
       startsOn: now - CLOCK_SKEW_MS,
       expiresOn: expiresOn ?? now + SERVER_SAS_TTL_MS,
       protocol: this.protocolFor(base),
+      snapshot,
     });
     return `${this.blobUrl(base, container, blobName)}?${sas}`;
+  }
+
+  private async serverRequest(
+    config: AzureBlobConfig,
+    container: string,
+    blobName: string,
+    permissions: string,
+    expiresOn?: number,
+    accessToken?: string,
+    params: Record<string, string> = {},
+  ) {
+    if (config.accountKey) {
+      const url = new URL(
+        await this.serverUrl(
+          config,
+          container,
+          blobName,
+          permissions,
+          expiresOn,
+          params.snapshot,
+        ),
+      );
+      for (const [key, value] of Object.entries(params))
+        url.searchParams.set(key, value);
+      return { url: url.toString() };
+    }
+    const token = accessToken ?? (await getAccessToken(config));
+    const base = config.internalEndpoint ?? config.endpoint;
+    const url = new URL(this.blobUrl(base, container, blobName));
+    for (const [key, value] of Object.entries(params))
+      url.searchParams.set(key, value);
+    return {
+      url: url.toString(),
+      headers: {
+        authorization: `Bearer ${token}`,
+        "x-ms-version": SAS_VERSION,
+      },
+    };
+  }
+
+  private async cachedUserDelegationKey(
+    ctx: RunQueryCtx,
+    config: AzureBlobConfig,
+  ): Promise<UserDelegationKey> {
+    const key = await ctx.runQuery(this.component.lib.getUserDelegationKey, {
+      accountName: config.accountName,
+      now: this.now(),
+    });
+    if (!key) {
+      throw new Error(
+        "No valid Azure user delegation key is cached; run AzureBlob.refreshUserDelegationKey from an action or cron",
+      );
+    }
+    return key;
+  }
+
+  /** Refreshes the cached delegation key when it expires within two days. */
+  async refreshUserDelegationKey(ctx: RunActionCtx): Promise<void> {
+    const config = this.config();
+    if (config.accountKey) return;
+    const now = this.now();
+    const cached = await ctx.runQuery(this.component.lib.getUserDelegationKey, {
+      accountName: config.accountName,
+      now,
+    });
+    if (
+      cached &&
+      Date.parse(cached.signedExpiry) - now >
+        DELEGATION_KEY_REFRESH_THRESHOLD_MS
+    ) {
+      return;
+    }
+    const key = await requestUserDelegationKey(config, now);
+    if (Date.parse(key.signedExpiry) <= now) {
+      throw new Error("Azure Blob returned an expired user delegation key");
+    }
+    await ctx.runMutation(this.component.lib.upsertUserDelegationKey, {
+      accountName: config.accountName,
+      ...key,
+    });
   }
 
   private async reserve(
@@ -218,11 +341,22 @@ export class AzureBlob {
       metadata?: Record<string, string>;
     },
     ttlMs = this.uploadTtlMs,
+    blocks = false,
   ) {
     const contentType = mediaType(args.contentType);
     const extension = this.allowed[contentType];
     if (!extension) throw new ConvexError("This file type is not allowed");
     const maxBytes = Math.min(args.maxBytes ?? this.ceiling, this.ceiling);
+    let blockSize: number | undefined;
+    if (blocks) {
+      if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
+        throw new ConvexError("Invalid block upload size");
+      try {
+        blockSize = blockSizeFor(args.size!);
+      } catch {
+        throw new ConvexError("Invalid block upload size");
+      }
+    }
     if (args.size !== undefined && args.size > maxBytes) {
       throw new ConvexError("The file is too large");
     }
@@ -240,13 +374,16 @@ export class AzureBlob {
       metadata: args.metadata,
       createdAt,
       uploadExpiresAt,
+      ...(blocks
+        ? { uploadMode: "blocks" as const, expectedSize: args.size, blockSize }
+        : {}),
     });
     return { fileId, blobName, contentType, createdAt, uploadExpiresAt };
   }
 
   /**
-   * Reserves a file and returns where the browser uploads it. The SAS can only create that one
-   * blob (permission `c`), so it cannot overwrite a file after it is confirmed.
+   * Reserves a file and returns a create-only PUT ticket, or a write-only block staging ticket
+   * when `blockUploads` is enabled. Block uploads are confirmed as immutable snapshots.
    *
    * `size` is the size the client reports; it rejects obvious oversize files early, while the
    * real size is enforced by {@link confirmUpload}.
@@ -263,23 +400,127 @@ export class AzureBlob {
     },
   ): Promise<UploadTicket> {
     const config = this.config();
-    const { fileId, blobName, contentType, createdAt, uploadExpiresAt } =
-      await this.reserve(ctx, config, args);
-    const sas = await signBlobSas({
-      accountName: config.accountName,
-      accountKey: config.accountKey,
-      container: config.container,
-      blobName,
-      permissions: "c",
-      startsOn: createdAt - CLOCK_SKEW_MS,
-      expiresOn: uploadExpiresAt,
-      protocol: this.protocolFor(config.endpoint),
-    });
+    const delegationKey = config.accountKey
+      ? undefined
+      : await this.cachedUserDelegationKey(ctx, config);
+    const ttl = delegationKey
+      ? Math.min(
+          this.uploadTtlMs,
+          Date.parse(delegationKey.signedExpiry) - this.now(),
+        )
+      : this.uploadTtlMs;
+    const reserved = await this.reserve(
+      ctx,
+      config,
+      args,
+      ttl,
+      this.options.blockUploads === true,
+    );
+    return await this.uploadTicket(
+      ctx,
+      config,
+      {
+        ...reserved,
+        ...(this.options.blockUploads
+          ? { uploadMode: "blocks", blockSize: blockSizeFor(args.size!) }
+          : {}),
+      },
+      delegationKey,
+    );
+  }
+
+  private async uploadTicket(
+    ctx: RunQueryCtx,
+    config: AzureBlobConfig,
+    file: {
+      fileId: string;
+      blobName: string;
+      contentType: string;
+      createdAt: number;
+      uploadExpiresAt: number;
+      uploadMode?: string;
+      blockSize?: number;
+    },
+    delegationKey?: UserDelegationKey,
+  ): Promise<UploadTicket> {
+    const { fileId, blobName, contentType, createdAt, uploadExpiresAt } = file;
+    const startsOn = createdAt - CLOCK_SKEW_MS;
+    const protocol = this.protocolFor(config.endpoint);
+    const sas = config.accountKey
+      ? await signBlobSas({
+          accountName: config.accountName,
+          accountKey: config.accountKey,
+          container: config.container,
+          blobName,
+          permissions: file.uploadMode === "blocks" ? "w" : "c",
+          startsOn,
+          expiresOn: uploadExpiresAt,
+          protocol,
+        })
+      : await this.signDelegationSas(
+          ctx,
+          config,
+          {
+            container: config.container,
+            blobName,
+            permissions: file.uploadMode === "blocks" ? "w" : "c",
+            startsOn,
+            expiresOn: uploadExpiresAt,
+            protocol,
+          },
+          delegationKey,
+        );
     return {
       fileId,
       uploadUrl: `${this.blobUrl(config.endpoint, config.container, blobName)}?${sas}`,
       headers: { "x-ms-blob-type": "BlockBlob", "content-type": contentType },
+      ...(file.uploadMode === "blocks"
+        ? {
+            kind: "blocks" as const,
+            blockSize: file.blockSize,
+            expiresAt: uploadExpiresAt,
+          }
+        : {}),
     };
+  }
+
+  /** Renews the same owner's pending upload without changing its blob name. */
+  async renewUploadUrl(
+    ctx: RunMutationCtx,
+    args: { fileId: string; uploadedBy: string },
+  ): Promise<UploadTicket> {
+    const current = await this.getFile(ctx, args.fileId);
+    if (
+      !current ||
+      current.uploadedBy !== args.uploadedBy ||
+      current.status !== "pending"
+    )
+      throw new ConvexError("Unknown upload");
+    const config = this.config();
+    const key = config.accountKey
+      ? undefined
+      : await this.cachedUserDelegationKey(ctx, config);
+    const now = this.now();
+    const expiresAt = Math.min(
+      now + this.uploadTtlMs,
+      key ? Date.parse(key.signedExpiry) : Infinity,
+    );
+    const file = await ctx.runMutation(this.component.lib.renewUpload, {
+      ...args,
+      now,
+      expiresAt,
+    });
+    if (!file) throw new ConvexError("Unknown upload");
+    return await this.uploadTicket(
+      ctx,
+      { ...config, container: file.container },
+      {
+        ...file,
+        createdAt: now,
+        uploadExpiresAt: expiresAt,
+      },
+      key,
+    );
   }
 
   /** The file's row, or null. Includes `uploadedBy`, so the app can check ownership. */
@@ -310,20 +551,31 @@ export class AzureBlob {
   /** A browser URL for a ready file, or null. See {@link urlForFile}. */
   async getUrl(ctx: RunQueryCtx, fileId: string, options: UrlOptions = {}) {
     const file = await this.getFile(ctx, fileId);
-    return file ? await this.urlForFile(file, options) : null;
+    return file ? await this.urlForFile(file, options, ctx) : null;
   }
 
   /**
    * A browser URL for a file you already loaded (from {@link list}, say), or null unless it is
    * ready. Read SAS URLs are signed per `readWindowSeconds` window and stay valid for two windows,
    * so query results stay cacheable. With `AZURE_BLOB_PUBLIC_BASE_URL` set, plain URLs are
-   * returned instead, except for downloads, which need a signed `Content-Disposition`.
+   * returned instead, except for downloads, which need a signed `Content-Disposition`. Pass a
+   * query context as the third argument when using Microsoft Entra credentials.
    */
   async urlForFile(
-    file: Pick<FileDoc, "status" | "container" | "blobName" | "fileName">,
+    file: Pick<
+      FileDoc,
+      | "status"
+      | "container"
+      | "blobName"
+      | "fileName"
+      | "snapshot"
+      | "uploadMode"
+    >,
     options: UrlOptions = {},
+    ctx?: RunQueryCtx,
   ) {
     if (file.status !== "ready") return null;
+    if (file.uploadMode === "blocks" && !file.snapshot) return null;
     const config = this.config();
     const responseHeaders: SasResponseHeaders = {};
     if (options.download) {
@@ -336,24 +588,79 @@ export class AzureBlob {
     if (options.cacheControl)
       responseHeaders.cacheControl = options.cacheControl;
     const overridden = Object.keys(responseHeaders).length > 0;
-    if (config.publicBaseUrl && !overridden) {
+    if (config.publicBaseUrl && !overridden && !file.snapshot) {
       return `${config.publicBaseUrl}/${encodeBlobPath(file.blobName)}`;
     }
     const windowMs =
       (this.options.readWindowSeconds ?? DEFAULT_READ_WINDOW_SECONDS) * 1000;
     const windowStart = Math.floor(this.now() / windowMs) * windowMs;
-    const sas = await signBlobSas({
-      accountName: config.accountName,
-      accountKey: config.accountKey,
-      container: file.container,
-      blobName: file.blobName,
-      permissions: "r",
-      startsOn: windowStart - CLOCK_SKEW_MS,
-      expiresOn: windowStart + 2 * windowMs,
-      protocol: this.protocolFor(config.endpoint),
-      responseHeaders: overridden ? responseHeaders : undefined,
-    });
+    const startsOn = windowStart - CLOCK_SKEW_MS;
+    const expiresOn = windowStart + 2 * windowMs;
+    const protocol = this.protocolFor(config.endpoint);
+    let sas: string;
+    if (config.accountKey) {
+      sas = await signBlobSas({
+        accountName: config.accountName,
+        accountKey: config.accountKey,
+        container: file.container,
+        blobName: file.blobName,
+        permissions: "r",
+        startsOn,
+        expiresOn,
+        protocol,
+        responseHeaders: overridden ? responseHeaders : undefined,
+        snapshot: file.snapshot,
+      });
+    } else {
+      if (!ctx) {
+        throw new Error(
+          "urlForFile requires a query context when using Microsoft Entra credentials",
+        );
+      }
+      sas = await this.signDelegationSas(ctx, config, {
+        container: file.container,
+        blobName: file.blobName,
+        permissions: "r",
+        startsOn,
+        expiresOn,
+        protocol,
+        responseHeaders: overridden ? responseHeaders : undefined,
+        snapshot: file.snapshot,
+      });
+    }
     return `${this.blobUrl(config.endpoint, file.container, file.blobName)}?${sas}`;
+  }
+
+  private async signDelegationSas(
+    ctx: RunQueryCtx,
+    config: AzureBlobConfig,
+    input: {
+      container: string;
+      blobName: string;
+      permissions: string;
+      startsOn: number;
+      expiresOn: number;
+      protocol?: "https";
+      responseHeaders?: SasResponseHeaders;
+      snapshot?: string;
+    },
+    cachedKey?: UserDelegationKey,
+  ) {
+    const key = cachedKey ?? (await this.cachedUserDelegationKey(ctx, config));
+    const keyStart = Date.parse(key.signedStart);
+    const keyExpiry = Date.parse(key.signedExpiry);
+    return await signUserDelegationSas({
+      accountName: config.accountName,
+      container: input.container,
+      blobName: input.blobName,
+      permissions: input.permissions,
+      startsOn: Math.max(input.startsOn, keyStart),
+      expiresOn: Math.min(input.expiresOn, keyExpiry),
+      protocol: input.protocol,
+      responseHeaders: input.responseHeaders,
+      delegationKey: key,
+      snapshot: input.snapshot,
+    });
   }
 
   /**
@@ -366,27 +673,43 @@ export class AzureBlob {
     fileId: string,
     onUpload?: UploadCallback,
   ): Promise<ConfirmResult> {
-    const file = await this.getFile(ctx, fileId);
+    let file = await this.getFile(ctx, fileId);
     if (!file || file.status === "deleting")
       return { ok: false, reason: "Unknown upload" };
     if (file.status === "ready") {
       return { ok: true, size: file.size ?? 0, contentType: file.contentType };
     }
     const config = this.config();
-    const url = await this.serverUrl(
+    if (file.uploadMode === "blocks" && !file.snapshot) {
+      if (effectiveUploadExpiry(file, this.uploadTtlMs) <= this.now())
+        return { ok: false, reason: "Upload expired" };
+      const snapshot = await this.commitBlocks(ctx, config, file);
+      if (!snapshot.ok) return snapshot;
+      file = { ...file, snapshot: snapshot.snapshot };
+    }
+    const request = await this.serverRequest(
       config,
       file.container,
       file.blobName,
       "r",
+      undefined,
+      undefined,
+      file.snapshot ? { snapshot: file.snapshot } : {},
     );
-    const head = await fetch(url, { method: "HEAD" });
+    const head = await fetch(request.url, {
+      method: "HEAD",
+      ...(request.headers ? { headers: request.headers } : {}),
+    });
     if (head.status === 404) return { ok: false, reason: "Upload not found" };
     if (!head.ok) throw new Error(`Azure Blob HEAD failed with ${head.status}`);
     const size = Number(head.headers.get("content-length"));
     const contentType = mediaType(head.headers.get("content-type"));
     const reason =
       this.rejection(file, size, contentType) ??
-      (await this.contentRejection(url, file));
+      (file.uploadMode === "blocks" && size !== file.expectedSize
+        ? "The upload size does not match"
+        : null) ??
+      (await this.contentRejection(request.url, file, request.headers));
     if (reason) {
       await this.purge(ctx, fileId);
       return { ok: false, reason };
@@ -395,9 +718,137 @@ export class AzureBlob {
       fileId,
       size,
       onUpload: onUpload ? await createFunctionHandle(onUpload) : undefined,
+      ...(file.snapshot ? { snapshot: file.snapshot } : {}),
     });
     return ready
       ? { ok: true, size: ready.size ?? size, contentType: ready.contentType }
+      : { ok: false, reason: "Unknown upload" };
+  }
+
+  private async commitBlocks(
+    ctx: RunActionCtx,
+    config: AzureBlobConfig,
+    file: FileDoc,
+  ): Promise<{ ok: true; snapshot: string } | { ok: false; reason: string }> {
+    const expectedSize = file.expectedSize;
+    const blockSize = file.blockSize;
+    if (
+      !expectedSize ||
+      !blockSize ||
+      !Number.isSafeInteger(expectedSize) ||
+      expectedSize > file.maxBytes
+    )
+      return { ok: false, reason: "Invalid block upload size" };
+    const count = Math.ceil(expectedSize / blockSize);
+    if (count > MAX_BLOCKS)
+      return { ok: false, reason: "Invalid block upload size" };
+    const read = await this.serverRequest(
+      config,
+      file.container,
+      file.blobName,
+      "r",
+      undefined,
+      undefined,
+      { comp: "blocklist", blocklisttype: "all" },
+    );
+    const list = await fetch(read.url, { headers: read.headers });
+    if (list.status === 404) return { ok: false, reason: "Upload not found" };
+    if (!list.ok)
+      throw new Error(`Azure Blob block list failed with ${list.status}`);
+    let blocks: ReturnType<typeof parseBlockList>;
+    const xmlResponse = await list.text();
+    try {
+      blocks = parseBlockList(xmlResponse);
+    } catch {
+      return { ok: false, reason: "Invalid block list" };
+    }
+    const selected = new Map<string, (typeof blocks)[number]>();
+    for (const block of blocks) {
+      if (!selected.has(block.id) || !block.committed)
+        selected.set(block.id, block);
+    }
+    if (selected.size !== count)
+      return { ok: false, reason: "The upload size does not match" };
+    let xml = '<?xml version="1.0" encoding="utf-8"?><BlockList>';
+    for (let index = 0; index < count; index++) {
+      const id = blockId(index);
+      const block = selected.get(id);
+      if (
+        !block ||
+        block.size !== Math.min(blockSize, expectedSize - index * blockSize)
+      )
+        return { ok: false, reason: "The upload size does not match" };
+      const tag = block.committed ? "Committed" : "Uncommitted";
+      xml += `<${tag}>${id}</${tag}>`;
+    }
+    xml += "</BlockList>";
+    const base = await this.serverRequest(
+      config,
+      file.container,
+      file.blobName,
+      "r",
+    );
+    const head = await fetch(base.url, {
+      method: "HEAD",
+      headers: base.headers,
+    });
+    if (!head.ok && head.status !== 404)
+      throw new Error(`Azure Blob HEAD failed with ${head.status}`);
+    const etag = head.headers.get("etag");
+    if (head.ok && !etag) return { ok: false, reason: "Missing blob ETag" };
+    const commit = await this.serverRequest(
+      config,
+      file.container,
+      file.blobName,
+      "w",
+      undefined,
+      undefined,
+      { comp: "blocklist" },
+    );
+    const committed = await fetch(commit.url, {
+      method: "PUT",
+      headers: {
+        ...commit.headers,
+        "content-type": "application/xml",
+        "x-ms-blob-content-type": file.contentType,
+        ...(head.ok ? { "If-Match": etag! } : { "If-None-Match": "*" }),
+      },
+      body: xml,
+    });
+    if (!committed.ok)
+      return {
+        ok: false,
+        reason: `Azure Blob commit failed with ${committed.status}`,
+      };
+    const committedEtag = committed.headers.get("etag");
+    if (!committedEtag) return { ok: false, reason: "Missing committed ETag" };
+    const snapshotRequest = await this.serverRequest(
+      config,
+      file.container,
+      file.blobName,
+      "w",
+      undefined,
+      undefined,
+      { comp: "snapshot" },
+    );
+    const response = await fetch(snapshotRequest.url, {
+      method: "PUT",
+      headers: { ...snapshotRequest.headers, "If-Match": committedEtag },
+    });
+    if (!response.ok)
+      return {
+        ok: false,
+        reason: `Azure Blob snapshot failed with ${response.status}`,
+      };
+    const snapshot = response.headers.get("x-ms-snapshot");
+    if (!snapshot || !Number.isFinite(Date.parse(snapshot)))
+      return { ok: false, reason: "Missing upload snapshot" };
+    const recorded = await ctx.runMutation(this.component.lib.recordSnapshot, {
+      fileId: file.fileId,
+      snapshot,
+    });
+    return recorded
+      ? { ok: true, snapshot: recorded }
       : { ok: false, reason: "Unknown upload" };
   }
 
@@ -410,12 +861,19 @@ export class AzureBlob {
     return null;
   }
 
-  private async contentRejection(url: string, file: FileDoc) {
+  private async contentRejection(
+    url: string,
+    file: FileDoc,
+    authorizationHeaders?: Record<string, string>,
+  ) {
     if (this.options.verifyContent === false) return null;
     if (sniffContentType(file.contentType, new Uint8Array()) === undefined)
       return null;
     const response = await fetch(url, {
-      headers: { range: `bytes=0-${SNIFF_BYTES - 1}` },
+      headers: {
+        ...authorizationHeaders,
+        range: `bytes=0-${SNIFF_BYTES - 1}`,
+      },
     });
     if (!response.ok)
       throw new Error(`Azure Blob GET failed with ${response.status}`);
@@ -472,18 +930,24 @@ export class AzureBlob {
       container: string;
       blobName: string;
       createdAt: number;
-      uploadExpiresAt: number;
+      uploadExpiresAt?: number;
     },
   ) {
-    const url = await this.serverUrl(
+    const request = await this.serverRequest(
       this.config(),
       file.container,
       file.blobName,
       "d",
     );
-    const response = await fetch(url, { method: "DELETE" });
+    const response = await fetch(request.url, {
+      method: "DELETE",
+      headers: { ...request.headers, "x-ms-delete-snapshots": "include" },
+    });
     if (!response.ok && response.status !== 404) return false;
-    if (this.now() >= file.uploadExpiresAt + CLOCK_SKEW_MS) {
+    if (
+      this.now() >=
+      effectiveUploadExpiry(file, this.uploadTtlMs) + CLOCK_SKEW_MS
+    ) {
       await ctx.runMutation(this.component.lib.remove, { fileId: file.fileId });
     }
     return true;
@@ -503,6 +967,7 @@ export class AzureBlob {
       pendingBefore:
         this.now() - (args.pendingOlderThanMs ?? DEFAULT_PENDING_TTL_MS),
       limit: args.limit ?? 100,
+      now: this.now(),
     });
     let removed = 0;
     for (const file of stale) {
@@ -524,6 +989,9 @@ export class AzureBlob {
     },
   ): Promise<StoreResult> {
     const config = this.config();
+    const accessToken = config.accountKey
+      ? undefined
+      : await getAccessToken(config);
     const { data, ...rest } = args;
     const body = data instanceof Blob ? data : new Blob([data]);
     const { fileId, blobName, contentType, uploadExpiresAt } =
@@ -533,16 +1001,21 @@ export class AzureBlob {
         { ...rest, size: body.size },
         SERVER_SAS_TTL_MS,
       );
-    const url = await this.serverUrl(
+    const request = await this.serverRequest(
       config,
       config.container,
       blobName,
       "c",
       uploadExpiresAt,
+      accessToken,
     );
-    const response = await fetch(url, {
+    const response = await fetch(request.url, {
       method: "PUT",
-      headers: { "x-ms-blob-type": "BlockBlob", "content-type": contentType },
+      headers: {
+        ...request.headers,
+        "x-ms-blob-type": "BlockBlob",
+        "content-type": contentType,
+      },
       body,
     });
     if (!response.ok) {
@@ -589,6 +1062,14 @@ export class AzureBlob {
             uploadedBy,
           });
           return await this.generateUploadUrl(ctx, { ...args, uploadedBy });
+        },
+      }),
+      renewUploadUrl: mutationGeneric({
+        args: { fileId: v.string() },
+        returns: uploadTicketValidator,
+        handler: async (ctx, args): Promise<UploadTicket> => {
+          const uploadedBy = await identify(ctx);
+          return await this.renewUploadUrl(ctx, { ...args, uploadedBy });
         },
       }),
       confirmUpload: actionGeneric({
