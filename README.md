@@ -416,6 +416,28 @@ SDK and expose a compatible `renewUploadUrl({ fileId })` mutation for the hook.
 `store` remains a single-PUT server-side upload; block mode is for browser
 upload sessions.
 
+### Integrity check with MD5
+
+Pass an optional `md5` to `generateUploadUrl`: the file's MD5 digest as base64
+(exactly 16 bytes). The ticket's `headers` then include `Content-MD5`, so Azure
+refuses a PUT whose body differs, and `confirmUpload` rejects (and deletes) a
+blob whose stored `Content-MD5` is missing or different, with the reason
+`Checksum mismatch`. An invalid `md5` throws a `ConvexError`.
+
+The app must compute the digest itself: Web Crypto has no MD5 and this package
+adds no hashing dependency. Use any MD5 implementation you trust, then:
+
+```ts
+const { upload } = useUploadFile(api.files);
+const fileId = await upload(file, { md5 }); // md5: base64 of the 16-byte digest
+```
+
+`useUploadFile` forwards extra arguments to your `generateUploadUrl` (add
+`md5: v.optional(v.string())` to a custom mutation's args; `clientApi` already
+accepts it) and sends the ticket headers with the PUT. Add `content-md5` to the
+CORS rule's **Allowed headers** so browsers may send it. `md5` is not supported
+with `blockUploads`: passing both throws a `ConvexError`.
+
 ### Event Grid upload confirmation
 
 The browser normally calls `confirmUpload` after Azure accepts a PUT. To recover

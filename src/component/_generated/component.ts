@@ -50,6 +50,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           malwareScanRequired?: boolean;
           maxBytes: number;
+          md5?: string;
           metadata?: Record<string, string>;
           uploadExpiresAt: number;
           uploadMode?: "blocks";
@@ -113,6 +114,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           malwareScanRequired?: boolean;
           maxBytes: number;
+          md5?: string;
           metadata?: Record<string, string>;
           nextAttemptAt?: number;
           size?: number;
@@ -146,6 +148,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           malwareScanRequired?: boolean;
           maxBytes: number;
+          md5?: string;
           metadata?: Record<string, string>;
           nextAttemptAt?: number;
           size?: number;
@@ -207,6 +210,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             fileName?: string;
             malwareScanRequired?: boolean;
             maxBytes: number;
+            md5?: string;
             metadata?: Record<string, string>;
             nextAttemptAt?: number;
             size?: number;
@@ -255,6 +259,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           malwareScanRequired?: boolean;
           maxBytes: number;
+          md5?: string;
           metadata?: Record<string, string>;
           nextAttemptAt?: number;
           size?: number;
@@ -295,6 +300,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           malwareScanRequired?: boolean;
           maxBytes: number;
+          md5?: string;
           metadata?: Record<string, string>;
           nextAttemptAt?: number;
           size?: number;
@@ -328,6 +334,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           malwareScanRequired?: boolean;
           maxBytes: number;
+          md5?: string;
           metadata?: Record<string, string>;
           nextAttemptAt?: number;
           size?: number;
@@ -361,6 +368,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           malwareScanRequired?: boolean;
           maxBytes: number;
+          md5?: string;
           metadata?: Record<string, string>;
           nextAttemptAt?: number;
           size?: number;
@@ -408,6 +416,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           fileName?: string;
           malwareScanRequired?: boolean;
           maxBytes: number;
+          md5?: string;
           metadata?: Record<string, string>;
           nextAttemptAt?: number;
           size?: number;

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add optional `md5` (base64 of a 16-byte digest, computed by the app) to
+  `generateUploadUrl` and the `clientApi` mutation. The ticket carries
+  `Content-MD5`, so Azure refuses a mismatched body, and `confirmUpload` rejects
+  and deletes a blob whose checksum is missing or different
+  (`Checksum mismatch`). New optional `files.md5` field. Not supported with
+  `blockUploads`; add `content-md5` to the CORS allowed headers to use it from
+  browsers.
 - Add bounded sweep concurrency (default 8) and optional internal-action drain
   scheduling with `continueWith`, `run`, and `maxRuns` (default 10). Failed blob
   deletes use exponential backoff capped at 24 hours; live upload URLs defer

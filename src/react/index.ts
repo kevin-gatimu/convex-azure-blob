@@ -18,7 +18,7 @@ type ConfirmResult =
   | { ok: false; reason: string };
 
 export type UploadOptions = {
-  /** Headers from the upload ticket: `x-ms-blob-type` and `content-type`. */
+  /** Headers from the upload ticket: `x-ms-blob-type`, `content-type` and, with an `md5`, `Content-MD5`. */
   headers?: Record<string, string>;
   /** Called with the fraction uploaded, from 0 to 1. */
   onProgress?: (fraction: number) => void;
@@ -253,7 +253,9 @@ type ExtraArgs<Args> = Omit<Args, keyof GenerateArgs>;
  * ```
  *
  * If your `generateUploadUrl` takes extra arguments (a post id, say), pass them as the second
- * argument of `upload`.
+ * argument of `upload`. That includes `md5`, the file's base64 MD5 digest: compute it in the app
+ * (Web Crypto has no MD5), and the ticket's `Content-MD5` header is sent with the PUT so Azure
+ * refuses a body that differs. `md5` is not supported with block uploads.
  * Block tickets support `pause()` and in-memory `resume()`; `cancel()` discards the session.
  * Resume renews unfinished staging tickets when `renewUploadUrl` is available.
  */

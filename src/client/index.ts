@@ -179,6 +179,10 @@ const isTransientAzureStatus = (status: number) =>
 const mediaType = (header: string | null | undefined) =>
   (header ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
 
+// Canonical base64 of exactly 16 bytes: 22 chars plus "==" padding, with zero trailing bits.
+const isMd5Base64 = (value: string) =>
+  /^[A-Za-z0-9+/]{21}[AQgw]==$/.test(value);
+
 function decodeXmlText(value: string) {
   return value
     .replace(/&#x([0-9a-f]+);/gi, (_, code: string) =>
@@ -575,6 +579,7 @@ export class AzureBlob {
       size?: number;
       fileName?: string;
       metadata?: Record<string, string>;
+      md5?: string;
     },
     ttlMs = this.uploadTtlMs,
     blocks = false,
@@ -609,13 +614,21 @@ export class AzureBlob {
       fileName: args.fileName,
       metadata: args.metadata,
       ...(this.options.requireMalwareScan ? { malwareScanRequired: true } : {}),
+      ...(args.md5 ? { md5: args.md5 } : {}),
       createdAt,
       uploadExpiresAt,
       ...(blocks
         ? { uploadMode: "blocks" as const, expectedSize: args.size, blockSize }
         : {}),
     });
-    return { fileId, blobName, contentType, createdAt, uploadExpiresAt };
+    return {
+      fileId,
+      blobName,
+      contentType,
+      createdAt,
+      uploadExpiresAt,
+      md5: args.md5,
+    };
   }
 
   /**
@@ -624,6 +637,11 @@ export class AzureBlob {
    *
    * `size` is the size the client reports; it rejects obvious oversize files early, while the
    * real size is enforced by {@link confirmUpload}.
+   *
+   * `md5` is the file's MD5 as base64 (16 bytes); the app must compute it, since Web Crypto has
+   * no MD5. The ticket then carries `Content-MD5`, so Azure refuses a body that differs, and
+   * {@link confirmUpload} rejects a blob whose stored checksum differs. Not supported with
+   * `blockUploads`.
    */
   async generateUploadUrl(
     ctx: RunMutationCtx,
@@ -634,8 +652,15 @@ export class AzureBlob {
       size?: number;
       fileName?: string;
       metadata?: Record<string, string>;
+      md5?: string;
     },
   ): Promise<UploadTicket> {
+    if (args.md5 !== undefined) {
+      if (this.options.blockUploads)
+        throw new ConvexError("md5 is not supported with block uploads");
+      if (!isMd5Base64(args.md5))
+        throw new ConvexError("md5 must be a base64-encoded 16-byte digest");
+    }
     const config = this.config();
     const delegationKey = config.accountKey
       ? undefined
@@ -677,6 +702,7 @@ export class AzureBlob {
       uploadExpiresAt: number;
       uploadMode?: string;
       blockSize?: number;
+      md5?: string;
     },
     delegationKey?: UserDelegationKey,
   ): Promise<UploadTicket> {
@@ -710,7 +736,11 @@ export class AzureBlob {
     return {
       fileId,
       uploadUrl: `${this.blobUrl(config.endpoint, config.container, blobName)}?${sas}`,
-      headers: { "x-ms-blob-type": "BlockBlob", "content-type": contentType },
+      headers: {
+        "x-ms-blob-type": "BlockBlob",
+        "content-type": contentType,
+        ...(file.md5 ? { "Content-MD5": file.md5 } : {}),
+      },
       ...(file.uploadMode === "blocks"
         ? {
             kind: "blocks" as const,
@@ -1014,6 +1044,9 @@ export class AzureBlob {
     const contentType = mediaType(head.headers.get("content-type"));
     const reason =
       this.rejection(file, size, contentType) ??
+      (file.md5 && head.headers.get("content-md5") !== file.md5
+        ? "Checksum mismatch"
+        : null) ??
       (file.uploadMode === "blocks" && size !== file.expectedSize
         ? "The upload size does not match"
         : null) ??
@@ -1715,6 +1748,7 @@ export class AzureBlob {
           contentType: v.string(),
           fileName: v.optional(v.string()),
           size: v.optional(v.number()),
+          md5: v.optional(v.string()),
         },
         returns: uploadTicketValidator,
         handler: async (ctx, args): Promise<UploadTicket> => {
