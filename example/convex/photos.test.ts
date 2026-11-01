@@ -1,9 +1,10 @@
 /// <reference types="vite/client" />
 import azureBlobTest from "convex-azure-blob/test";
+import { AzureBlob } from "convex-azure-blob";
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { MAX_FILE_BYTES } from "../upload-policy";
-import { api, internal } from "./_generated/api";
+import { api, components, internal } from "./_generated/api";
 import { azure } from "./photos";
 import schema from "./schema";
 
@@ -19,7 +20,7 @@ const blockId = (index: number) => btoa(String(index).padStart(8, "0"));
 type Stored = { size: number; type: string; bytes: Uint8Array<ArrayBuffer> };
 // What Azure "holds" per blob name; unlisted blobs default by extension.
 const stored = new Map<string, Stored>();
-const failures: { blockList?: number; commit?: number } = {};
+const failures: { blockList?: number; commit?: number; snapshot?: number } = {};
 const defaults = (name: string): Stored =>
   name.endsWith(".pdf")
     ? { size: PDF.length, type: "application/pdf", bytes: PDF }
@@ -85,7 +86,7 @@ const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
   }
   if (method === "PUT" && comp === "snapshot") {
     return new Response(null, {
-      status: 201,
+      status: failures.snapshot ?? 201,
       headers: { "x-ms-snapshot": SNAPSHOT },
     });
   }
@@ -191,6 +192,7 @@ afterEach(() => {
   stored.clear();
   delete failures.blockList;
   delete failures.commit;
+  delete failures.snapshot;
 });
 
 describe("Event Grid confirmation", () => {
@@ -271,6 +273,26 @@ describe("Event Grid confirmation", () => {
     expect(await t.run((ctx) => ctx.db.query("photos").take(10))).toEqual([]);
   });
 
+  test("does not confirm blobs outside the configured path prefix", async () => {
+    const t = initConvexTest();
+    const otherAzure = new AzureBlob(components.azureBlob, {
+      blockUploads: true,
+      pathPrefix: "other",
+    });
+    const ticket = await t.mutation((ctx) =>
+      otherAzure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        size: 8,
+        uploadedBy: "alice",
+      }),
+    );
+
+    expect((await postEventGrid(t, [blobCreatedEvent(ticket)])).status).toBe(
+      200,
+    );
+    expect(await t.run((ctx) => ctx.db.query("photos").take(10))).toEqual([]);
+  });
+
   test("confirms a BlobCreated event and attaches the photo once across retries", async () => {
     const t = initConvexTest().withIdentity({ subject: "alice" });
     const ticket = await t.mutation(api.photos.generateUploadUrl, {
@@ -325,6 +347,45 @@ describe("Event Grid confirmation", () => {
       1,
     );
   });
+
+  test.each(["commit", "snapshot"] as const)(
+    "returns a retryable status after a transient Azure %s failure",
+    async (stage) => {
+      const t = initConvexTest();
+      const ticket = await t.mutation(api.photos.generateUploadUrl, {
+        contentType: "image/png",
+        size: 8,
+      });
+      const event = [blobCreatedEvent(ticket)];
+      failures[stage] = 503;
+
+      expect((await postEventGrid(t, event)).status).toBe(503);
+      expect(await t.run((ctx) => ctx.db.query("photos").take(10))).toEqual([]);
+
+      delete failures[stage];
+      expect((await postEventGrid(t, event)).status).toBe(200);
+      expect(
+        await t.run((ctx) => ctx.db.query("photos").take(10)),
+      ).toHaveLength(1);
+    },
+  );
+
+  test.each(["commit", "snapshot"] as const)(
+    "acknowledges a permanent Azure %s failure",
+    async (stage) => {
+      const t = initConvexTest();
+      const ticket = await t.mutation(api.photos.generateUploadUrl, {
+        contentType: "image/png",
+        size: 8,
+      });
+      failures[stage] = 400;
+
+      expect((await postEventGrid(t, [blobCreatedEvent(ticket)])).status).toBe(
+        200,
+      );
+      expect(await t.run((ctx) => ctx.db.query("photos").take(10))).toEqual([]);
+    },
+  );
 
   test("commits the upload callback once when browser and Event Grid confirm concurrently", async () => {
     const t = initConvexTest().withIdentity({ subject: "alice" });

@@ -168,6 +168,8 @@ const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SERVER_SAS_TTL_MS = 60 * 1000;
 const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 2 * 24 * 60 * 60 * 1000;
 const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
+const isTransientAzureStatus = (status: number) =>
+  status === 408 || status === 429 || status >= 500;
 
 const mediaType = (header: string | null | undefined) =>
   (header ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
@@ -396,6 +398,8 @@ export class AzureBlob {
         config ??= this.config();
         const address = blobAddressFromEventUrl(blobUrl, config.endpoint);
         if (!address || address.container !== config.container) continue;
+        const prefix = this.options.pathPrefix;
+        if (prefix && !address.blobName.startsWith(`${prefix}/`)) continue;
         try {
           const file = await ctx.runQuery(this.component.lib.getByBlobName, {
             ...address,
@@ -1258,11 +1262,14 @@ export class AzureBlob {
       },
       body: xml,
     });
-    if (!committed.ok)
+    if (!committed.ok) {
+      if (isTransientAzureStatus(committed.status))
+        throw new Error(`Azure Blob commit failed with ${committed.status}`);
       return {
         ok: false,
         reason: `Azure Blob commit failed with ${committed.status}`,
       };
+    }
     const committedEtag = committed.headers.get("etag");
     if (!committedEtag) return { ok: false, reason: "Missing committed ETag" };
     const snapshotRequest = await this.serverRequest(
@@ -1278,11 +1285,14 @@ export class AzureBlob {
       method: "PUT",
       headers: { ...snapshotRequest.headers, "If-Match": committedEtag },
     });
-    if (!response.ok)
+    if (!response.ok) {
+      if (isTransientAzureStatus(response.status))
+        throw new Error(`Azure Blob snapshot failed with ${response.status}`);
       return {
         ok: false,
         reason: `Azure Blob snapshot failed with ${response.status}`,
       };
+    }
     const snapshot = response.headers.get("x-ms-snapshot");
     if (!snapshot || !Number.isFinite(Date.parse(snapshot)))
       return { ok: false, reason: "Missing upload snapshot" };
