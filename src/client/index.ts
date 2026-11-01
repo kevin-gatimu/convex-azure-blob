@@ -18,6 +18,7 @@ import { ConvexError, v } from "convex/values";
 import type { ObjectType } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 import type { fileFields } from "../component/schema.js";
+export { accessTier, archiveStatus } from "../component/schema.js";
 import { getAccessToken, requestUserDelegationKey } from "./auth.js";
 import { resolveConfig } from "./config.js";
 import type { AzureBlobConfig } from "./config.js";
@@ -66,6 +67,14 @@ type RunActionCtx = Pick<
 /** A file as the component stores it. `fileId` is what the app keeps on its own documents. */
 export type FileDoc = { fileId: string } & ObjectType<typeof fileFields>;
 export type FileStatus = FileDoc["status"];
+/** An Azure block blob storage tier. */
+export type AccessTier = NonNullable<FileDoc["accessTier"]>;
+/** An online tier to which an archived blob can be rehydrated. */
+export type RehydrateOptions = {
+  tier: Exclude<AccessTier, "Archive">;
+  /** Azure scheduling priority; defaults to Standard. */
+  priority?: "Standard" | "High";
+};
 
 /** An app mutation invoked atomically with the file's ready transition. */
 export type UploadCallback = FunctionReference<
@@ -94,6 +103,8 @@ export type AzureBlobOptions = {
   blockUploads?: boolean;
   /** Keep confirmed files unservable until Defender for Storage reports a clean scan. */
   requireMalwareScan?: boolean;
+  /** Apply this tier server-side after a file becomes ready. */
+  accessTier?: AccessTier;
   /** Virtual folder for new blobs, e.g. `"avatars"` gives `avatars/<uuid>.png`. */
   pathPrefix?: string;
   /** How long an upload URL stays valid. Default 300. */
@@ -780,7 +791,7 @@ export class AzureBlob {
     });
   }
 
-  /** A browser URL for a ready file, or null. See {@link urlForFile}. */
+  /** A browser URL for a ready, non-archived file, or null. See {@link urlForFile}. */
   async getUrl(ctx: RunQueryCtx, fileId: string, options: UrlOptions = {}) {
     const file = await this.getFile(ctx, fileId);
     return file ? await this.urlForFile(file, options, ctx) : null;
@@ -788,7 +799,7 @@ export class AzureBlob {
 
   /**
    * A browser URL for a file you already loaded (from {@link list}, say), or null unless it is
-   * ready. Read SAS URLs are signed per `readWindowSeconds` window and stay valid for two windows,
+   * ready and not archived. Read SAS URLs are signed per `readWindowSeconds` window and stay valid for two windows,
    * so query results stay cacheable. With `AZURE_BLOB_PUBLIC_BASE_URL` set, plain URLs are
    * returned instead, except for downloads, which need a signed `Content-Disposition`. Pass a
    * query context as the third argument when using Microsoft Entra credentials.
@@ -802,11 +813,12 @@ export class AzureBlob {
       | "fileName"
       | "snapshot"
       | "uploadMode"
+      | "accessTier"
     >,
     options: UrlOptions = {},
     ctx?: RunQueryCtx,
   ) {
-    if (file.status !== "ready") return null;
+    if (file.status !== "ready" || file.accessTier === "Archive") return null;
     if (file.uploadMode === "blocks" && !file.snapshot) return null;
     const config = this.config();
     const responseHeaders: SasResponseHeaders = {};
@@ -861,6 +873,164 @@ export class AzureBlob {
       });
     }
     return `${this.blobUrl(config.endpoint, file.container, file.blobName)}?${sas}`;
+  }
+
+  /** Sets a ready file's Azure tier from an action; false if unknown or not ready. */
+  async setTier(ctx: RunActionCtx, fileId: string, tier: AccessTier) {
+    const file = await this.getFile(ctx, fileId);
+    if (!file || file.status !== "ready") return false;
+    return await this.changeTier(ctx, file, tier);
+  }
+
+  /** Starts archive rehydration from an action; poll {@link refreshTier} until it completes. */
+  async rehydrate(
+    ctx: RunActionCtx,
+    fileId: string,
+    options: RehydrateOptions,
+  ) {
+    if (!["Hot", "Cool", "Cold"].includes(options.tier))
+      throw new ConvexError("Invalid rehydration tier");
+    if (
+      options.priority !== undefined &&
+      !["Standard", "High"].includes(options.priority)
+    )
+      throw new ConvexError("Invalid rehydration priority");
+    const file = await this.getFile(ctx, fileId);
+    if (!file || file.status !== "ready") return false;
+    return await this.changeTier(
+      ctx,
+      file,
+      options.tier,
+      options.priority ?? "Standard",
+    );
+  }
+
+  /** Refreshes Azure tier properties from an action or cron; false if unknown or not ready. */
+  async refreshTier(ctx: RunActionCtx, fileId: string) {
+    const file = await this.getFile(ctx, fileId);
+    if (!file || file.status !== "ready") return false;
+    const request = await this.serverRequest(
+      this.config(),
+      file.container,
+      file.blobName,
+      "r",
+      undefined,
+      undefined,
+      file.snapshot ? { snapshot: file.snapshot } : {},
+    );
+    let response: Response;
+    try {
+      response = await fetch(request.url, {
+        method: "HEAD",
+        headers: { ...request.headers, "x-ms-version": SAS_VERSION },
+      });
+    } catch {
+      throw new ConvexError("Azure Blob tier HEAD request failed");
+    }
+    if (!response.ok)
+      throw new ConvexError(
+        `Azure Blob tier HEAD failed with ${response.status}`,
+      );
+    return await this.recordTier(ctx, fileId, response.headers);
+  }
+
+  private async recordTier(
+    ctx: RunActionCtx,
+    fileId: string,
+    headers: Headers,
+  ) {
+    const tier = headers.get("x-ms-access-tier");
+    const status = headers.get("x-ms-archive-status");
+    return await ctx.runMutation(this.component.lib.updateTier, {
+      fileId,
+      accessTier:
+        tier && ["Hot", "Cool", "Cold", "Archive"].includes(tier)
+          ? (tier as AccessTier)
+          : undefined,
+      archiveStatus:
+        status &&
+        [
+          "rehydrate-pending-to-hot",
+          "rehydrate-pending-to-cool",
+          "rehydrate-pending-to-cold",
+        ].includes(status)
+          ? (status as NonNullable<FileDoc["archiveStatus"]>)
+          : undefined,
+    });
+  }
+
+  private async changeTier(
+    ctx: RunActionCtx,
+    file: FileDoc,
+    tier: AccessTier,
+    priority?: RehydrateOptions["priority"],
+  ) {
+    if (!["Hot", "Cool", "Cold", "Archive"].includes(tier))
+      throw new ConvexError("Invalid access tier");
+    const request = await this.serverRequest(
+      this.config(),
+      file.container,
+      file.blobName,
+      "w",
+      undefined,
+      undefined,
+      { comp: "tier", ...(file.snapshot ? { snapshot: file.snapshot } : {}) },
+    );
+    let response: Response;
+    try {
+      response = await fetch(request.url, {
+        method: "PUT",
+        headers: {
+          ...request.headers,
+          "x-ms-version": SAS_VERSION,
+          "x-ms-access-tier": tier,
+          ...(priority ? { "x-ms-rehydrate-priority": priority } : {}),
+        },
+      });
+    } catch {
+      throw new ConvexError("Azure Blob Set Blob Tier request failed");
+    }
+    if (!response.ok)
+      throw new ConvexError(
+        `Azure Blob Set Blob Tier failed with ${response.status}`,
+      );
+    // A 202 leaves the blob archived until Azure completes rehydration.
+    const pending = response.status === 202 && tier !== "Archive";
+    return await ctx.runMutation(this.component.lib.updateTier, {
+      fileId: file.fileId,
+      accessTier: pending ? "Archive" : tier,
+      archiveStatus: pending
+        ? (`rehydrate-pending-to-${tier.toLowerCase()}` as NonNullable<
+            FileDoc["archiveStatus"]
+          >)
+        : undefined,
+    });
+  }
+
+  private async applyReadyTier(
+    ctx: RunActionCtx,
+    file: FileDoc,
+    headers?: Headers,
+  ) {
+    if (this.options.accessTier) {
+      try {
+        await this.changeTier(ctx, file, this.options.accessTier);
+        return;
+      } catch {
+        console.error(
+          "Automatic Azure Blob tier change failed; retaining ready file and refreshing its actual tier",
+        );
+      }
+      // The file is already ready, so recording the actual tier is best-effort and never throws.
+      try {
+        if (headers) await this.recordTier(ctx, file.fileId, headers);
+        else await this.refreshTier(ctx, file.fileId);
+      } catch {
+        console.error("Azure Blob tier refresh failed after becoming ready");
+      }
+    } else if (headers) {
+      await this.recordTier(ctx, file.fileId, headers);
+    }
   }
 
   private async signDelegationSas(
@@ -974,6 +1144,8 @@ export class AzureBlob {
           onUpload: onUploadHandle,
           ...(file.snapshot ? { snapshot: file.snapshot } : {}),
         });
+    if (confirmed?.status === "ready")
+      await this.applyReadyTier(ctx, confirmed, head.headers);
     return confirmed
       ? {
           ok: true,
@@ -1059,12 +1231,15 @@ export class AzureBlob {
           throw new Error(`Azure Blob tag read failed with ${response.status}`);
         const result = malwareScanResult(await response.text());
         if (result === "no threats found") {
-          await ctx.runMutation(this.component.lib.markReady, {
+          const ready = await ctx.runMutation(this.component.lib.markReady, {
             fileId: job.fileId,
             size: job.size,
             onUpload: job.onUpload,
             ...(job.snapshot ? { snapshot: job.snapshot } : {}),
           });
+          if (ready) {
+            await this.applyReadyTier(ctx, ready);
+          }
         } else if (result === "malicious") {
           const cleanupUntil = (job.uploadExpiresAt ?? now) + CLOCK_SKEW_MS;
           await ctx.runMutation(this.component.lib.markScanRejected, {

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add server-side access tier defaults, `setTier`, `rehydrate`, and
+  `refreshTier`, plus exported access-tier/archive-status validators and
+  optional file properties. Archived files stay unservable through rehydration;
+  failed automatic tiering preserves ready files and reads their actual tier.
+  The README covers pricing, lifecycle policies, polling, and archived snapshot
+  restrictions.
+
 - Add `eventGridHandler({ secret, onUpload? })` for standard-schema Azure Event
   Grid `BlobCreated` events. It handles subscription validation, confirms
   tracked uploads through the normal checks, and makes repeated delivery safe.

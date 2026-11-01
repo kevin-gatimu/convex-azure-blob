@@ -58,6 +58,71 @@ async function browserUpload(
 }
 
 describe.skipIf(!endpoint)("against Azurite", () => {
+  it("sets and refreshes tiers using a real write SAS and denies a read SAS", async () => {
+    const t = convexTest(defineSchema({}), componentTest.modules);
+    const azure = new AzureBlob(register(t), { config, accessTier: "Cool" });
+    const { ticket, put } = await browserUpload(azure, t, PNG);
+    expect(put.status).toBe(201);
+    try {
+      expect(
+        await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+      ).toMatchObject({ ok: true });
+      expect(
+        await t.query((ctx) => azure.getFile(ctx, ticket.fileId)),
+      ).toMatchObject({ accessTier: "Cool" });
+      const readUrl = await t.query((ctx) => azure.getUrl(ctx, ticket.fileId));
+      const denied = new URL(readUrl!);
+      denied.searchParams.set("comp", "tier");
+      expect(
+        (
+          await fetch(denied, {
+            method: "PUT",
+            headers: {
+              "x-ms-version": "2022-11-02",
+              "x-ms-access-tier": "Hot",
+            },
+          })
+        ).status,
+      ).toBe(403);
+      expect(
+        await t.action((ctx) => azure.setTier(ctx, ticket.fileId, "Cold")),
+      ).toBe(true);
+      expect(
+        await t.action((ctx) => azure.refreshTier(ctx, ticket.fileId)),
+      ).toBe(true);
+      expect(
+        await t.query((ctx) => azure.getFile(ctx, ticket.fileId)),
+      ).toMatchObject({ accessTier: "Cold" });
+      expect(
+        await t.action((ctx) => azure.setTier(ctx, ticket.fileId, "Archive")),
+      ).toBe(true);
+      expect(
+        await t.action((ctx) => azure.refreshTier(ctx, ticket.fileId)),
+      ).toBe(true);
+      expect(
+        await t.query((ctx) => azure.getUrl(ctx, ticket.fileId)),
+      ).toBeNull();
+      expect(
+        await t.action((ctx) =>
+          azure.rehydrate(ctx, ticket.fileId, {
+            tier: "Hot",
+            priority: "High",
+          }),
+        ),
+      ).toBe(true);
+      expect(
+        await t.action((ctx) => azure.refreshTier(ctx, ticket.fileId)),
+      ).toBe(true);
+      expect(
+        await t.query((ctx) => azure.getFile(ctx, ticket.fileId)),
+      ).toMatchObject({ accessTier: "Hot" });
+    } finally {
+      expect(await t.action((ctx) => azure.purge(ctx, ticket.fileId))).toBe(
+        true,
+      );
+    }
+  });
+
   it("stages blocks and reads an immutable snapshot after the staging SAS overwrites the base", async () => {
     const t = convexTest(defineSchema({}), componentTest.modules);
     const azure = new AzureBlob(register(t), {

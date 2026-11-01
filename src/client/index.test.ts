@@ -4,6 +4,7 @@ import {
   defineSchema,
   defineTable,
   internalMutationGeneric,
+  httpRouter,
 } from "convex/server";
 import { v } from "convex/values";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2089,5 +2090,385 @@ describe("clientApi", () => {
       reason: "Unknown upload",
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("access tiers", () => {
+  function stubTier(tier = "Hot", status?: string, tierResponse = 200) {
+    stubBlob({});
+    const blobFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (params(String(url)).get("comp") === "tier")
+        return new Response(null, { status: tierResponse });
+      const response = await blobFetch(url, init);
+      if (init?.method === "HEAD") {
+        response.headers.set("x-ms-access-tier", tier);
+        if (status) response.headers.set("x-ms-archive-status", status);
+      }
+      return response;
+    });
+  }
+  const tierCall = () =>
+    fetchMock.mock.calls.find(
+      ([url]) => params(String(url)).get("comp") === "tier",
+    )!;
+
+  it("applies the default only after confirmation, with write-only server SAS", async () => {
+    const { t, azure } = setup({ accessTier: "Cool" });
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(ticket.headers).not.toHaveProperty("x-ms-access-tier");
+    expect(params(ticket.uploadUrl).get("sp")).toBe("c");
+    stubTier();
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+    ).toMatchObject({ ok: true });
+    expect(params(String(tierCall()[0])).get("sp")).toBe("w");
+    expect(tierCall()[1]).toMatchObject({
+      method: "PUT",
+      headers: { "x-ms-access-tier": "Cool", "x-ms-version": "2022-11-02" },
+    });
+    expect(methods()).toEqual(["HEAD", "GET", "PUT"]);
+    expect(
+      await t.query((ctx) => azure.getFile(ctx, ticket.fileId)),
+    ).toMatchObject({ status: "ready", accessTier: "Cool" });
+    expect(
+      (
+        await t.query((ctx) =>
+          azure.list(ctx, { paginationOpts: { numItems: 10, cursor: null } }),
+        )
+      ).page[0],
+    ).toMatchObject({ accessTier: "Cool" });
+  });
+
+  it("keeps failed automatic tiering ready and records the actual HEAD tier", async () => {
+    const { t, azure, reserve, file } = setup({ accessTier: "Archive" });
+    const fileId = await reserve();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      stubTier("Cool", undefined, 403);
+      expect(
+        await t.action((ctx) => azure.confirmUpload(ctx, fileId)),
+      ).toMatchObject({ ok: true });
+      expect(await file(fileId)).toMatchObject({
+        status: "ready",
+        accessTier: "Cool",
+      });
+      expect(methods()).toEqual(["HEAD", "GET", "PUT"]);
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("refreshing its actual tier"),
+      );
+      expect(await t.query((ctx) => azure.getUrl(ctx, fileId))).not.toBeNull();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("records HEAD tiers without a constructor default", async () => {
+    const { t, azure, reserve, file } = setup();
+    const fileId = await reserve();
+    stubTier("Cold");
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    expect(await file(fileId)).toMatchObject({ accessTier: "Cold" });
+    expect(methods()).toEqual(["HEAD", "GET"]);
+  });
+
+  it("sets ready tiers and blocks archived signed and public URLs", async () => {
+    const { t, azure, upload, file } = setup({
+      config: { ...config, publicBaseUrl: "https://cdn.example.com/uploads" },
+    });
+    const fileId = await upload();
+    stubTier();
+    expect(await t.action((ctx) => azure.setTier(ctx, fileId, "Archive"))).toBe(
+      true,
+    );
+    expect((await file(fileId))?.accessTier).toBe("Archive");
+    expect(await t.query((ctx) => azure.getUrl(ctx, fileId))).toBeNull();
+    expect(
+      await t.query((ctx) => azure.getUrl(ctx, fileId, { download: true })),
+    ).toBeNull();
+    expect(await azure.urlForFile((await file(fileId))!)).toBeNull();
+    expect(params(String(tierCall()[0])).get("sp")).toBe("w");
+  });
+
+  it("does no Azure work for unknown and non-ready files", async () => {
+    const { t, azure, reserve } = setup({ requireMalwareScan: true });
+    const fileId = await reserve();
+    for (const id of ["invalid", fileId]) {
+      expect(await t.action((ctx) => azure.setTier(ctx, id, "Cool"))).toBe(
+        false,
+      );
+      expect(
+        await t.action((ctx) => azure.rehydrate(ctx, id, { tier: "Hot" })),
+      ).toBe(false);
+      expect(await t.action((ctx) => azure.refreshTier(ctx, id))).toBe(false);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+    stubBlob({});
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    fetchMock.mockClear();
+    expect(await t.action((ctx) => azure.setTier(ctx, fileId, "Cool"))).toBe(
+      false,
+    );
+    await t.mutation((ctx) => azure.markForDeletion(ctx, fileId));
+    expect(await t.action((ctx) => azure.setTier(ctx, fileId, "Cool"))).toBe(
+      false,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["Hot", "Cool", "Cold"] as const)(
+    "records 202 rehydration to %s while preserving Archive",
+    async (tier) => {
+      const { t, azure, upload, file } = setup();
+      const fileId = await upload();
+      stubTier("Archive", undefined, 202);
+      expect(
+        await t.action((ctx) =>
+          azure.rehydrate(ctx, fileId, { tier, priority: "High" }),
+        ),
+      ).toBe(true);
+      expect(tierCall()[1]).toMatchObject({
+        method: "PUT",
+        headers: {
+          "x-ms-access-tier": tier,
+          "x-ms-rehydrate-priority": "High",
+        },
+      });
+      expect(await file(fileId)).toMatchObject({
+        accessTier: "Archive",
+        archiveStatus: `rehydrate-pending-to-${tier.toLowerCase()}`,
+      });
+      expect(await t.query((ctx) => azure.getUrl(ctx, fileId))).toBeNull();
+    },
+  );
+
+  it("defaults priority to Standard and clears archive status on immediate success", async () => {
+    const { t, azure, upload, file } = setup();
+    const fileId = await upload();
+    stubTier("Archive", "rehydrate-pending-to-hot");
+    await t.action((ctx) => azure.refreshTier(ctx, fileId));
+    expect(
+      await t.action((ctx) => azure.rehydrate(ctx, fileId, { tier: "Hot" })),
+    ).toBe(true);
+    expect(tierCall()[1]?.headers).toMatchObject({
+      "x-ms-rehydrate-priority": "Standard",
+    });
+    expect(await file(fileId)).toMatchObject({ accessTier: "Hot" });
+    expect((await file(fileId))?.archiveStatus).toBeUndefined();
+  });
+
+  it("refreshes tier and status, then clears absent archive status", async () => {
+    const { t, azure, upload, file } = setup();
+    const fileId = await upload();
+    stubTier("Archive", "rehydrate-pending-to-cool");
+    expect(await t.action((ctx) => azure.refreshTier(ctx, fileId))).toBe(true);
+    expect(await file(fileId)).toMatchObject({
+      accessTier: "Archive",
+      archiveStatus: "rehydrate-pending-to-cool",
+    });
+    expect(params(String(fetchMock.mock.calls[0]![0])).get("sp")).toBe("r");
+    stubTier("Cool");
+    expect(await t.action((ctx) => azure.refreshTier(ctx, fileId))).toBe(true);
+    expect(await file(fileId)).toMatchObject({ accessTier: "Cool" });
+    expect((await file(fileId))?.archiveStatus).toBeUndefined();
+    expect(await t.query((ctx) => azure.getUrl(ctx, fileId))).not.toBeNull();
+  });
+
+  it.each([403, 409, 500])(
+    "reports status %s without leaking the URL or SAS",
+    async (status) => {
+      const { t, azure, upload, file } = setup();
+      const fileId = await upload();
+      stubTier("Hot", undefined, status);
+      await expect(
+        t.action((ctx) => azure.setTier(ctx, fileId, "Cool")),
+      ).rejects.toThrow(`Azure Blob Set Blob Tier failed with ${status}`);
+      await expect(
+        t.action((ctx) => azure.rehydrate(ctx, fileId, { tier: "Hot" })),
+      ).rejects.toThrow(`Azure Blob Set Blob Tier failed with ${status}`);
+      try {
+        await t.action((ctx) => azure.setTier(ctx, fileId, "Cool"));
+      } catch (error) {
+        expect(String(error)).not.toContain("http");
+        expect(String(error)).not.toContain("sig=");
+      }
+      expect((await file(fileId))?.accessTier).toBeUndefined();
+    },
+  );
+
+  it("sanitizes network failures and reports failed HEAD status", async () => {
+    const { t, azure, upload } = setup();
+    const fileId = await upload();
+    fetchMock.mockRejectedValue(
+      new Error("https://secret.example/blob?sig=private"),
+    );
+    await expect(
+      t.action((ctx) => azure.setTier(ctx, fileId, "Cool")),
+    ).rejects.toThrow("Azure Blob Set Blob Tier request failed");
+    await expect(
+      t.action((ctx) => azure.refreshTier(ctx, fileId)),
+    ).rejects.toThrow("Azure Blob tier HEAD request failed");
+    stubBlob({ status: 403 });
+    await expect(
+      t.action((ctx) => azure.refreshTier(ctx, fileId)),
+    ).rejects.toThrow("Azure Blob tier HEAD failed with 403");
+  });
+
+  it("tiers and refreshes the verified block snapshot, not the writable base", async () => {
+    const { t, azure } = setup({ blockUploads: true, accessTier: "Cold" });
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        size: PNG.length,
+      }),
+    );
+    stubBlocks();
+    const blockFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) =>
+      params(String(url)).get("comp") === "tier"
+        ? new Response(null, { status: 200 })
+        : await blockFetch(url, init),
+    );
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+    ).toMatchObject({ ok: true });
+    expect(params(String(tierCall()[0])).get("snapshot")).toBe(
+      "2026-01-01T12:00:00.0000000Z",
+    );
+    expect(params(String(tierCall()[0])).get("sr")).toBe("bs");
+    fetchMock.mockClear();
+    await t.action((ctx) => azure.refreshTier(ctx, ticket.fileId));
+    expect(params(String(fetchMock.mock.calls[0]![0])).has("snapshot")).toBe(
+      true,
+    );
+  });
+
+  it("applies the default only after a clean malware verdict", async () => {
+    const { t, azure, reserve, file } = setup({
+      requireMalwareScan: true,
+      accessTier: "Cool",
+    });
+    const fileId = await reserve();
+    stubTier();
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    expect(await file(fileId)).toMatchObject({ status: "scanning" });
+    expect(methods()).toEqual(["HEAD", "GET"]);
+    stubScanResult("No threats found");
+    expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+    expect(await file(fileId)).toMatchObject({
+      status: "ready",
+      accessTier: "Cool",
+    });
+  });
+
+  it("keeps a clean-scanned file ready when tiering and the tier refresh both fail", async () => {
+    const { t, azure, reserve, file } = setup({
+      requireMalwareScan: true,
+      accessTier: "Cool",
+    });
+    const fileId = await reserve();
+    stubTier();
+    await t.action((ctx) => azure.confirmUpload(ctx, fileId));
+    stubScanResult("No threats found");
+    const scanFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (params(String(url)).get("comp") === "tier")
+        return new Response(null, { status: 500 });
+      if (init?.method === "HEAD") return new Response(null, { status: 503 });
+      return await scanFetch(url, init);
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+      expect(await file(fileId)).toMatchObject({ status: "ready" });
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("tier refresh failed"),
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("applies the default through Event Grid confirmation and makes redelivery harmless", async () => {
+    const router = httpRouter();
+    const t = convexTest(defineSchema({}), {
+      ...componentTest.modules,
+      "./component/http.ts": async () => ({ default: router }),
+    });
+    const azure = new AzureBlob(register(t), {
+      config,
+      now: () => T0,
+      accessTier: "Cool",
+    });
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    const doc = (await t.query((ctx) => azure.getFile(ctx, ticket.fileId)))!;
+    const secret = "a".repeat(32);
+    router.route({
+      path: "/events",
+      method: "POST",
+      handler: azure.eventGridHandler({ secret }),
+    });
+    const request = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify([
+        {
+          id: "tier-event",
+          eventType: "Microsoft.Storage.BlobCreated",
+          subject: `/blobServices/default/containers/uploads/blobs/${doc.blobName}`,
+          eventTime: new Date(T0).toISOString(),
+          dataVersion: "",
+          metadataVersion: "1",
+          data: {
+            url: `https://127.0.0.1:10000/devstoreaccount1/uploads/${doc.blobName}`,
+          },
+        },
+      ]),
+    };
+    stubTier();
+    expect((await t.fetch(`/events?secret=${secret}`, request)).status).toBe(
+      200,
+    );
+    expect(
+      await t.query((ctx) => azure.getFile(ctx, ticket.fileId)),
+    ).toMatchObject({ status: "ready", accessTier: "Cool" });
+    fetchMock.mockClear();
+    expect((await t.fetch(`/events?secret=${secret}`, request)).status).toBe(
+      200,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("applies the default to server-side store uploads", async () => {
+    const { t, azure } = setup({ accessTier: "Cool" });
+    stubTier();
+    const result = await t.action((ctx) =>
+      azure.store(ctx, {
+        data: PNG,
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(result).toMatchObject({ ok: true });
+    if (result.ok)
+      expect(
+        await t.query((ctx) => azure.getFile(ctx, result.fileId)),
+      ).toMatchObject({ accessTier: "Cool" });
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url]) => params(String(url)).get("comp") === "tier",
+      ),
+    ).toHaveLength(1);
   });
 });
