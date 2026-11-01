@@ -661,6 +661,35 @@ and `getUrl` returns `<base>/<blob name>` with no token. That makes URLs
 permanent and easy to cache at the edge. Download URLs are still signed, since
 they need a `Content-Disposition` override.
 
+## Reading files from actions
+
+`read` fetches a ready file's bytes inside an action, for thumbnails, parsing or
+re-uploading. It returns a `Response`, or `null` if the file is unknown or not
+`ready`. Check the caller's permission first.
+
+```ts
+export const thumbnail = action({
+  args: { fileId: v.string() },
+  handler: async (ctx, { fileId }) => {
+    await requireUserInAction(ctx);
+    const response = await azure.read(ctx, fileId);
+    if (!response) return null;
+    const image = new Uint8Array(await response.arrayBuffer());
+    // ...resize, then azure.store(ctx, { data, contentType, uploadedBy })
+  },
+});
+
+// Only the first kilobyte (end is inclusive); Azure answers 206.
+const head = await azure.read(ctx, fileId, { range: { start: 0, end: 1023 } });
+```
+
+`start` must be a non-negative integer and `end`, if given, an integer no
+smaller than `start`; otherwise `read` throws. Any other Azure status than 200
+(206 when `range` is given) throws an error with the status only, never the URL
+or SAS, and the returned `Response` has an empty `url`. The request uses a
+one-minute read-only SAS (or your Entra token) against the internal endpoint, so
+the bytes stream from Azure to the action, not through a browser URL.
+
 ## Listing files and metadata
 
 ```ts
@@ -781,6 +810,31 @@ export const importAvatar = internalAction({
 ```
 
 `store` runs the same checks as a browser upload.
+
+When a source is already available at an HTTPS URL, Azure can fetch it directly
+without passing the bytes through the Convex action:
+
+```ts
+const result = await azure.storeFromUrl(ctx, {
+  sourceUrl,
+  contentType: "image/png",
+  uploadedBy: userId,
+  fileName: "avatar",
+  maxBytes: 5 * 1024 * 1024,
+});
+if (!result.ok) throw new Error(result.reason);
+return result.fileId;
+```
+
+`storeFromUrl` accepts only HTTPS source URLs and applies the same size,
+content-type and file-signature checks as `store`. The source must be publicly
+readable or include a read SAS, and must return a valid `Content-Length`. Source
+URLs are limited to 2 KiB. Azure's synchronous operation is limited to 5,000
+MiB; an oversized source or one without a valid length is rejected. Azure
+fetches the source URL itself, so treat user-supplied URLs as an SSRF risk:
+validate them against your application's trusted-source policy before calling
+this method. HTTPS alone does not make an arbitrary URL safe. Do not log source
+URLs that contain SAS tokens.
 
 ## Several containers or folders
 
@@ -914,6 +968,7 @@ query methods from mutations and actions too.
 | `renewUploadUrl(ctx, { fileId, uploadedBy })`                                                 | mutation     | Same pending upload ticket with a renewed expiry; authorize the uploader first. |
 | `confirmUpload(ctx, fileId, onUpload?)`                                                       | action       | `{ ok: true, size, contentType }` or `{ ok: false, reason }`                    |
 | `getFile(ctx, fileId)`                                                                        | query        | `FileDoc` or `null`                                                             |
+| `read(ctx, fileId, { range?: { start, end? } }?)`                                             | action       | `Response` (200, or 206 with `range`), or `null` unless the file is `ready`     |
 | `getUrl(ctx, fileId, { download?, cacheControl? })`                                           | query        | URL or `null`                                                                   |
 | `urlForFile(file, { download?, cacheControl? }, ctx?)`                                        | anywhere     | URL or `null`                                                                   |
 | `list(ctx, { uploadedBy?, paginationOpts })`                                                  | query        | `PaginationResult<FileDoc>`                                                     |
@@ -922,6 +977,7 @@ query methods from mutations and actions too.
 | `purge(ctx, fileId)` / `delete(ctx, fileId)`                                                  | action       | `boolean`                                                                       |
 | `sweep(ctx, { pendingOlderThanMs?, limit? })`                                                 | action       | number of blobs removed                                                         |
 | `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
+| `storeFromUrl(ctx, { sourceUrl, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`  | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
 | `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key  |
 | `scanMalware(ctx, limit?)`                                                                    | action       | number of due Defender scan jobs checked                                        |
 | `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | public upload functions and internal `scanMalware` action                       |

@@ -366,6 +366,138 @@ describe("md5 integrity", () => {
   });
 });
 
+describe("read", () => {
+  const readText = (
+    state: ReturnType<typeof setup>,
+    fileId: string,
+    options?: { range?: { start: number; end?: number } },
+  ) =>
+    state.t.action(async (ctx) => {
+      const response = await state.azure.read(ctx, fileId, options);
+      return response
+        ? {
+            status: response.status,
+            bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+          }
+        : null;
+    });
+
+  it("returns the bytes of a ready file with a read-only SAS", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    fetchMock.mockImplementation(
+      async () => new Response(PNG, { status: 200 }),
+    );
+    expect(await readText(state, fileId)).toEqual({
+      status: 200,
+      bytes: Array.from(PNG),
+    });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(params(String(url)).get("sp")).toBe("r");
+    expect(init?.method).toBe("GET");
+    expect(init?.headers).not.toHaveProperty("x-ms-range");
+  });
+
+  it("returns null for a file that is not ready without calling Azure", async () => {
+    const state = setup();
+    const pending = await state.reserve();
+    const deleting = await state.upload();
+    await state.t.action((ctx) => state.azure.markForDeletion(ctx, deleting));
+    fetchMock.mockClear();
+    expect(await readText(state, pending)).toBeNull();
+    expect(await readText(state, deleting)).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns null for an unknown file id without calling Azure", async () => {
+    const state = setup();
+    fetchMock.mockClear();
+    expect(await readText(state, "unknown")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns a Response that does not expose the signed URL", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    fetchMock.mockImplementation(async (url) => {
+      const response = new Response(PNG, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+      Object.defineProperty(response, "url", { value: String(url) });
+      return response;
+    });
+    const seen = await state.t.action(async (ctx) => {
+      const response = (await state.azure.read(ctx, fileId))!;
+      return {
+        url: response.url,
+        type: response.headers.get("content-type"),
+        size: (await response.arrayBuffer()).byteLength,
+      };
+    });
+    expect(seen).toEqual({ url: "", type: "image/png", size: PNG.length });
+  });
+
+  it("throws when a range request is answered with the full file", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    fetchMock.mockImplementation(
+      async () => new Response(PNG, { status: 200 }),
+    );
+    await expect(
+      readText(state, fileId, { range: { start: 2, end: 4 } }),
+    ).rejects.toThrow("Azure Blob read failed with 200");
+  });
+
+  it("sends an inclusive x-ms-range and returns the 206 response", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    fetchMock.mockImplementation(
+      async () => new Response(PNG.slice(2, 5), { status: 206 }),
+    );
+    expect(
+      await readText(state, fileId, { range: { start: 2, end: 4 } }),
+    ).toEqual({ status: 206, bytes: Array.from(PNG.slice(2, 5)) });
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      "x-ms-range": "bytes=2-4",
+    });
+    await readText(state, fileId, { range: { start: 7 } });
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      "x-ms-range": "bytes=7-",
+    });
+  });
+
+  it("rejects an invalid range before calling Azure", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    for (const range of [
+      { start: -1 },
+      { start: 1.5 },
+      { start: Number.NaN },
+      { start: 5, end: 4 },
+      { start: 0, end: 2.5 },
+    ]) {
+      await expect(readText(state, fileId, { range })).rejects.toThrow();
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("throws on a non-2xx response with the status but not the URL or SAS", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    const body = new Response("denied", { status: 403 });
+    const cancel = vi.spyOn(body.body!, "cancel");
+    fetchMock.mockImplementation(async () => body);
+    const error = await readText(state, fileId).catch((e: unknown) => e);
+    const message = String((error as Error).message);
+    expect(message).toContain("403");
+    expect(message).not.toContain("http");
+    expect(message).not.toContain("sig=");
+    expect(message).not.toContain("devstoreaccount1");
+    expect(cancel).toHaveBeenCalled();
+  });
+});
+
 describe("generateUploadUrl", () => {
   it("returns a create-only URL for one server-named blob with a short expiry", async () => {
     const { t, azure, file } = setup();
@@ -1317,6 +1449,169 @@ describe("store", () => {
   });
 });
 
+describe("storeFromUrl", () => {
+  it("copies an HTTPS source as a block blob and confirms it", async () => {
+    const maxBytes = 6000 * 1024 * 1024;
+    const state = setup({ maxBytes });
+    stubBlob({ length: PNG.length });
+    const blobFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "PUT") return new Response(null, { status: 201 });
+      return await blobFetch(url, init);
+    });
+    const sourceUrl = "https://source.example/image.png?sig=fake";
+    const result = await state.t.action((ctx) =>
+      state.azure.storeFromUrl(ctx, {
+        sourceUrl,
+        contentType: "IMAGE/PNG; charset=binary",
+        uploadedBy: "u1",
+        maxBytes,
+        fileName: "import.png",
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    expect(methods()).toEqual(["PUT", "HEAD", "GET"]);
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(params(String(url)).get("sp")).toBe("c");
+    expect(init?.headers).toMatchObject({
+      "content-length": "0",
+      "x-ms-blob-type": "BlockBlob",
+      "x-ms-blob-content-type": "image/png",
+      "x-ms-copy-source": sourceUrl,
+    });
+    if (result.ok)
+      expect(await state.file(result.fileId)).toMatchObject({
+        status: "ready",
+        fileName: "import.png",
+        maxBytes: 5000 * 1024 * 1024,
+      });
+  });
+
+  it.each([
+    ["not a URL", "Source URL must be a valid HTTPS URL"],
+    ["http://source.example/image.png", "Source URL must be HTTPS"],
+    ["https://source.example/image.png#fragment", "cannot include credentials"],
+    [
+      `https://source.example/${"a".repeat(2048)}`,
+      "Source URL must be no longer than 2 KiB",
+    ],
+  ])(
+    "rejects unsafe source URL %s before Azure requests",
+    async (sourceUrl) => {
+      const { t, azure } = setup();
+      expect(
+        await t.action((ctx) =>
+          azure.storeFromUrl(ctx, {
+            sourceUrl,
+            contentType: "image/png",
+            uploadedBy: "u1",
+          }),
+        ),
+      ).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining("Source URL"),
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reports the 409 source limit and attempts cleanup", async () => {
+    const state = setup();
+    fetchMock.mockImplementation(async (_url, init) =>
+      init?.method === "DELETE"
+        ? new Response(null, { status: 202 })
+        : new Response(null, { status: 409 }),
+    );
+    const result = await state.t.action((ctx) =>
+      state.azure.storeFromUrl(ctx, {
+        sourceUrl: "https://source.example/large.bin",
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        "Azure Blob URL copy failed with 409; the source must have a valid Content-Length and be no larger than 5,000 MiB",
+    });
+    expect(methods()).toEqual(["PUT", "DELETE"]);
+  });
+
+  it("cleans up an Azure copy failure without exposing the source URL", async () => {
+    const state = setup();
+    const sourceUrl = "https://source.example/file.png?sig=private";
+    fetchMock.mockImplementation(async (_url, init) =>
+      init?.method === "DELETE"
+        ? new Response(null, { status: 202 })
+        : new Response(null, { status: 403 }),
+    );
+    const result = await state.t.action((ctx) =>
+      state.azure.storeFromUrl(ctx, {
+        sourceUrl,
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Azure Blob URL copy failed with 403",
+    });
+    expect(methods()).toEqual(["PUT", "DELETE"]);
+    expect(JSON.stringify(result)).not.toContain(sourceUrl);
+  });
+
+  it("cleans up when the Azure copy request rejects", async () => {
+    const state = setup();
+    const sourceUrl = "https://source.example/file.png?sig=private";
+    fetchMock.mockImplementation(async (_url, init) => {
+      if (init?.method === "PUT") throw new Error(`unreachable ${sourceUrl}`);
+      return new Response(null, { status: 202 });
+    });
+
+    const result = await state.t.action((ctx) =>
+      state.azure.storeFromUrl(ctx, {
+        sourceUrl,
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Azure Blob URL copy request failed",
+    });
+    expect(methods()).toEqual(["PUT", "DELETE"]);
+    expect(JSON.stringify(result)).not.toContain(sourceUrl);
+  });
+
+  it("deletes a copied blob rejected by the normal signature check", async () => {
+    const state = setup();
+    stubBlob({ length: PNG.length, bytes: new Uint8Array([1, 2, 3]) });
+    const blobFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "PUT") return new Response(null, { status: 201 });
+      return await blobFetch(url, init);
+    });
+
+    expect(
+      await state.t.action((ctx) =>
+        state.azure.storeFromUrl(ctx, {
+          sourceUrl: "https://source.example/not-a-png",
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      ),
+    ).toEqual({
+      ok: false,
+      reason: "The file content does not match its type",
+    });
+    expect(methods()).toEqual(["PUT", "HEAD", "GET", "DELETE"]);
+  });
+});
+
 describe("Microsoft Entra user-delegation SAS", () => {
   it("refreshes only when the cached key has less than two days remaining", async () => {
     const { t, azure, advance } = setupEntra();
@@ -1477,6 +1772,31 @@ describe("Microsoft Entra user-delegation SAS", () => {
       expect(params(String(url)).has("sig")).toBe(false);
       expect(init?.headers).toMatchObject({
         authorization: "Bearer access-token",
+        "x-ms-version": "2022-11-02",
+      });
+    }
+
+    fetchMock.mockClear();
+    const storedFromUrl = await t.action((ctx) =>
+      azure.storeFromUrl(ctx, {
+        sourceUrl: "https://source.example/image.png",
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(storedFromUrl.ok).toBe(true);
+    const copyCalls = fetchMock.mock.calls.filter(
+      ([url]) => !String(url).includes("/oauth2/v2.0/token"),
+    );
+    expect(copyCalls.map(([, init]) => init?.method ?? "GET")).toEqual([
+      "PUT",
+      "HEAD",
+      "GET",
+    ]);
+    for (const [url, init] of copyCalls) {
+      expect(params(String(url)).has("sig")).toBe(false);
+      expect(init?.headers).toMatchObject({
+        authorization: expect.stringMatching(/^Bearer /),
         "x-ms-version": "2022-11-02",
       });
     }

@@ -166,6 +166,7 @@ const MAX_MALWARE_SCAN_BATCH = 50;
 // Start times are backdated so a client whose clock runs slow is not refused.
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SERVER_SAS_TTL_MS = 60 * 1000;
+const MAX_PUT_BLOB_FROM_URL_BYTES = 5000 * 1024 * 1024;
 const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 2 * 24 * 60 * 60 * 1000;
 const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
 const isTransientAzureStatus = (status: number) =>
@@ -926,6 +927,68 @@ export class AzureBlob {
   }
 
   /**
+   * Streams a ready file's bytes from an action, or returns null if the file is unknown or not
+   * ready. `range` is an inclusive byte range and must yield a 206 response. The returned
+   * Response has no `url`, so the signed URL can't leak from it. Run your own permission
+   * checks first.
+   *
+   * @example
+   * ```ts
+   * const response = await azure.read(ctx, fileId, { range: { start: 0, end: 1023 } });
+   * const head = response ? new Uint8Array(await response.arrayBuffer()) : null;
+   * ```
+   */
+  async read(
+    ctx: RunActionCtx,
+    fileId: string,
+    options: { range?: { start: number; end?: number } } = {},
+  ): Promise<Response | null> {
+    const range = options.range;
+    if (range) {
+      if (!Number.isSafeInteger(range.start) || range.start < 0)
+        throw new ConvexError("Range start must be a non-negative integer");
+      if (
+        range.end !== undefined &&
+        (!Number.isSafeInteger(range.end) || range.end < range.start)
+      )
+        throw new ConvexError(
+          "Range end must be an integer no smaller than start",
+        );
+    }
+    const file = await this.getFile(ctx, fileId);
+    if (!file || file.status !== "ready") return null;
+    if (file.uploadMode === "blocks" && !file.snapshot) return null;
+    const request = await this.serverRequest(
+      this.config(),
+      file.container,
+      file.blobName,
+      "r",
+      undefined,
+      undefined,
+      file.snapshot ? { snapshot: file.snapshot } : {},
+    );
+    const response = await fetch(request.url, {
+      method: "GET",
+      headers: {
+        ...request.headers,
+        ...(range
+          ? { "x-ms-range": `bytes=${range.start}-${range.end ?? ""}` }
+          : {}),
+      },
+    });
+    if (response.status !== (range ? 206 : 200)) {
+      await response.body?.cancel();
+      throw new Error(`Azure Blob read failed with ${response.status}`);
+    }
+    // A fresh Response, because the original's `url` carries the SAS.
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
+
+  /**
    * Checks the uploaded blob's size, type and (by default) leading bytes against what was
    * reserved. A blob that fails is deleted and its file removed. Confirming twice is harmless.
    * An optional app mutation attaches the file atomically; a failure rolls back confirmation.
@@ -1509,6 +1572,97 @@ export class AzureBlob {
       return {
         ok: false,
         reason: `Azure Blob upload failed with ${response.status}`,
+      };
+    }
+    const confirmed = await this.confirmUpload(ctx, fileId);
+    return confirmed.ok ? { ok: true, fileId } : confirmed;
+  }
+
+  /** Copies an HTTPS source directly into Azure, then applies the normal upload checks. */
+  async storeFromUrl(
+    ctx: RunActionCtx,
+    args: {
+      sourceUrl: string;
+      contentType: string;
+      uploadedBy: string;
+      maxBytes?: number;
+      fileName?: string;
+      metadata?: Record<string, string>;
+    },
+  ): Promise<StoreResult> {
+    const { sourceUrl: sourceAddress, ...rest } = args;
+    let source: URL;
+    try {
+      source = new URL(sourceAddress);
+    } catch {
+      return { ok: false, reason: "Source URL must be a valid HTTPS URL" };
+    }
+    if (
+      source.protocol !== "https:" ||
+      source.username ||
+      source.password ||
+      source.href.includes("#")
+    ) {
+      return {
+        ok: false,
+        reason:
+          "Source URL must be HTTPS and cannot include credentials or a fragment",
+      };
+    }
+    if (source.href.length > 2 * 1024) {
+      return { ok: false, reason: "Source URL must be no longer than 2 KiB" };
+    }
+
+    const config = this.config();
+    const accessToken = config.accountKey
+      ? undefined
+      : await getAccessToken(config);
+    const { fileId, blobName, contentType, uploadExpiresAt } =
+      await this.reserve(
+        ctx,
+        config,
+        {
+          ...rest,
+          maxBytes: Math.min(
+            args.maxBytes ?? this.ceiling,
+            this.ceiling,
+            MAX_PUT_BLOB_FROM_URL_BYTES,
+          ),
+        },
+        SERVER_SAS_TTL_MS,
+      );
+    const request = await this.serverRequest(
+      config,
+      config.container,
+      blobName,
+      "c",
+      uploadExpiresAt,
+      accessToken,
+    );
+    let response: Response;
+    try {
+      response = await fetch(request.url, {
+        method: "PUT",
+        headers: {
+          ...request.headers,
+          "content-length": "0",
+          "x-ms-blob-type": "BlockBlob",
+          "x-ms-blob-content-type": contentType,
+          "x-ms-copy-source": source.href,
+        },
+      });
+    } catch {
+      await this.purge(ctx, fileId);
+      return { ok: false, reason: "Azure Blob URL copy request failed" };
+    }
+    if (response.status !== 201) {
+      await this.purge(ctx, fileId);
+      return {
+        ok: false,
+        reason:
+          response.status === 409
+            ? "Azure Blob URL copy failed with 409; the source must have a valid Content-Length and be no larger than 5,000 MiB"
+            : `Azure Blob URL copy failed with ${response.status}`,
       };
     }
     const confirmed = await this.confirmUpload(ctx, fileId);
