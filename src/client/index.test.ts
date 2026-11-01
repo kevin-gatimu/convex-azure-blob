@@ -302,6 +302,39 @@ describe("read", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("returns a Response that does not expose the signed URL", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    fetchMock.mockImplementation(async (url) => {
+      const response = new Response(PNG, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+      Object.defineProperty(response, "url", { value: String(url) });
+      return response;
+    });
+    const seen = await state.t.action(async (ctx) => {
+      const response = (await state.azure.read(ctx, fileId))!;
+      return {
+        url: response.url,
+        type: response.headers.get("content-type"),
+        size: (await response.arrayBuffer()).byteLength,
+      };
+    });
+    expect(seen).toEqual({ url: "", type: "image/png", size: PNG.length });
+  });
+
+  it("throws when a range request is answered with the full file", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    fetchMock.mockImplementation(
+      async () => new Response(PNG, { status: 200 }),
+    );
+    await expect(
+      readText(state, fileId, { range: { start: 2, end: 4 } }),
+    ).rejects.toThrow("Azure Blob read failed with 200");
+  });
+
   it("sends an inclusive x-ms-range and returns the 206 response", async () => {
     const state = setup();
     const fileId = await state.upload();

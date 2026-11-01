@@ -897,7 +897,8 @@ export class AzureBlob {
 
   /**
    * Streams a ready file's bytes from an action, or returns null if the file is unknown or not
-   * ready. `range` is an inclusive byte range and yields a 206 response. Run your own permission
+   * ready. `range` is an inclusive byte range and must yield a 206 response. The returned
+   * Response has no `url`, so the signed URL can't leak from it. Run your own permission
    * checks first.
    *
    * @example
@@ -944,11 +945,16 @@ export class AzureBlob {
           : {}),
       },
     });
-    if (response.status !== 200 && response.status !== 206) {
+    if (response.status !== (range ? 206 : 200)) {
       await response.body?.cancel();
       throw new Error(`Azure Blob read failed with ${response.status}`);
     }
-    return response;
+    // A fresh Response, because the original's `url` carries the SAS.
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   }
 
   /**

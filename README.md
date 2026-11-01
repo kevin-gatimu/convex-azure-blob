@@ -662,11 +662,11 @@ const head = await azure.read(ctx, fileId, { range: { start: 0, end: 1023 } });
 ```
 
 `start` must be a non-negative integer and `end`, if given, an integer no
-smaller than `start`; otherwise `read` throws. Any Azure status other than 200
-or 206 throws an error with the status only, never the URL or SAS. The request
-uses a one-minute read-only SAS (or your Entra token) against the internal
-endpoint, so the bytes stream from Azure to the action, not through a browser
-URL.
+smaller than `start`; otherwise `read` throws. Any other Azure status than 200
+(206 when `range` is given) throws an error with the status only, never the URL
+or SAS, and the returned `Response` has an empty `url`. The request uses a
+one-minute read-only SAS (or your Entra token) against the internal endpoint, so
+the bytes stream from Azure to the action, not through a browser URL.
 
 ## Listing files and metadata
 
