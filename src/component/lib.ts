@@ -537,6 +537,34 @@ export const remove = mutation({
   },
 });
 
+/** Defers deletion after a failure or until a live upload URL can no longer recreate the blob. */
+export const deferSweep = mutation({
+  args: {
+    fileId: v.id("files"),
+    now: v.number(),
+    nextAttemptAt: v.optional(v.number()),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const row = await ctx.db.get("files", args.fileId);
+    if (!row || row.status !== "deleting") return null;
+    if (args.nextAttemptAt !== undefined) {
+      await ctx.db.patch("files", row._id, {
+        nextAttemptAt: args.nextAttemptAt,
+      });
+    } else {
+      const sweepAttempts = (row.sweepAttempts ?? 0) + 1;
+      await ctx.db.patch("files", row._id, {
+        sweepAttempts,
+        nextAttemptAt:
+          args.now +
+          Math.min(60_000 * 2 ** (sweepAttempts - 1), 24 * 60 * 60_000),
+      });
+    }
+    return null;
+  },
+});
+
 /** Atomically claims stale pending uploads, so confirmation cannot race the selection. */
 export const claimSweepable = mutation({
   args: {
@@ -560,7 +588,11 @@ export const claimSweepable = mutation({
     );
     const deleting = await ctx.db
       .query("files")
-      .withIndex("by_status_createdAt", (q) => q.eq("status", "deleting"))
+      .withIndex("by_status_nextAttemptAt", (q) =>
+        q
+          .eq("status", "deleting")
+          .lte("nextAttemptAt", args.now ?? args.pendingBefore),
+      )
       .take(limit);
     const expired: Doc<"files">[] = [];
     if (deleting.length < limit) {

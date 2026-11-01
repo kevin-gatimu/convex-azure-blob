@@ -65,6 +65,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         null,
         Name
       >;
+      deferSweep: FunctionReference<
+        "mutation",
+        "internal",
+        { fileId: string; nextAttemptAt?: number; now: number },
+        null,
+        Name
+      >;
       dueMalwareScans: FunctionReference<
         "query",
         "internal",
@@ -107,6 +114,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
+          nextAttemptAt?: number;
           size?: number;
           snapshot?: string;
           status:
@@ -116,6 +124,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "rejected"
             | "scan_timed_out"
             | "deleting";
+          sweepAttempts?: number;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -138,6 +147,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
+          nextAttemptAt?: number;
           size?: number;
           snapshot?: string;
           status:
@@ -147,6 +157,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "rejected"
             | "scan_timed_out"
             | "deleting";
+          sweepAttempts?: number;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -197,6 +208,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             malwareScanRequired?: boolean;
             maxBytes: number;
             metadata?: Record<string, string>;
+            nextAttemptAt?: number;
             size?: number;
             snapshot?: string;
             status:
@@ -206,6 +218,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               | "rejected"
               | "scan_timed_out"
               | "deleting";
+            sweepAttempts?: number;
             uploadExpiresAt?: number;
             uploadMode?: "blocks";
             uploadedBy: string;
@@ -243,6 +256,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
+          nextAttemptAt?: number;
           size?: number;
           snapshot?: string;
           status:
@@ -252,6 +266,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "rejected"
             | "scan_timed_out"
             | "deleting";
+          sweepAttempts?: number;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -281,6 +296,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
+          nextAttemptAt?: number;
           size?: number;
           snapshot?: string;
           status:
@@ -290,6 +306,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "rejected"
             | "scan_timed_out"
             | "deleting";
+          sweepAttempts?: number;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -312,6 +329,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
+          nextAttemptAt?: number;
           size?: number;
           snapshot?: string;
           status:
@@ -321,6 +339,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "rejected"
             | "scan_timed_out"
             | "deleting";
+          sweepAttempts?: number;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -343,6 +362,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
+          nextAttemptAt?: number;
           size?: number;
           snapshot?: string;
           status:
@@ -352,6 +372,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "rejected"
             | "scan_timed_out"
             | "deleting";
+          sweepAttempts?: number;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -388,6 +409,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           malwareScanRequired?: boolean;
           maxBytes: number;
           metadata?: Record<string, string>;
+          nextAttemptAt?: number;
           size?: number;
           snapshot?: string;
           status:
@@ -397,6 +419,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "rejected"
             | "scan_timed_out"
             | "deleting";
+          sweepAttempts?: number;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;

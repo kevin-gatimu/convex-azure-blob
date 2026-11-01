@@ -195,6 +195,32 @@ afterEach(() => {
   delete failures.snapshot;
 });
 
+describe("sweep continuation", () => {
+  test("drains a full batch through the scheduled example action and accepts cron args", async () => {
+    const t = initConvexTest();
+    const ids: string[] = [];
+    for (let i = 0; i < 101; i++) {
+      const ticket = await t.action((ctx) =>
+        azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "demo-user",
+          size: PNG.length,
+        }),
+      );
+      ids.push(ticket.fileId);
+    }
+    vi.advanceTimersByTime(2 * 60 * 60_000);
+    expect(await t.action(internal.photos.sweep, {})).toBe(100);
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    expect(blobCalls().filter((call) => call.method === "DELETE")).toHaveLength(
+      101,
+    );
+    for (const id of ids)
+      expect(await t.action((ctx) => azure.getFile(ctx, id))).toBeNull();
+    expect(await t.action(internal.photos.sweep, { run: 9 })).toBe(0);
+  });
+});
+
 describe("Event Grid confirmation", () => {
   test("answers the standard subscription validation handshake", async () => {
     const t = initConvexTest();
