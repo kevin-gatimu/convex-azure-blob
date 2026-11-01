@@ -4,6 +4,7 @@ import {
   defineSchema,
   defineTable,
   internalMutationGeneric,
+  makeFunctionReference,
 } from "convex/server";
 import { v } from "convex/values";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +12,7 @@ import componentTest, { register } from "../test.js";
 import { AzureBlob } from "./index.js";
 import type { AzureBlobOptions, FileDoc } from "./index.js";
 import { effectiveUploadExpiry } from "./upload-expiry.js";
+import { api as componentApi } from "../component/_generated/api.js";
 import {
   blockId,
   blockSizeFor,
@@ -1363,6 +1365,213 @@ describe("purge and sweep", () => {
     expect(await state.file(old)).toBeNull();
     for (const id of young)
       expect((await state.file(id))?.status).toBe("pending");
+  });
+
+  it.each([2, undefined])(
+    "bounds slow deletes with concurrency %s",
+    async (concurrency) => {
+      const { t, azure, reserve, advance } = setup();
+      for (let i = 0; i < 12; i++) await reserve();
+      advance(2 * 60 * MINUTE);
+      const started = deferred();
+      const release = deferred();
+      const bound = concurrency ?? 8;
+      let active = 0;
+      let maximum = 0;
+      fetchMock.mockImplementation(async () => {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        if (active === bound) started.resolve();
+        try {
+          await release.promise;
+          return new Response(null, { status: 202 });
+        } finally {
+          active -= 1;
+        }
+      });
+      const sweeping = t.action((ctx) => azure.sweep(ctx, { concurrency }));
+      try {
+        await started.promise;
+        expect(maximum).toBe(bound);
+      } finally {
+        release.resolve();
+      }
+      expect(await sweeping).toBe(12);
+      expect(maximum).toBe(bound);
+    },
+  );
+
+  it("schedules full claimed batches up to maxRuns, including failed deletes", async () => {
+    const { t, azure, reserve, advance } = setup();
+    for (let i = 0; i < 4; i++) await reserve();
+    advance(2 * 60 * MINUTE);
+    stubBlob({}, 500);
+    const continueWith = makeFunctionReference<"action", { run?: number }>(
+      "photos:sweep",
+    ) as unknown as NonNullable<
+      Parameters<AzureBlob["sweep"]>[1]
+    >["continueWith"];
+    const runAfter = vi.fn(async () => "scheduled" as never);
+    const sweep = (run?: number, maxRuns?: number) =>
+      t.action((ctx) =>
+        azure.sweep(
+          { ...ctx, scheduler: { runAfter } },
+          { limit: 1, continueWith, run, maxRuns },
+        ),
+      );
+    expect(await sweep()).toBe(0);
+    expect(runAfter).toHaveBeenLastCalledWith(0, continueWith, { run: 1 });
+    expect(await sweep(8)).toBe(0);
+    expect(runAfter).toHaveBeenLastCalledWith(0, continueWith, { run: 9 });
+    expect(await sweep(9)).toBe(0);
+    expect(runAfter).toHaveBeenCalledTimes(2);
+    expect(await sweep(0, 1)).toBe(0);
+    expect(runAfter).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not schedule a partial batch and supports contexts without a scheduler", async () => {
+    const { t, azure, reserve, advance } = setup();
+    await reserve();
+    advance(2 * 60 * MINUTE);
+    stubBlob({});
+    const continueWith = makeFunctionReference<"action", { run?: number }>(
+      "photos:sweep",
+    ) as unknown as NonNullable<
+      Parameters<AzureBlob["sweep"]>[1]
+    >["continueWith"];
+    const runAfter = vi.fn(async () => "scheduled" as never);
+    expect(
+      await t.action((ctx) =>
+        azure.sweep(
+          { ...ctx, scheduler: { runAfter } },
+          { continueWith, limit: 2 },
+        ),
+      ),
+    ).toBe(1);
+    expect(runAfter).not.toHaveBeenCalled();
+    expect(
+      await t.action((ctx) =>
+        azure.sweep({
+          runQuery: ctx.runQuery,
+          runMutation: ctx.runMutation,
+        }),
+      ),
+    ).toBe(0);
+    await expect(
+      t.action((ctx) =>
+        azure.sweep(
+          {
+            runQuery: ctx.runQuery,
+            runMutation: ctx.runMutation,
+          },
+          { continueWith },
+        ),
+      ),
+    ).rejects.toThrow("sweep continuation requires a scheduler");
+  });
+
+  it.each([
+    { concurrency: 0 },
+    { concurrency: 1.5 },
+    { concurrency: Infinity },
+    { run: -1 },
+    { maxRuns: 0 },
+    { limit: NaN },
+  ])("rejects invalid sweep options %j before claiming", async (args) => {
+    const { t, azure, reserve, file, advance } = setup();
+    const id = await reserve();
+    advance(2 * 60 * MINUTE);
+    await expect(t.action((ctx) => azure.sweep(ctx, args))).rejects.toThrow();
+    expect((await file(id))?.status).toBe("pending");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("defers a failing row so a newer row is swept, with growing capped backoff", async () => {
+    const { t, azure, reserve, file, advance } = setup();
+    const failing = await reserve();
+    advance(MINUTE);
+    const newer = await reserve();
+    advance(2 * 60 * MINUTE);
+    stubBlob({}, 500);
+    expect(await t.action((ctx) => azure.sweep(ctx, { limit: 1 }))).toBe(0);
+    let now = T0 + 121 * MINUTE;
+    expect(await file(failing)).toMatchObject({
+      sweepAttempts: 1,
+      nextAttemptAt: now + MINUTE,
+      status: "deleting",
+    });
+    stubBlob({});
+    expect(await t.action((ctx) => azure.sweep(ctx, { limit: 1 }))).toBe(1);
+    expect(await file(newer)).toBeNull();
+    expect(await t.action((ctx) => azure.sweep(ctx, { limit: 1 }))).toBe(0);
+    stubBlob({}, 500);
+    for (let attempts = 2; attempts <= 13; attempts++) {
+      const due = (await file(failing))!.nextAttemptAt!;
+      advance(due - now);
+      now = due;
+      expect(await t.action((ctx) => azure.sweep(ctx, { limit: 1 }))).toBe(0);
+      expect(await file(failing)).toMatchObject({
+        sweepAttempts: attempts,
+        nextAttemptAt: now + Math.min(MINUTE * 2 ** (attempts - 1), DAY),
+      });
+    }
+  });
+
+  it("defers a successful delete until the upload expiry plus clock skew", async () => {
+    const { t, azure, reserve, file, advance } = setup();
+    const id = await reserve();
+    stubBlob({});
+    expect(await t.action((ctx) => azure.purge(ctx, id))).toBe(true);
+    const due = (await file(id))!.uploadExpiresAt! + 5 * MINUTE;
+    expect(await file(id)).toMatchObject({
+      status: "deleting",
+      nextAttemptAt: due,
+    });
+    expect((await file(id))?.sweepAttempts).toBeUndefined();
+    advance(due - T0 - 1);
+    expect(await t.action((ctx) => azure.sweep(ctx))).toBe(0);
+    advance(1);
+    expect(await t.action((ctx) => azure.sweep(ctx))).toBe(1);
+    expect(await file(id)).toBeNull();
+  });
+
+  it("includes undefined and due nextAttemptAt in the bounded index range, including legacy calls", async () => {
+    const t = convexTest(componentTest.schema, componentTest.modules);
+    const insert = (nextAttemptAt?: number) =>
+      t.run((ctx) =>
+        ctx.db.insert("files", {
+          container: "uploads",
+          blobName: crypto.randomUUID(),
+          contentType: "image/png",
+          maxBytes: 1024,
+          uploadedBy: "u1",
+          status: "deleting",
+          createdAt: T0 - DAY,
+          ...(nextAttemptAt !== undefined ? { nextAttemptAt } : {}),
+        }),
+      );
+    const unset = await insert();
+    const overdue = await insert(T0 - 1);
+    const due = await insert(T0);
+    await insert(T0 + 1);
+    const claimed = await t.mutation(componentApi.lib.claimSweepable, {
+      pendingBefore: T0 - MINUTE,
+      now: T0,
+      limit: 10,
+    });
+    expect(claimed.map((row) => row.fileId)).toEqual([unset, overdue, due]);
+    const legacy = await t.mutation(componentApi.lib.claimSweepable, {
+      pendingBefore: T0 - MINUTE,
+      limit: 10,
+    });
+    expect(legacy.map((row) => row.fileId)).toEqual([unset]);
+    expect(
+      await t.mutation(componentApi.lib.claimSweepable, {
+        pendingBefore: T0 - MINUTE,
+        now: T0,
+        limit: 1,
+      }),
+    ).toHaveLength(1);
   });
 
   it("respects the sweep limit", async () => {

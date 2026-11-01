@@ -32,6 +32,8 @@ export const fileFields = {
   createdAt: v.number(),
   /** Expiry of the create-only SAS; optional for files created before this field existed. */
   uploadExpiresAt: v.optional(v.number()),
+  nextAttemptAt: v.optional(v.number()),
+  sweepAttempts: v.optional(v.number()),
   uploadMode: v.optional(v.literal("blocks")),
   expectedSize: v.optional(v.number()),
   blockSize: v.optional(v.number()),
@@ -54,6 +56,7 @@ export default defineSchema({
   files: defineTable(fileFields)
     .index("by_container_blobName", ["container", "blobName"])
     .index("by_status_createdAt", ["status", "createdAt"])
+    .index("by_status_nextAttemptAt", ["status", "nextAttemptAt"])
     .index("by_status_uploadExpiresAt", ["status", "uploadExpiresAt"])
     .index("by_uploadedBy_status", ["uploadedBy", "status"]),
   malwareScans: defineTable({

@@ -9,6 +9,12 @@
   (`Checksum mismatch`). New optional `files.md5` field. Not supported with
   `blockUploads`; add `content-md5` to the CORS allowed headers to use it from
   browsers.
+- Add bounded sweep concurrency (default 8) and optional internal-action drain
+  scheduling with `continueWith`, `run`, and `maxRuns` (default 10). Failed blob
+  deletes use exponential backoff capped at 24 hours; live upload URLs defer
+  cleanup until expiry plus clock skew. File records gain optional
+  `nextAttemptAt` and `sweepAttempts`; the component adds `deferSweep` and an
+  indexed due-time selection. The README documents the options and cron wrapper.
 - Add `AzureBlob.read(ctx, fileId, { range? })` to read a ready file's bytes
   from an action, optionally an inclusive byte range (206). It returns null for
   an unknown or not-ready file, and throws without exposing the URL or SAS when

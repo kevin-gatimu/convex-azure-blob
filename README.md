@@ -763,8 +763,13 @@ export default crons;
 
 // convex/files.ts
 export const sweep = internalAction({
-  args: {},
-  handler: async (ctx) => await azure.sweep(ctx),
+  args: { run: v.optional(v.number()) },
+  returns: v.number(),
+  handler: async (ctx, args): Promise<number> =>
+    await azure.sweep(ctx, {
+      continueWith: internal.files.sweep,
+      run: args.run,
+    }),
 });
 
 export const refreshUserDelegationKey = internalAction({
@@ -786,6 +791,21 @@ so a confirmation that commits first is not swept. Each sweep examines at most
 1000 expired pending rows in expiry order while skipping those younger than the
 age cutoff; if more than 1000 young rows sort ahead of an older one, it waits
 until they age out.
+
+Sweep claims up to `limit` files (default 100, clamped to 1-200) and deletes
+with `concurrency` workers (default 8, a positive integer). A failed Azure
+delete is deferred for one minute, doubling on each failure up to 24 hours, so
+one failing blob does not monopolize later batches. A successful delete with a
+live upload URL is deferred until its recorded expiry plus the clock-skew
+allowance.
+
+Pass an internal action as `continueWith` to drain a backlog: a full claimed
+batch schedules it with `{ run: run + 1 }` at zero delay while
+`run + 1 < maxRuns`. `run` defaults to 0 and `maxRuns` to 10; the action must
+forward `run` and use the same sweep options on each invocation. A scheduler is
+required only when using `continueWith`; existing callers with just `runQuery`
+and `runMutation` still work. The return counts successful blob deletes
+(including 404), not removed rows. The cron starts a fresh chain with `{}`.
 
 ## Storing files from actions
 
@@ -975,7 +995,7 @@ query methods from mutations and actions too.
 | `updateFile(ctx, fileId, { fileName?, metadata? })`                                           | mutation     | `boolean`                                                                       |
 | `markForDeletion(ctx, fileId)`                                                                | mutation     | `boolean`                                                                       |
 | `purge(ctx, fileId)` / `delete(ctx, fileId)`                                                  | action       | `boolean`                                                                       |
-| `sweep(ctx, { pendingOlderThanMs?, limit? })`                                                 | action       | number of blobs removed                                                         |
+| `sweep(ctx, { pendingOlderThanMs?, limit?, concurrency?, continueWith?, run?, maxRuns? })`    | action       | number of blobs removed                                                         |
 | `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
 | `storeFromUrl(ctx, { sourceUrl, contentType, uploadedBy, maxBytes?, fileName?, metadata? })`  | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                               |
 | `refreshUserDelegationKey(ctx, { force? })`                                                   | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key  |
