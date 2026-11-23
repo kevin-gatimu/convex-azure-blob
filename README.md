@@ -253,11 +253,14 @@ container. See Microsoft's docs for
 and
 [Get User Delegation Key](https://learn.microsoft.com/rest/api/storageservices/get-user-delegation-key).
 
-The example's `refreshUserDelegationKey` internal action is scheduled daily and
-refreshes the key when it has less than two days remaining. Run the action once
-from the Convex dashboard after deployment to initialize the cache; uploads and
-signed read URLs fail with a clear error until a valid key is cached. Keys are
-valid for at most seven days.
+The example's `refreshUserDelegationKey` internal action is scheduled hourly and
+refreshes the key when it has less than twelve hours remaining. Run the action
+once from the Convex dashboard after deployment to initialize the cache; uploads
+and signed read URLs fail with a clear error until a valid key is cached. Keys
+are valid for 24 hours. In Entra mode, upload and read SAS expiries are capped
+at the cached key's expiry, so a long `uploadTtlSeconds` (for block uploads) can
+be cut to as little as about 12 hours; renew with `renewUploadUrl`. Refresh
+hourly: with a daily schedule the key expires a few minutes before the next run.
 
 The cached delegation key is a signing secret stored in the component table.
 Treat access to the Convex deployment and its component data as privileged.
@@ -413,6 +416,12 @@ service version used here (about 190.7 TiB per blob). Your configured `maxBytes`
 still applies; the SDK's default remains 10 MiB. Unfinished Azure blocks expire
 after seven days, and the sweep removes abandoned Convex reservations after
 their upload expiry. Keep the sweep running.
+
+The staging write SAS lets a client stage uncommitted blocks, up to Azure's
+limits, until the ticket expires. Uncommitted blocks are billed until Azure
+discards them after seven days, and `maxBytes` is only enforced at confirm. Keep
+`uploadTtlSeconds` short, rate-limit with `checkUpload`, and set a cost or
+lifecycle alert on the storage account.
 
 For custom public upload functions, authorize the uploader before calling the
 SDK and expose a compatible `renewUploadUrl({ fileId })` mutation for the hook.
@@ -617,6 +626,13 @@ Azure. It also reads the first 64 bytes and checks them against the file
 signature for JPEG, PNG, GIF, WebP, AVIF, HEIC, PDF, ZIP, MP4, WebM and MP3
 (`SNIFFABLE_CONTENT_TYPES`). Types without a known signature, such as CSV, skip
 that byte check. Turn it off with `verifyContent: false`.
+
+Warning: browsers can execute some content types (`text/html`, `image/svg+xml`,
+`application/xhtml+xml`, `text/javascript`, XML). They are served with that type
+from the storage origin, and Azure does not send
+`X-Content-Type-Options: nosniff`. If you must accept them, serve them as
+downloads (`getUrl(ctx, id, { download: true })`) or from a separate storage
+account or domain with no cookies.
 
 ## Access tiers
 
@@ -945,6 +961,8 @@ export const documents = new AzureBlob(components.azureBlob, {
   from the stored blob, against what was reserved, before `getUrl` returns
   anything. A SAS cannot cap the upload size, so an oversized blob exists until
   confirm (or the sweep) deletes it.
+- **Active content.** Executable types such as HTML and SVG need care; see the
+  warning under "Allowed types and sizes".
 - **Malware scanning is opt-in.** Use `requireMalwareScan` with Defender for
   Storage to keep confirmed files unservable until a clean scan result arrives.
   Without it, files are not checked for malware. See

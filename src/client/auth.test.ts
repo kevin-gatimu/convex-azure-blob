@@ -82,7 +82,7 @@ describe("getAccessToken", () => {
 });
 
 describe("requestUserDelegationKey", () => {
-  it("requests and parses a seven-day key using OAuth", async () => {
+  it("requests and parses a 24-hour key using OAuth", async () => {
     fetchMock
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ access_token: "access-token" })),
@@ -93,7 +93,7 @@ describe("requestUserDelegationKey", () => {
             <SignedOid>11111111-2222-3333-4444-555555555555</SignedOid>
             <SignedTid>aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</SignedTid>
             <SignedStart>2026-01-01T11:55:00Z</SignedStart>
-            <SignedExpiry>2026-01-08T11:55:00Z</SignedExpiry>
+            <SignedExpiry>2026-01-02T11:55:00Z</SignedExpiry>
             <SignedService>b</SignedService>
             <SignedVersion>2022-11-02</SignedVersion>
             <Value>dGVzdC1rZXk=</Value>
@@ -107,7 +107,7 @@ describe("requestUserDelegationKey", () => {
       signedObjectId: "11111111-2222-3333-4444-555555555555",
       signedTenantId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
       signedStart: "2026-01-01T11:55:00Z",
-      signedExpiry: "2026-01-08T11:55:00Z",
+      signedExpiry: "2026-01-02T11:55:00Z",
       signedService: "b",
       signedVersion: "2022-11-02",
       keyValue: "dGVzdC1rZXk=",
@@ -124,8 +124,23 @@ describe("requestUserDelegationKey", () => {
       "x-ms-version": "2022-11-02",
     });
     expect(init?.body).toBe(
-      "<KeyInfo><Start>2026-01-01T11:55:00Z</Start><Expiry>2026-01-08T11:55:00Z</Expiry></KeyInfo>",
+      "<KeyInfo><Start>2026-01-01T11:55:00Z</Start><Expiry>2026-01-02T11:55:00Z</Expiry></KeyInfo>",
     );
+  });
+
+  it("asks for a key valid for exactly 24 hours, starting five minutes ago", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "access-token" })),
+      )
+      .mockResolvedValueOnce(new Response("<UserDelegationKey/>"));
+    const now = Date.UTC(2026, 0, 1, 12);
+    await requestUserDelegationKey(config, now).catch(() => undefined);
+    const body = String(fetchMock.mock.calls[1]![1]?.body);
+    const start = Date.parse(/<Start>([^<]+)<\/Start>/.exec(body)![1]!);
+    const expiry = Date.parse(/<Expiry>([^<]+)<\/Expiry>/.exec(body)![1]!);
+    expect(start).toBe(now - 5 * 60 * 1000);
+    expect(expiry - start).toBe(24 * 60 * 60 * 1000);
   });
 
   it("surfaces Azure errors and incomplete key responses", async () => {

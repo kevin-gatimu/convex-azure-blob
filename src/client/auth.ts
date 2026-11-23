@@ -2,7 +2,7 @@ import { DEFAULT_AUTHORITY_HOST, type AzureBlobConfig } from "./config.js";
 import { sasTime, SAS_VERSION } from "./sas.js";
 import type { UserDelegationKey } from "./sas.js";
 
-const KEY_VALIDITY_MS = 7 * 24 * 60 * 60 * 1000;
+const KEY_VALIDITY_MS = 24 * 60 * 60 * 1000;
 const KEY_START_SKEW_MS = 5 * 60 * 1000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- User delegation keys are now requested for 24 hours and refreshed when less
+  than 12 hours remain (was 7 days and 2 days). **Action needed with Microsoft
+  Entra credentials:** run `refreshUserDelegationKey` hourly; a daily cron
+  leaves about five minutes a day with no valid key, when uploads and signed
+  reads fail. The example cron is updated. Entra-mode upload and read SAS
+  expiries are capped at the cached key's expiry, so `uploadTtlSeconds` or read
+  windows longer than about 12 hours are shortened.
+- The Event Grid secret is now compared in constant time.
 - Add `AzureBlob.checkSetup(ctx, { origin?, checksum? })` and the exported
   `SetupCheck` and `SetupResult` types. It checks the config, credentials,
   container and, given an origin, the CORS preflight for the headers the
