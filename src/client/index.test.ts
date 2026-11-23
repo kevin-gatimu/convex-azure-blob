@@ -10,7 +10,7 @@ import {
 import { v } from "convex/values";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import componentTest, { register } from "../test.js";
-import { AzureBlob } from "./index.js";
+import { AzureBlob, DEFAULT_MAX_BYTES } from "./index.js";
 import type { AzureBlobOptions, FileDoc } from "./index.js";
 import { effectiveUploadExpiry } from "./upload-expiry.js";
 import { api as componentApi } from "../component/_generated/api.js";
@@ -1101,6 +1101,48 @@ describe("getUrl", () => {
     expect(download).toMatch(/^http:\/\/127\.0\.0\.1:10000\/.*rscd=/);
   });
 
+  it("signs a snapshot file instead of serving the public base URL", async () => {
+    const state = setup({
+      blockUploads: true,
+      config: { ...config, publicBaseUrl: "https://cdn.example/up" },
+    });
+    const ticket = await state.t.action((ctx) =>
+      state.azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        size: PNG.length,
+      }),
+    );
+    stubBlocks();
+    expect(
+      (
+        await state.t.action((ctx) =>
+          state.azure.confirmUpload(ctx, ticket.fileId),
+        )
+      ).ok,
+    ).toBe(true);
+    const url = (await state.t.action((ctx) =>
+      state.azure.getUrl(ctx, ticket.fileId),
+    ))!;
+    expect(url.startsWith("http://127.0.0.1:10000/")).toBe(true);
+    expect(params(url).get("sr")).toBe("bs");
+    expect(params(url).get("snapshot")).toBe("2026-01-01T12:00:00.0000000Z");
+    expect(params(url).has("sig")).toBe(true);
+  });
+
+  it("signs a Cache-Control override instead of serving the public base URL", async () => {
+    const { t, azure, upload } = setup({
+      config: { ...config, publicBaseUrl: "https://cdn.example/up" },
+    });
+    const fileId = await upload();
+    const url = (await t.action((ctx) =>
+      azure.getUrl(ctx, fileId, { cacheControl: "no-store" }),
+    ))!;
+    expect(url.startsWith("http://127.0.0.1:10000/")).toBe(true);
+    expect(params(url).get("rscc")).toBe("no-store");
+    expect(params(url).has("sig")).toBe(true);
+  });
+
   it("uses the container the file was uploaded to", async () => {
     const { t, azure, upload } = setup();
     const fileId = await upload();
@@ -1754,6 +1796,62 @@ describe("storeFromUrl", () => {
         reason: expect.stringContaining(reason),
       });
       expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    "https://user:secret-pass@source.example/image.png",
+    "https://user@source.example/image.png",
+    "https://:secret-pass@source.example/image.png",
+  ])(
+    "rejects the source URL %s with credentials before reserving or calling Azure",
+    async (sourceUrl) => {
+      const { t, azure } = setup();
+      const result = await t.action((ctx) =>
+        azure.storeFromUrl(ctx, {
+          sourceUrl,
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      );
+      expect(result).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining("credentials"),
+      });
+      expect(JSON.stringify(result).includes("secret-pass")).toBe(false);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(
+        await t.mutation(azure.component.lib.claimSweepable, {
+          pendingBefore: T0 + DAY,
+          limit: 10,
+          now: T0 + DAY,
+        }),
+      ).toEqual([]);
+    },
+  );
+
+  it.each([200, 202])(
+    "treats a %s copy answer as a failure and deletes the blob",
+    async (status) => {
+      const state = setup();
+      fetchMock.mockImplementation(async (_url, init) =>
+        init?.method === "DELETE"
+          ? new Response(null, { status: 202 })
+          : new Response(null, { status }),
+      );
+      expect(
+        await state.t.action((ctx) =>
+          state.azure.storeFromUrl(ctx, {
+            sourceUrl: "https://source.example/image.png",
+            contentType: "image/png",
+            uploadedBy: "u1",
+          }),
+        ),
+      ).toEqual({
+        ok: false,
+        reason: `Azure Blob URL copy failed with ${status}`,
+      });
+      expect(methods()).toEqual(["PUT", "DELETE"]);
     },
   );
 
@@ -2599,6 +2697,7 @@ describe("block clientApi", () => {
 
 describe("clientApi", () => {
   const onUpload = vi.fn();
+  const checkUploadSpy = vi.fn();
   let gatedNow = T0;
   const app = defineTestApp({
     schema: defineSchema({
@@ -2633,6 +2732,7 @@ describe("clientApi", () => {
       identify: async (ctx) =>
         (await ctx.auth.getUserIdentity())?.subject ?? null,
       checkUpload: async (_ctx, args) => {
+        checkUploadSpy(args);
         if (args.fileName === "forbidden.png")
           throw new Error("Quota exceeded");
       },
@@ -2655,6 +2755,7 @@ describe("clientApi", () => {
 
   beforeEach(() => {
     onUpload.mockReset();
+    checkUploadSpy.mockReset();
     gatedNow = T0;
   });
 
@@ -2844,6 +2945,107 @@ describe("clientApi", () => {
           fileName: "forbidden.png",
         }),
     ).rejects.toThrow("Quota exceeded");
+  });
+
+  it("refuses caller-supplied uploadedBy, maxBytes and metadata, and records the signed-in user", async () => {
+    const t = createTest().withIdentity({ subject: "user1" });
+    const claimable = () =>
+      t.mutation(app.components.azureBlob.lib.claimSweepable, {
+        pendingBefore: T0 + DAY,
+        limit: 10,
+        now: T0 + DAY,
+      });
+    for (const extra of [
+      { uploadedBy: "victim" },
+      { maxBytes: 1e12 },
+      { metadata: { role: "admin" } },
+    ]) {
+      await expect(
+        t.mutation(api.files.generateUploadUrl, {
+          contentType: "image/png",
+          ...extra,
+        } as never),
+      ).rejects.toThrow(/Unexpected field/);
+    }
+    expect(checkUploadSpy).not.toHaveBeenCalled();
+    expect(await claimable()).toEqual([]);
+
+    const ticket = await t.mutation(api.files.generateUploadUrl, {
+      contentType: "image/png",
+    });
+    expect(checkUploadSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ uploadedBy: "user1" }),
+    );
+    const stored = await t.query(app.components.azureBlob.lib.get, {
+      fileId: ticket.fileId,
+    });
+    expect(stored).toMatchObject({
+      uploadedBy: "user1",
+      maxBytes: DEFAULT_MAX_BYTES,
+    });
+    expect(stored?.metadata).toBeUndefined();
+    await expect(
+      t.mutation(api.files.renewUploadUrl, {
+        fileId: ticket.fileId,
+        uploadedBy: "victim",
+      } as never),
+    ).rejects.toThrow(/Unexpected field/);
+    await expect(
+      t.action(api.files.confirmUpload, {
+        fileId: ticket.fileId,
+        uploadedBy: "victim",
+      } as never),
+    ).rejects.toThrow(/Unexpected field/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses an anonymous generateUploadUrl before checkUpload, reservation or any Azure call", async () => {
+    const anonymous = createTest();
+    await expect(
+      anonymous.mutation(api.files.generateUploadUrl, {
+        contentType: "image/png",
+        fileName: "cat.png",
+      }),
+    ).rejects.toThrow("Not authorized to upload files");
+    expect(checkUploadSpy).not.toHaveBeenCalled();
+    expect(
+      await anonymous.mutation(app.components.azureBlob.lib.claimSweepable, {
+        pendingBefore: T0 + DAY,
+        limit: 10,
+        now: T0 + DAY,
+      }),
+    ).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses an anonymous confirmUpload of a real pending file without any Azure call", async () => {
+    const anonymous = createTest();
+    const { fileId } = await anonymous
+      .withIdentity({ subject: "user1" })
+      .mutation(api.files.generateUploadUrl, { contentType: "image/png" });
+    stubBlob({});
+    await expect(
+      anonymous.action(api.files.confirmUpload, { fileId }),
+    ).rejects.toThrow("Not authorized to upload files");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(onUpload).not.toHaveBeenCalled();
+    expect(
+      (await anonymous.query(app.components.azureBlob.lib.get, { fileId }))
+        ?.status,
+    ).toBe("pending");
+  });
+
+  it("registers scanMalware as an internal action and the upload functions as public", () => {
+    const files = azure.clientApi({ identify: async () => "user1" });
+    const flags = (fn: object) => fn as { isPublic?: true; isInternal?: true };
+    expect(flags(files.scanMalware).isInternal).toBe(true);
+    expect(flags(files.scanMalware).isPublic).toBeUndefined();
+    for (const fn of [
+      files.generateUploadUrl,
+      files.renewUploadUrl,
+      files.confirmUpload,
+    ])
+      expect(flags(fn).isPublic).toBe(true);
   });
 
   it("does not let one user confirm another user's upload", async () => {
@@ -3202,7 +3404,10 @@ describe("access tiers", () => {
       "./component/http.ts": async () => ({ default: router }),
     });
     const azure = new AzureBlob(register(t), {
-      config,
+      config: {
+        ...config,
+        endpoint: "https://127.0.0.1:10000/devstoreaccount1",
+      },
       now: () => T0,
       accessTier: "Cool",
     });
@@ -3854,5 +4059,880 @@ describe("eventGridHandler authentication", () => {
       validationRequest,
     );
     expect(ascii.status).toBe(401);
+  });
+});
+
+describe("eventGridHandler event filtering", () => {
+  const secret = "a".repeat(32);
+  const endpoint = "https://127.0.0.1:10000/devstoreaccount1";
+  const event = (
+    eventType: string,
+    data: Record<string, unknown>,
+    id = "event",
+  ) => ({
+    id,
+    eventType,
+    subject: "",
+    eventTime: new Date(T0).toISOString(),
+    dataVersion: "",
+    metadataVersion: "1",
+    data,
+  });
+  const created = (url: string, id?: string) =>
+    event("Microsoft.Storage.BlobCreated", { url }, id);
+  const validation = (id?: string) =>
+    event(
+      "Microsoft.EventGrid.SubscriptionValidationEvent",
+      { validationCode: "code-123" },
+      id,
+    );
+  type RawHandler = {
+    _handler: (ctx: unknown, request: Request) => Promise<Response>;
+  };
+
+  async function start(configuredEndpoint = endpoint) {
+    const router = httpRouter();
+    const t = convexTest(defineSchema({}), {
+      ...componentTest.modules,
+      "./component/http.ts": async () => ({ default: router }),
+    });
+    const azure = new AzureBlob(register(t), {
+      config: { ...config, endpoint: configuredEndpoint },
+      now: () => T0,
+    });
+    const handler = azure.eventGridHandler({ secret });
+    router.route({ path: "/events", method: "POST", handler });
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    const doc = (await t.query((ctx) => azure.getFile(ctx, ticket.fileId)))!;
+    stubBlob({});
+    fetchMock.mockClear();
+    return {
+      doc,
+      handler: handler as unknown as RawHandler,
+      post: (events: unknown[]) =>
+        t.fetch(`/events?secret=${secret}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(events),
+        }),
+      status: async () =>
+        (await t.query((ctx) => azure.getFile(ctx, ticket.fileId)))?.status,
+    };
+  }
+
+  it("confirms a pending file when the event comes from the configured account", async () => {
+    const { doc, post, status } = await start();
+    const response = await post([
+      created(`${endpoint}/uploads/${doc.blobName}`),
+    ]);
+    expect(response.status).toBe(200);
+    expect(await status()).toBe("ready");
+    expect(methods()).toContain("HEAD");
+  });
+
+  it("accepts the account's own blob host when the endpoint is a custom domain, and no other account", async () => {
+    const { doc, post, status } = await start("https://files.example.com");
+    const ignored = await post([
+      created(
+        `https://otheraccount.blob.core.windows.net/uploads/${doc.blobName}`,
+      ),
+    ]);
+    expect(ignored.status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await status()).toBe("pending");
+    const accepted = await post([
+      created(
+        `https://devstoreaccount1.blob.core.windows.net/uploads/${doc.blobName}`,
+      ),
+    ]);
+    expect(accepted.status).toBe(200);
+    expect(await status()).toBe("ready");
+  });
+
+  it.each(["GET", "PUT", "DELETE"])(
+    "answers %s with 405 and an Allow header, before touching the request",
+    async (method) => {
+      const { handler } = await start();
+      const response = await handler._handler(
+        {},
+        new Request(`https://some.convex.site/events?secret=${secret}`, {
+          method,
+        }),
+      );
+      expect(response.status).toBe(405);
+      expect(response.headers.get("Allow")).toBe("POST");
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses a plain-http request even with the right secret and a valid body", async () => {
+    const { handler } = await start();
+    const response = await handler._handler(
+      {},
+      new Request(`http://some.convex.site/events?secret=${secret}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify([validation()]),
+      }),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("HTTPS is required");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a validation event mixed with an upload event", "created"],
+    ["two validation events", "validation"],
+  ])(
+    "rejects a batch with %s without confirming anything",
+    async (_n, other) => {
+      const { doc, post, status } = await start();
+      const response = await post([
+        validation("v1"),
+        other === "created"
+          ? created(`${endpoint}/uploads/${doc.blobName}`, "c1")
+          : validation("v2"),
+      ]);
+      expect(response.status).toBe(400);
+      expect(await status()).toBe("pending");
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [
+      "another host",
+      (name: string) => `https://evil.example/devstoreaccount1/uploads/${name}`,
+    ],
+    [
+      "another port",
+      (name: string) =>
+        `https://127.0.0.1:10001/devstoreaccount1/uploads/${name}`,
+    ],
+    [
+      "a look-alike subdomain",
+      (name: string) =>
+        `https://127.0.0.1.evil.example:10000/devstoreaccount1/uploads/${name}`,
+    ],
+    [
+      "credentials pointing elsewhere",
+      (name: string) =>
+        `https://127.0.0.1:10000@evil.example/devstoreaccount1/uploads/${name}`,
+    ],
+    [
+      "another storage account",
+      (name: string) => `https://other.blob.core.windows.net/uploads/${name}`,
+    ],
+    ["another container", (name: string) => `${endpoint}/other/${name}`],
+  ])("acknowledges but ignores an event from %s", async (_name, urlFor) => {
+    const { doc, post, status } = await start();
+    const response = await post([created(urlFor(doc.blobName))]);
+    expect(response.status).toBe(200);
+    expect(await status()).toBe("pending");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "a leading encoded dot-dot segment",
+      (name: string) => `${endpoint}/uploads/..%2f${name}`,
+    ],
+    [
+      "an encoded dot-dot between segments",
+      (name: string) => `${endpoint}/uploads/x%2f..%2f${name}`,
+    ],
+    [
+      "an encoded slash inside the container",
+      (name: string) => `${endpoint}/uploads%2f${name}`,
+    ],
+    [
+      "an encoded slash inside the account path",
+      (name: string) =>
+        `https://127.0.0.1:10000/devstoreaccount1%2f..%2fdevstoreaccount1/uploads/${name}`,
+    ],
+  ])("acknowledges but ignores a path with %s", async (_name, urlFor) => {
+    const { doc, post, status } = await start();
+    const response = await post([created(urlFor(doc.blobName))]);
+    expect(response.status).toBe(200);
+    expect(await status()).toBe("pending");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a whole batch holding a plain-http BlobCreated URL, leaving its valid events pending", async () => {
+    const { doc, post, status } = await start();
+    const response = await post([
+      created(`${endpoint}/uploads/${doc.blobName}`, "good"),
+      created(
+        `http://127.0.0.1:10000/devstoreaccount1/uploads/${doc.blobName}`,
+        "plain",
+      ),
+    ]);
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Invalid Event Grid event schema");
+    expect(await status()).toBe("pending");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("delegation key safety", () => {
+  const KEY_VALUE = "dGVzdC1kZWxlZ2F0aW9uLWtleQ==";
+  const key = (signedExpiry: string) => ({
+    keyValue: KEY_VALUE,
+    signedObjectId: "11111111-2222-3333-4444-555555555555",
+    signedTenantId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    signedStart: "2026-01-01T11:00:00Z",
+    signedExpiry,
+    signedService: "b",
+    signedVersion: "2022-11-02",
+  });
+  const cache = (state: ReturnType<typeof setup>, signedExpiry: string) =>
+    state.t.mutation(state.azure.component.lib.upsertUserDelegationKey, {
+      accountName: entraConfig.accountName,
+      ...key(signedExpiry),
+    });
+  const cached = (state: ReturnType<typeof setup>) =>
+    state.t.query(state.azure.component.lib.getUserDelegationKey, {
+      accountName: entraConfig.accountName,
+      now: T0,
+    });
+  const claimable = (state: ReturnType<typeof setup>) =>
+    state.t.mutation(state.azure.component.lib.claimSweepable, {
+      pendingBefore: T0 + DAY,
+      limit: 10,
+      now: T0 + DAY,
+    });
+
+  it.each([
+    ["exactly now", "2026-01-01T12:00:00Z"],
+    ["in the past", "2025-12-31T12:00:00Z"],
+  ])(
+    "refuses a key Azure returns already expired (%s) and keeps the cached one",
+    async (_name, expiry) => {
+      const state = setupEntra();
+      await state.t.action((ctx) => state.azure.refreshUserDelegationKey(ctx));
+      const first = await cached(state);
+      const entra = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url, init) => {
+        if (String(url).includes("comp=userdelegationkey"))
+          return new Response(`<UserDelegationKey>
+            <SignedOid>99999999-2222-3333-4444-555555555555</SignedOid>
+            <SignedTid>aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</SignedTid>
+            <SignedStart>2025-12-30T12:00:00Z</SignedStart>
+            <SignedExpiry>${expiry}</SignedExpiry>
+            <SignedService>b</SignedService>
+            <SignedVersion>2022-11-02</SignedVersion>
+            <Value>ZXhwaXJlZA==</Value>
+          </UserDelegationKey>`);
+        return await entra(url, init);
+      });
+      await expect(
+        state.t.action((ctx) =>
+          state.azure.refreshUserDelegationKey(ctx, { force: true }),
+        ),
+      ).rejects.toThrow("expired user delegation key");
+      expect(first).not.toBeNull();
+      expect((await cached(state))?.keyValue === first?.keyValue).toBe(true);
+      expect((await cached(state))?.signedObjectId).toBe(first?.signedObjectId);
+    },
+  );
+
+  it("never puts the key value in tickets, read URLs, errors or setup results", async () => {
+    const state = setupEntra({ length: PNG.length });
+    await state.t.action((ctx) => state.azure.refreshUserDelegationKey(ctx));
+    const seen: string[] = [];
+    const ticket = await state.t.action((ctx) =>
+      state.azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    seen.push(JSON.stringify(ticket));
+    seen.push(
+      JSON.stringify(
+        await state.t.action((ctx) =>
+          state.azure.renewUploadUrl(ctx, {
+            fileId: ticket.fileId,
+            uploadedBy: "u1",
+          }),
+        ),
+      ),
+    );
+    await state.t.action((ctx) =>
+      state.azure.confirmUpload(ctx, ticket.fileId),
+    );
+    seen.push(
+      (await state.t.action((ctx) =>
+        state.azure.getUrl(ctx, ticket.fileId, { download: true }),
+      ))!,
+    );
+    const entra = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) =>
+      init?.method === "HEAD"
+        ? new Response(null, {
+            status: 404,
+            headers: { "x-ms-error-code": "BlobNotFound" },
+          })
+        : await entra(url, init),
+    );
+    seen.push(
+      JSON.stringify(
+        await state.t.action((ctx) => state.azure.checkSetup(ctx)),
+      ),
+    );
+    fetchMock.mockImplementation(async (url, init) =>
+      String(url).includes("comp=userdelegationkey")
+        ? new Response("<UserDelegationKey></UserDelegationKey>")
+        : await entra(url, init),
+    );
+    seen.push(
+      String(
+        await state.t
+          .action((ctx) =>
+            state.azure.refreshUserDelegationKey(ctx, { force: true }),
+          )
+          .catch((error: unknown) => error),
+      ),
+    );
+    expect(seen).toHaveLength(5);
+    for (const secret of [
+      KEY_VALUE,
+      encodeURIComponent(KEY_VALUE),
+      atob(KEY_VALUE),
+    ])
+      for (const text of seen) expect(text.includes(secret)).toBe(false);
+  });
+
+  it("refuses to issue a ticket when the cached key expires within a minute, reserving nothing", async () => {
+    const state = setupEntra();
+    await cache(state, "2026-01-01T12:01:00Z");
+    await expect(
+      state.t.action((ctx) =>
+        state.azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      ),
+    ).rejects.toThrow("expires too soon; run refreshUserDelegationKey");
+    expect(await claimable(state)).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await cache(state, "2026-01-01T12:01:01Z");
+    const ticket = await state.t.action((ctx) =>
+      state.azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(params(ticket.uploadUrl).get("se")).toBe("2026-01-01T12:01:01Z");
+  });
+
+  it("refuses to renew when the cached key expires within a minute, leaving the row unchanged", async () => {
+    const state = setupEntra();
+    await state.t.action((ctx) => state.azure.refreshUserDelegationKey(ctx));
+    const fileId = await state.reserve();
+    const before = await state.file(fileId);
+    await cache(state, "2026-01-01T12:01:00Z");
+    state.advance(MINUTE / 2);
+    await expect(
+      state.t.action((ctx) =>
+        state.azure.renewUploadUrl(ctx, { fileId, uploadedBy: "u1" }),
+      ),
+    ).rejects.toThrow("expires too soon; run refreshUserDelegationKey");
+    expect((await state.file(fileId))?.uploadExpiresAt).toBe(
+      before?.uploadExpiresAt,
+    );
+  });
+
+  it("never signs a renewal or a read URL past the cached key's expiry", async () => {
+    const state = setup({
+      config: entraConfig,
+      uploadTtlSeconds: 24 * 60 * 60,
+      readWindowSeconds: 24 * 60 * 60,
+    });
+    stubEntra({ length: PNG.length });
+    const keyExpiry = Date.parse("2026-01-01T12:10:00Z");
+    await cache(state, "2026-01-01T12:10:00Z");
+    const ticket = await state.t.action((ctx) =>
+      state.azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(Date.parse(params(ticket.uploadUrl).get("se")!)).toBe(keyExpiry);
+    state.advance(MINUTE);
+    const renewed = await state.t.action((ctx) =>
+      state.azure.renewUploadUrl(ctx, {
+        fileId: ticket.fileId,
+        uploadedBy: "u1",
+      }),
+    );
+    expect(Date.parse(params(renewed.uploadUrl).get("se")!)).toBe(keyExpiry);
+    expect(
+      (await state.file(ticket.fileId))?.uploadExpiresAt,
+    ).toBeLessThanOrEqual(keyExpiry);
+
+    await state.t.action((ctx) =>
+      state.azure.confirmUpload(ctx, ticket.fileId),
+    );
+    const readUrl = await state.t.action((ctx) =>
+      state.azure.getUrl(ctx, ticket.fileId),
+    );
+    expect(Date.parse(params(readUrl).get("se")!)).toBeLessThanOrEqual(
+      keyExpiry,
+    );
+  });
+});
+
+describe("SAS protocol and scope", () => {
+  const httpsEndpoint = "https://acct.blob.core.windows.net";
+  const spr = (url: string | URL) => params(String(url)).get("spr");
+
+  it.each([
+    ["an https endpoint", "https", { endpoint: httpsEndpoint }, undefined],
+    [
+      "an http endpoint with httpsOnly",
+      "https",
+      { endpoint: config.endpoint },
+      true,
+    ],
+    [
+      "an https endpoint with httpsOnly off",
+      null,
+      { endpoint: httpsEndpoint },
+      false,
+    ],
+  ])(
+    "signs upload, read and server SAS URLs for %s with spr=%s",
+    async (_name, expected, override, httpsOnly) => {
+      const state = setup({
+        config: { ...config, ...override },
+        ...(httpsOnly === undefined ? {} : { httpsOnly }),
+      });
+      const ticket = await state.t.action((ctx) =>
+        state.azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      );
+      expect(spr(ticket.uploadUrl)).toBe(expected);
+      stubBlob({});
+      await state.t.action((ctx) =>
+        state.azure.confirmUpload(ctx, ticket.fileId),
+      );
+      const readUrl = await state.t.action((ctx) =>
+        state.azure.getUrl(ctx, ticket.fileId),
+      );
+      expect(spr(readUrl!)).toBe(expected);
+      const downloadUrl = await state.t.action((ctx) =>
+        state.azure.getUrl(ctx, ticket.fileId, { download: true }),
+      );
+      expect(spr(downloadUrl!)).toBe(expected);
+      await state.t.action((ctx) => state.azure.purge(ctx, ticket.fileId));
+      expect(methods()).toEqual(["HEAD", "GET", "DELETE"]);
+      for (const [url] of fetchMock.mock.calls) expect(spr(url)).toBe(expected);
+    },
+  );
+
+  it("signs delegation SAS URLs with spr=https on an https endpoint, and omits it when httpsOnly is off", async () => {
+    for (const [httpsOnly, expected] of [
+      [undefined, "https"],
+      [false, null],
+    ] as const) {
+      const state = setup({
+        config: entraConfig,
+        ...(httpsOnly === undefined ? {} : { httpsOnly }),
+      });
+      stubEntra();
+      await state.t.action((ctx) => state.azure.refreshUserDelegationKey(ctx));
+      const ticket = await state.t.action((ctx) =>
+        state.azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      );
+      expect(spr(ticket.uploadUrl)).toBe(expected);
+      await state.t.action((ctx) =>
+        state.azure.confirmUpload(ctx, ticket.fileId),
+      );
+      expect(
+        spr(
+          (await state.t.action((ctx) =>
+            state.azure.getUrl(ctx, ticket.fileId),
+          ))!,
+        ),
+      ).toBe(expected);
+    }
+  });
+
+  it("backdates the upload start by five minutes and keeps it on a renewed ticket", async () => {
+    const state = setup();
+    const ticket = await state.t.action((ctx) =>
+      state.azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(params(ticket.uploadUrl).get("st")).toBe("2026-01-01T11:55:00Z");
+    state.advance(2 * MINUTE);
+    const renewed = await state.t.action((ctx) =>
+      state.azure.renewUploadUrl(ctx, {
+        fileId: ticket.fileId,
+        uploadedBy: "u1",
+      }),
+    );
+    expect(params(renewed.uploadUrl).get("st")).toBe("2026-01-01T11:57:00Z");
+    expect(params(renewed.uploadUrl).get("sp")).toBe("c");
+  });
+
+  it("renews a block ticket with write-only permission on the same blob", async () => {
+    const state = setup({ blockUploads: true });
+    const ticket = await state.t.action((ctx) =>
+      state.azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        size: PNG.length,
+      }),
+    );
+    state.advance(2 * MINUTE);
+    const renewed = await state.t.action((ctx) =>
+      state.azure.renewUploadUrl(ctx, {
+        fileId: ticket.fileId,
+        uploadedBy: "u1",
+      }),
+    );
+    expect(renewed.kind).toBe("blocks");
+    expect(params(renewed.uploadUrl).get("sp")).toBe("w");
+    expect(params(renewed.uploadUrl).get("sr")).toBe("b");
+    expect(new URL(renewed.uploadUrl).pathname).toBe(
+      new URL(ticket.uploadUrl).pathname,
+    );
+  });
+});
+
+describe("Azure request failures", () => {
+  // Rejects every matching call with a message that carries the full request URL, as undici can.
+  function rejectWhen(match: (url: URL, init?: RequestInit) => boolean) {
+    const inner = fetchMock.getMockImplementation()!;
+    const urls: string[] = [];
+    fetchMock.mockImplementation(async (url, init) => {
+      if (match(new URL(String(url)), init)) {
+        urls.push(String(url));
+        throw new TypeError(`fetch failed for ${String(url)}`);
+      }
+      return await inner(url, init);
+    });
+    return urls;
+  }
+  const caught = (run: () => Promise<unknown>) =>
+    run().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+  function expectSanitized(error: unknown, expected: string, urls: string[]) {
+    expect(urls.length).toBeGreaterThan(0);
+    const message =
+      error instanceof AggregateError
+        ? (error.errors as Error[]).map((e) => e.message).join("\n")
+        : String((error as Error | undefined)?.message);
+    for (const url of urls) {
+      const sig = new URL(url).searchParams.get("sig");
+      expect(sig).toBeTruthy();
+      expect(message.includes(url)).toBe(false);
+      expect(message.includes(sig ?? "")).toBe(false);
+    }
+    expect(message).toContain(expected);
+  }
+  const isMethod = (method: string) => (_url: URL, init?: RequestInit) =>
+    (init?.method ?? "GET") === method;
+
+  it("hides the SAS URL when reading a file fails", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    const urls = rejectWhen(isMethod("GET"));
+    const error = await caught(() =>
+      state.t.action((ctx) => state.azure.read(ctx, fileId)),
+    );
+    expectSanitized(error, "Azure Blob read request failed", urls);
+  });
+
+  it("hides the SAS URL when the confirm HEAD fails", async () => {
+    const state = setup();
+    const fileId = await state.reserve();
+    stubBlob({});
+    const urls = rejectWhen(isMethod("HEAD"));
+    const error = await caught(() =>
+      state.t.action((ctx) => state.azure.confirmUpload(ctx, fileId)),
+    );
+    expectSanitized(error, "Azure Blob HEAD request failed", urls);
+    expect((await state.file(fileId))?.status).toBe("pending");
+  });
+
+  it("hides the SAS URL when the signature sniff fails", async () => {
+    const state = setup();
+    const fileId = await state.reserve();
+    stubBlob({});
+    const urls = rejectWhen(isMethod("GET"));
+    const error = await caught(() =>
+      state.t.action((ctx) => state.azure.confirmUpload(ctx, fileId)),
+    );
+    expectSanitized(error, "Azure Blob GET request failed", urls);
+    expect((await state.file(fileId))?.status).toBe("pending");
+  });
+
+  it("hides the SAS URL when a server-side upload fails", async () => {
+    const state = setup();
+    stubBlob({});
+    const urls = rejectWhen(isMethod("PUT"));
+    const error = await caught(() =>
+      state.t.action((ctx) =>
+        state.azure.store(ctx, {
+          data: PNG,
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      ),
+    );
+    expectSanitized(error, "Azure Blob upload request failed", urls);
+  });
+
+  it.each([
+    [
+      "block list",
+      (url: URL, init?: RequestInit) =>
+        url.searchParams.get("comp") === "blocklist" && init?.method !== "PUT",
+    ],
+    [
+      "HEAD",
+      (url: URL, init?: RequestInit) =>
+        init?.method === "HEAD" && !url.searchParams.has("snapshot"),
+    ],
+    [
+      "block commit",
+      (url: URL, init?: RequestInit) =>
+        url.searchParams.get("comp") === "blocklist" && init?.method === "PUT",
+    ],
+    ["snapshot", (url: URL) => url.searchParams.get("comp") === "snapshot"],
+  ])(
+    "hides the SAS URL when the block-upload %s request fails",
+    async (operation, match) => {
+      const state = setup({ blockUploads: true });
+      const ticket = await state.t.action((ctx) =>
+        state.azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+          size: PNG.length,
+        }),
+      );
+      stubBlocks();
+      const urls = rejectWhen(match);
+      const error = await caught(() =>
+        state.t.action((ctx) => state.azure.confirmUpload(ctx, ticket.fileId)),
+      );
+      expectSanitized(error, `Azure Blob ${operation} request failed`, urls);
+      expect((await state.file(ticket.fileId))?.status).toBe("pending");
+    },
+  );
+
+  it("hides the SAS URL when the malware tag read fails, and retries later", async () => {
+    const state = setup({ requireMalwareScan: true });
+    const fileId = await state.reserve();
+    stubBlob({});
+    await state.t.action((ctx) => state.azure.confirmUpload(ctx, fileId));
+    const urls = rejectWhen(
+      (url, init) =>
+        init?.method === "GET" && url.searchParams.get("comp") === "tags",
+    );
+    const error = await caught(() =>
+      state.t.action((ctx) => state.azure.scanMalware(ctx)),
+    );
+    expectSanitized(error, "Azure Blob tag read request failed", urls);
+    expect((await state.file(fileId))?.status).toBe("scanning");
+  });
+
+  it("hides the SAS URL when deleting a malicious blob fails, and keeps cleanup pending", async () => {
+    const state = setup({ requireMalwareScan: true });
+    const fileId = await state.reserve();
+    stubBlob({});
+    await state.t.action((ctx) => state.azure.confirmUpload(ctx, fileId));
+    stubScanResult("Malicious");
+    const urls = rejectWhen(isMethod("DELETE"));
+    const error = await caught(() =>
+      state.t.action((ctx) => state.azure.scanMalware(ctx)),
+    );
+    expectSanitized(error, "Azure Blob delete request failed", urls);
+    expect((await state.file(fileId))?.status).toBe("rejected");
+  });
+
+  it("defers a purge whose delete request rejects instead of throwing", async () => {
+    const state = setup();
+    const fileId = await state.upload();
+    const urls = rejectWhen(isMethod("DELETE"));
+    expect(await state.t.action((ctx) => state.azure.purge(ctx, fileId))).toBe(
+      false,
+    );
+    expect(urls).toHaveLength(1);
+    expect(await state.file(fileId)).toMatchObject({
+      status: "deleting",
+      sweepAttempts: 1,
+      nextAttemptAt: T0 + MINUTE,
+    });
+  });
+});
+
+describe("limits and validation", () => {
+  it.each([0, -1, NaN, Infinity, 604_801])(
+    "rejects a TTL or read window of %s seconds",
+    (seconds) => {
+      const component = {} as never;
+      expect(
+        () => new AzureBlob(component, { uploadTtlSeconds: seconds }),
+      ).toThrow("Upload TTL must be between 0 and 604800 seconds");
+      expect(
+        () =>
+          new AzureBlob(component, {
+            uploadTtlSeconds: seconds,
+            blockUploads: true,
+          }),
+      ).toThrow("Block upload TTL must be between 0 and 604800 seconds");
+      expect(
+        () => new AzureBlob(component, { readWindowSeconds: seconds }),
+      ).toThrow("Read window must be between 0 and 604800 seconds");
+    },
+  );
+
+  it("accepts the smallest and largest TTL and read window", () => {
+    const component = {} as never;
+    for (const seconds of [1, 604_800])
+      expect(
+        () =>
+          new AzureBlob(component, {
+            uploadTtlSeconds: seconds,
+            readWindowSeconds: seconds,
+          }),
+      ).not.toThrow();
+  });
+
+  it("rejects a path prefix with dot segments, control characters or other separators", () => {
+    const component = {} as never;
+    for (const pathPrefix of [
+      "a/../b",
+      "a/./b",
+      "x\n",
+      "a\nb",
+      "a\\b",
+      "a%2fb",
+      "é",
+    ])
+      expect(() => new AzureBlob(component, { pathPrefix })).toThrow(
+        "Invalid pathPrefix",
+      );
+  });
+
+  it("accepts a 1024-character metadata value and rejects 1025", async () => {
+    const { t, azure } = setup();
+    const reserve = (value: string) =>
+      t.action((ctx) =>
+        azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+          metadata: { note: value },
+        }),
+      );
+    await expect(reserve("x".repeat(1024))).resolves.toMatchObject({
+      fileId: expect.any(String),
+    });
+    await expect(reserve("x".repeat(1025))).rejects.toThrow("exceeds 1024");
+  });
+
+  it("refuses renewals that expire in the past or more than seven days out", async () => {
+    const state = setup();
+    const fileId = await state.reserve();
+    const renew = (now: number, expiresAt: number) =>
+      state.t.mutation(state.azure.component.lib.renewUpload, {
+        fileId,
+        uploadedBy: "u1",
+        now,
+        expiresAt,
+      });
+    for (const expiresAt of [T0, T0 - MINUTE, T0 + 7 * DAY + 1, Infinity, NaN])
+      await expect(renew(T0, expiresAt)).rejects.toThrow(
+        "Invalid upload expiry",
+      );
+    await expect(renew(NaN, T0 + MINUTE)).rejects.toThrow(
+      "Invalid upload expiry",
+    );
+    expect(await renew(T0, T0 + 7 * DAY)).toMatchObject({
+      uploadExpiresAt: T0 + 7 * DAY,
+    });
+  });
+
+  async function seedPending(state: ReturnType<typeof setup>, count: number) {
+    for (let i = 0; i < count; i++)
+      await state.t.mutation(state.azure.component.lib.create, {
+        container: "uploads",
+        blobName: `bulk-${i}.png`,
+        contentType: "image/png",
+        maxBytes: 1000,
+        uploadedBy: "u1",
+        createdAt: T0,
+        uploadExpiresAt: T0 + 5 * MINUTE,
+      });
+  }
+
+  it("claims at most 200 files in the component however large the limit", async () => {
+    const state = setup();
+    await seedPending(state, 205);
+    const claimed = await state.t.mutation(
+      state.azure.component.lib.claimSweepable,
+      { pendingBefore: T0 + DAY, limit: 1e9, now: T0 + DAY },
+    );
+    expect(claimed).toHaveLength(200);
+  });
+
+  it("removes at most 200 files per client sweep however large the limit", async () => {
+    const state = setup();
+    await seedPending(state, 205);
+    state.advance(DAY);
+    stubBlob({});
+    expect(
+      await state.t.action((ctx) =>
+        state.azure.sweep(ctx, { limit: 1e9, pendingOlderThanMs: 0 }),
+      ),
+    ).toBe(200);
+    expect(
+      await state.t.action((ctx) =>
+        state.azure.sweep(ctx, { limit: 1e9, pendingOlderThanMs: 0 }),
+      ),
+    ).toBe(5);
+  });
+
+  it("claims at least one file when the limit is zero or negative", async () => {
+    const state = setup();
+    for (let i = 0; i < 3; i++) await state.reserve();
+    for (const limit of [0, -5]) {
+      const claimed = await state.t.mutation(
+        state.azure.component.lib.claimSweepable,
+        { pendingBefore: T0 + DAY, limit, now: T0 + DAY },
+      );
+      expect(claimed).toHaveLength(1);
+    }
+  });
+
+  it("will not mark a scan-gated pending file ready without passing through scanning", async () => {
+    const state = setup({ requireMalwareScan: true });
+    const fileId = await state.reserve();
+    expect(
+      await state.t.mutation(state.azure.component.lib.markReady, {
+        fileId,
+        size: PNG.length,
+      }),
+    ).toBeNull();
+    expect((await state.file(fileId))?.status).toBe("pending");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

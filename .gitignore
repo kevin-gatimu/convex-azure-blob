@@ -20,3 +20,8 @@ node_modules
 /.claude/
 /.agents/
 /.playwright-mcp/
+
+# Local secrets (.env.example is the tracked template)
+.env
+.env.*
+!.env.example

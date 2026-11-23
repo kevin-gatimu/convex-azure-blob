@@ -430,6 +430,99 @@ describe("useUploadFile", () => {
     expect(renewUploadUrl).not.toHaveBeenCalled();
     delete api.renewUploadUrl;
   });
+
+  describe("resuming a paused block upload", () => {
+    const blockFile = new Blob(["abcdefgh"], { type: "image/png" });
+    const ticket = {
+      fileId: "f1",
+      uploadUrl: "https://x/y?sig=old",
+      headers: {},
+      kind: "blocks",
+      blockSize: 2,
+    };
+
+    // Starts a block upload with three PUTs in flight, then pauses it.
+    async function pausedUpload() {
+      api.renewUploadUrl = "renew" as unknown as NonNullable<
+        typeof api.renewUploadUrl
+      >;
+      FakeXhr.automatic = false;
+      generateUploadUrl.mockResolvedValue(ticket);
+      confirmUpload.mockResolvedValue({
+        ok: true,
+        size: 8,
+        contentType: "image/png",
+      });
+      await mount();
+      let result!: Promise<unknown>;
+      await act(async () => {
+        result = hook.upload(blockFile).catch((caught: unknown) => caught);
+      });
+      expect(FakeXhr.requests).toHaveLength(3);
+      await act(async () => {
+        hook.pause();
+        expect(await result).toMatchObject({ name: "AbortError" });
+      });
+      expect(hook.canResume).toBe(true);
+      FakeXhr.automatic = true;
+    }
+    afterEach(() => {
+      delete api.renewUploadUrl;
+    });
+
+    it.each([
+      ["path", { uploadUrl: "https://x/other?sig=new" }],
+      ["host", { uploadUrl: "https://evil.example/y?sig=new" }],
+      ["port", { uploadUrl: "https://x:8443/y?sig=new" }],
+      ["scheme", { uploadUrl: "http://x/y?sig=new" }],
+      ["fileId", { fileId: "f2" }],
+      ["block size", { blockSize: 4 }],
+      ["kind", { kind: undefined }],
+    ])(
+      "refuses a renewed ticket whose %s differs, sending nothing and keeping the session",
+      async (_name, patch) => {
+        await pausedUpload();
+        const sent = FakeXhr.requests.length;
+        renewUploadUrl.mockResolvedValue({ ...ticket, ...patch });
+        await act(async () => {
+          await expect(hook.resume()).rejects.toThrow(
+            "Renewed upload ticket does not match",
+          );
+        });
+        expect(FakeXhr.requests).toHaveLength(sent);
+        expect(confirmUpload).not.toHaveBeenCalled();
+        expect(hook.canResume).toBe(true);
+        expect(hook.error?.message).toBe(
+          "Renewed upload ticket does not match",
+        );
+      },
+    );
+
+    it("never writes the ticket or file to browser storage", async () => {
+      const storage = () => ({
+        setItem: vi.fn(),
+        getItem: vi.fn(),
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+      });
+      const local = storage();
+      const session = storage();
+      vi.stubGlobal("localStorage", local);
+      vi.stubGlobal("sessionStorage", session);
+      await pausedUpload();
+      renewUploadUrl.mockResolvedValue({
+        ...ticket,
+        uploadUrl: "https://x/y?sig=new",
+      });
+      await act(async () => {
+        expect(await hook.resume()).toBe("f1");
+      });
+      expect(FakeXhr.requests.length).toBeGreaterThan(3);
+      for (const store of [local, session])
+        for (const method of Object.values(store))
+          expect(method).not.toHaveBeenCalled();
+    });
+  });
 });
 afterEach(() => vi.unstubAllGlobals());
 

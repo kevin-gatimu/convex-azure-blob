@@ -278,4 +278,17 @@ describe("attachmentDisposition", () => {
       `attachment; filename="na_ve _draft_ (1).png"; filename*=UTF-8''na%C3%AFve%20%22draft%22%20%281%29.png`,
     );
   });
+
+  it("strips CR, LF, tab, backslash and quotes from the fallback so the header cannot be split or quoted out of", () => {
+    const value = attachmentDisposition('a\r\nSet-Cookie: x=1\\b"c\td.png');
+    expect(/[\r\n\t\\]/.test(value)).toBe(false);
+    expect((value.match(/"/g) ?? []).length).toBe(2);
+    expect(value).toContain('filename="a__Set-Cookie: x=1_b_c_d.png"');
+  });
+
+  it("percent-encodes the same characters, and the apostrophe, in filename*", () => {
+    const value = attachmentDisposition("a\r\nb\\c\"d'e.png");
+    expect(value).toContain("filename*=UTF-8''a%0D%0Ab%5Cc%22d%27e.png");
+    expect(value.split("filename*=UTF-8''")[1]).toMatch(/^[A-Za-z0-9._~%-]+$/);
+  });
 });

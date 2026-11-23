@@ -91,4 +91,39 @@ describe("resolveConfig", () => {
       "requires AZURE_BLOB_KEY or all Microsoft Entra client credentials; missing: AZURE_BLOB_CLIENT_ID, AZURE_BLOB_CLIENT_SECRET",
     );
   });
+
+  it("never echoes a credential or endpoint value in a configuration error", () => {
+    const accountKey = "c2VjcmV0LWFjY291bnQta2V5";
+    const clientSecret = "very-secret-client-secret";
+    const endpoint = "https://private-account.blob.core.windows.net";
+    const errors: Error[] = [];
+    for (const attempt of [
+      () => resolveConfig({ accountKey, endpoint }, {}),
+      () =>
+        resolveConfig(
+          { endpoint, clientSecret },
+          { AZURE_BLOB_ACCOUNT: "acct", AZURE_BLOB_CONTAINER: "uploads" },
+        ),
+      () =>
+        resolveConfig(undefined, {
+          AZURE_BLOB_ACCOUNT: "acct",
+          AZURE_BLOB_CONTAINER: "uploads",
+          AZURE_BLOB_ENDPOINT: endpoint,
+          AZURE_BLOB_CLIENT_SECRET: clientSecret,
+        }),
+    ]) {
+      try {
+        attempt();
+      } catch (error) {
+        errors.push(error as Error);
+      }
+    }
+    expect(errors).toHaveLength(3);
+    for (const error of errors)
+      for (const secret of [accountKey, clientSecret, endpoint])
+        expect(error.message.includes(secret)).toBe(false);
+    expect(errors[0]!.message).toContain("AZURE_BLOB_ACCOUNT");
+    expect(errors[1]!.message).toContain("AZURE_BLOB_TENANT_ID");
+    expect(errors[2]!.message).toContain("AZURE_BLOB_TENANT_ID");
+  });
 });
