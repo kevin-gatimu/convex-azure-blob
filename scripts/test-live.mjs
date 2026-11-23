@@ -11,20 +11,29 @@ for (const name of [".env.local", ".env"]) {
   if (existsSync(file)) process.loadEnvFile(file);
 }
 
-// The suite reads AZURE_LIVE_*; fill them from the app's AZURE_BLOB_* settings.
-for (const name of [
-  "ACCOUNT",
-  "CONTAINER",
-  "ENDPOINT",
-  "KEY",
-  "TENANT_ID",
-  "CLIENT_ID",
-  "CLIENT_SECRET",
-]) {
-  const value = process.env[`AZURE_BLOB_${name}`];
+// .env.example name -> the name live.test.ts reads (it reads only AZURE_LIVE_*).
+const names = {
+  AZURE_BLOB_ACCOUNT: "ACCOUNT",
+  AZURE_BLOB_CONTAINER: "CONTAINER",
+  AZURE_BLOB_ENDPOINT: "ENDPOINT",
+  AZURE_BLOB_KEY: "KEY",
+  AZURE_BLOB_TENANT_ID: "TENANT_ID",
+  AZURE_BLOB_CLIENT_ID: "CLIENT_ID",
+  AZURE_BLOB_CLIENT_SECRET: "CLIENT_SECRET",
+  AZURE_BLOB_SHARED_KEY_ACCOUNT: "SHARED_KEY_ACCOUNT",
+  AZURE_BLOB_SHARED_KEY_CONTAINER: "SHARED_KEY_CONTAINER",
+  AZURE_BLOB_SHARED_KEY_ENDPOINT: "SHARED_KEY_ENDPOINT",
+  AZURE_BLOB_SHARED_KEY: "SHARED_KEY",
+  AZURE_BLOB_CORS_ORIGIN: "ORIGIN",
+  AZURE_BLOB_COPY_SOURCE: "COPY_SOURCE",
+};
+for (const [from, to] of Object.entries(names)) {
+  const value = process.env[from];
   // process.env stores undefined as the string "undefined", so copy only real values.
-  if (value && !process.env[`AZURE_LIVE_${name}`])
-    process.env[`AZURE_LIVE_${name}`] = value;
+  if (value && !process.env[`AZURE_LIVE_${to}`])
+    process.env[`AZURE_LIVE_${to}`] = value;
+  // AzureBlob falls back to AZURE_BLOB_*, which would give the Entra suite the account key.
+  delete process.env[from];
 }
 process.env.AZURE_LIVE = "1";
 

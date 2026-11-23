@@ -87,6 +87,10 @@ function UploadRow({
         <span className="hint">
           {formatSize(item.file.size)} <span aria-hidden="true"> / </span>
           {item.status === "complete" ? "Uploaded and verified" : item.status}
+          {item.status === "paused" &&
+            canResume &&
+            progress !== null &&
+            `, ${Math.round(progress * 100)}% saved`}
         </span>
         {isUploading && (
           <>

@@ -25,6 +25,12 @@
   expiries are capped at the cached key's expiry, so `uploadTtlSeconds` or read
   windows longer than about 12 hours are shortened.
 - The Event Grid secret is now compared in constant time.
+- `useUploadFile`: when `confirmUpload` rejects a block upload for any reason
+  other than "Upload expired", `canResume` is now false, because the server has
+  deleted the file; before, `resume()` was offered and failed with "Unknown
+  upload". While paused, `progress` now counts only stored blocks, and
+  `resume()` starts from that value instead of 0. The example shows the saved
+  percentage on paused rows.
 - Add `AzureBlob.checkSetup(ctx, { origin?, checksum? })` and the exported
   `SetupCheck` and `SetupResult` types. It checks the config, credentials,
   container and, given an origin, the CORS preflight for the headers the

@@ -9,7 +9,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_FILE_BYTES } from "../upload-policy";
 import App from "./App";
 
-type HookState = { progress: number | null; canResume: boolean };
+type HookState = {
+  progress: number | null;
+  canResume: boolean;
+  isUploading?: boolean;
+};
 type Fake = {
   setState: (state: HookState) => void;
   settle: { resolve: (id: string) => void; reject: (e: Error) => void } | null;
@@ -71,7 +75,7 @@ vi.mock("convex-azure-blob/react", async () => {
         cancel: fake.cancel,
         progress: state.progress,
         canResume: state.canResume,
-        isUploading: state.progress !== null,
+        isUploading: state.isUploading ?? state.progress !== null,
         error: null,
       };
     },
@@ -314,6 +318,23 @@ describe("App", () => {
       expect(h.fakes[0]!.upload).toHaveBeenCalledTimes(1);
       await resolveUpload(0);
       expect(textOf(row("a.png"))).toContain("Uploaded and verified");
+    });
+
+    it("shows how much a paused upload kept, without a progress bar", async () => {
+      await startOne();
+      await setProgress(0, 0.4);
+      await click(button(row("a.png"), "Pause"));
+      await rejectUpload(0, abort(), true);
+      await act(async () => {
+        h.fakes[0]!.setState({
+          progress: 0.25,
+          canResume: true,
+          isUploading: false,
+        });
+      });
+      expect(textOf(row("a.png"))).toContain("paused, 25% saved");
+      expect(row("a.png").findAllByType("progress")).toHaveLength(0);
+      expect(button(row("a.png"), "Resume")).toBeDefined();
     });
 
     it("resumes once when Resume is clicked twice", async () => {

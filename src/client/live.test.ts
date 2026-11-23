@@ -16,27 +16,34 @@ const TIMEOUT = 60_000;
 const env = (name: string) => process.env[`AZURE_LIVE_${name}`] || undefined;
 
 const enabled = process.env.AZURE_LIVE === "1";
-const account = env("ACCOUNT");
-const container = env("CONTAINER");
-const endpoint = (
-  env("ENDPOINT") ?? (account ? `https://${account}.blob.core.windows.net` : "")
-).replace(/\/+$/, "");
 const origin = env("ORIGIN");
 const copySource = env("COPY_SOURCE");
 const runId = randomUUID().slice(0, 8);
 const pathPrefix = `live-test/${runId}`;
 
-const base = enabled && account && container;
-const sharedKeyConfig: Partial<AzureBlobConfig> | null =
-  base && env("KEY")
-    ? { accountName: account, container, endpoint, accountKey: env("KEY") }
+/** The account a group runs against; the shared key group may use its own (SHARED_KEY_*). */
+function target(prefix: "" | "SHARED_KEY_") {
+  const own = prefix && env(`${prefix}ACCOUNT`);
+  const accountName = own || env("ACCOUNT");
+  const container = (own && env(`${prefix}CONTAINER`)) || env("CONTAINER");
+  const endpoint = (
+    (own ? env(`${prefix}ENDPOINT`) : env("ENDPOINT")) ??
+    `https://${accountName}.blob.core.windows.net`
+  ).replace(/\/+$/, "");
+  return enabled && accountName && container
+    ? { accountName, container, endpoint }
     : null;
+}
+
+const sharedKeyTarget = target("SHARED_KEY_");
+const accountKey = env("SHARED_KEY") ?? env("KEY");
+const sharedKeyConfig: Partial<AzureBlobConfig> | null =
+  sharedKeyTarget && accountKey ? { ...sharedKeyTarget, accountKey } : null;
+const entraTarget = target("");
 const entraConfig: Partial<AzureBlobConfig> | null =
-  base && env("TENANT_ID") && env("CLIENT_ID") && env("CLIENT_SECRET")
+  entraTarget && env("TENANT_ID") && env("CLIENT_ID") && env("CLIENT_SECRET")
     ? {
-        accountName: account,
-        container,
-        endpoint,
+        ...entraTarget,
         tenantId: env("TENANT_ID"),
         clientId: env("CLIENT_ID"),
         clientSecret: env("CLIENT_SECRET"),
@@ -155,13 +162,13 @@ function defineLiveSuite(
     async function blobStatus(azure: AzureBlob, fileId: string) {
       const file = await t.query((ctx) => azure.getFile(ctx, fileId));
       const name = file!.blobName.split("/").map(encodeURIComponent).join("/");
-      const url = `${endpoint}/${container}/${name}`;
+      const url = `${config!.endpoint}/${config!.container}/${name}`;
       if (config!.accountKey) {
         const now = Date.now();
         const sas = await signBlobSas({
           accountName: config!.accountName!,
           accountKey: config!.accountKey,
-          container: container!,
+          container: config!.container!,
           blobName: file!.blobName,
           permissions: "r",
           startsOn: now - 5 * 60_000,
@@ -282,7 +289,7 @@ function defineLiveSuite(
       expect((await call(url!)).status).toBe(403);
     });
 
-    it.skipIf(!config || !endpoint.startsWith("https:"))(
+    it.skipIf(!config || !config.endpoint!.startsWith("https:"))(
       "a plain http variant of an https SAS is not served",
       async () => {
         const azure = client();
@@ -454,7 +461,7 @@ function defineLiveSuite(
       const storedKey = (now: number) =>
         t.query((ctx) =>
           ctx.runQuery(component.lib.getUserDelegationKey, {
-            accountName: account!,
+            accountName: config!.accountName!,
             now,
           }),
         );

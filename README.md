@@ -118,29 +118,68 @@ app.use(azureBlob);
 export default app;
 ```
 
-Set the storage account details on your deployment:
+### Environment variables
+
+Set these on your Convex deployment with `npx convex env set`, or pass the same
+values as `config` to the constructor. Pick **one** way to sign: a shared
+account key, or Microsoft Entra. If `AZURE_BLOB_KEY` is set, the shared key is
+used and the Entra variables are ignored.
+
+#### Always needed
+
+| Variable                       | Required | Meaning                                                                                                        |
+| ------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------- |
+| `AZURE_BLOB_ACCOUNT`           | yes      | Storage account name.                                                                                          |
+| `AZURE_BLOB_CONTAINER`         | yes      | Container that new uploads go to.                                                                              |
+| `AZURE_BLOB_ENDPOINT`          | yes      | Account URL as the **browser** sees it, e.g. `https://<account>.blob.core.windows.net`.                        |
+| `AZURE_BLOB_INTERNAL_ENDPOINT` | no       | Account URL **Convex** uses for its own requests, when it differs (self-hosted Convex in Docker, for example). |
+| `AZURE_BLOB_PUBLIC_BASE_URL`   | no       | Serve reads as `<base>/<blob name>` without a token: a CDN, or a container with public read access.            |
+
+#### Shared key
+
+The account must allow shared key access.
+
+| Variable         | Required | Meaning                                                      |
+| ---------------- | -------- | ------------------------------------------------------------ |
+| `AZURE_BLOB_KEY` | yes      | Base64 account key, from the account's **Access keys** page. |
+
+#### Microsoft Entra
+
+Works when shared key access is disabled. Setup steps are in
+[Microsoft Entra user-delegation SAS](#microsoft-entra-user-delegation-sas).
+
+| Variable                    | Required | Meaning                                                                                   |
+| --------------------------- | -------- | ----------------------------------------------------------------------------------------- |
+| `AZURE_BLOB_TENANT_ID`      | yes      | Directory (tenant) ID.                                                                    |
+| `AZURE_BLOB_CLIENT_ID`      | yes      | Application (client) ID of the app registration.                                          |
+| `AZURE_BLOB_CLIENT_SECRET`  | yes      | Client secret of the app registration.                                                    |
+| `AZURE_BLOB_KEY`            | no       | Must be unset, or the shared key is used instead.                                         |
+| `AZURE_BLOB_AUTHORITY_HOST` | no       | Authority base URL for sovereign clouds; defaults to `https://login.microsoftonline.com`. |
+
+Entra mode also needs the hourly `refreshUserDelegationKey` cron described
+below.
+
+With a shared key:
 
 ```sh
 npx convex env set AZURE_BLOB_ACCOUNT mystorageaccount
-npx convex env set AZURE_BLOB_KEY 'base64-account-key=='
 npx convex env set AZURE_BLOB_CONTAINER uploads
 npx convex env set AZURE_BLOB_ENDPOINT https://mystorageaccount.blob.core.windows.net
+npx convex env set AZURE_BLOB_KEY   # prompts, so the key stays out of shell history
 ```
 
-| Variable                       | Required      | Meaning                                                                                                        |
-| ------------------------------ | ------------- | -------------------------------------------------------------------------------------------------------------- |
-| `AZURE_BLOB_ACCOUNT`           | yes           | Storage account name.                                                                                          |
-| `AZURE_BLOB_KEY`               | one auth mode | Base64 account key. Preferred when set; otherwise use all three Entra client-credential variables below.       |
-| `AZURE_BLOB_CONTAINER`         | yes           | Container that new uploads go to.                                                                              |
-| `AZURE_BLOB_ENDPOINT`          | yes           | Account URL as the **browser** sees it, e.g. `https://<account>.blob.core.windows.net`.                        |
-| `AZURE_BLOB_INTERNAL_ENDPOINT` | no            | Account URL **Convex** uses for its own requests, when it differs (self-hosted Convex in Docker, for example). |
-| `AZURE_BLOB_PUBLIC_BASE_URL`   | no            | Serve reads as `<base>/<blob name>` without a token: a CDN, or a container with public read access.            |
-| `AZURE_BLOB_TENANT_ID`         | Entra mode    | Microsoft Entra tenant ID.                                                                                     |
-| `AZURE_BLOB_CLIENT_ID`         | Entra mode    | Microsoft Entra application client ID.                                                                         |
-| `AZURE_BLOB_CLIENT_SECRET`     | Entra mode    | Microsoft Entra application client secret.                                                                     |
-| `AZURE_BLOB_AUTHORITY_HOST`    | no            | Microsoft Entra authority base URL; defaults to `https://login.microsoftonline.com`.                           |
+With Microsoft Entra:
 
-You can pass the same values as `config` to the constructor instead.
+```sh
+npx convex env set AZURE_BLOB_ACCOUNT mystorageaccount
+npx convex env set AZURE_BLOB_CONTAINER uploads
+npx convex env set AZURE_BLOB_ENDPOINT https://mystorageaccount.blob.core.windows.net
+npx convex env set AZURE_BLOB_TENANT_ID '<directory-tenant-id>'
+npx convex env set AZURE_BLOB_CLIENT_ID '<application-client-id>'
+npx convex env set AZURE_BLOB_CLIENT_SECRET   # prompts
+```
+
+[`.env.example`](./.env.example) lists the same variables, grouped the same way.
 
 ### Microsoft Entra user-delegation SAS
 
@@ -394,8 +433,13 @@ const {
 - `pause()` aborts active requests but keeps the file and successful block IDs.
   `resume()` renews the same upload ticket and sends only unfinished blocks.
   Handle the rejected upload promise as well as displaying `error`.
-- A failed transfer can be resumed when `canResume` is true. `cancel()` discards
-  the session; it does not immediately delete Azure's staged blocks.
+- While paused, `progress` counts only the blocks Azure has stored, since
+  in-flight bytes are sent again, and `resume()` continues from that value.
+- A failed transfer can be resumed when `canResume` is true. A file that
+  `confirmUpload` rejects (wrong type, size or checksum) is deleted, so
+  `canResume` turns false and only a new `upload()` can retry it; an expired
+  ticket stays resumable. `cancel()` discards the session; it does not
+  immediately delete Azure's staged blocks.
 - Resume state exists only in this hook instance. Reloading, leaving the page,
   or unmounting the uploader discards it. No SAS tokens or file data are saved
   to browser storage.
