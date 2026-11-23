@@ -44,8 +44,7 @@
     "check": "npm run build:clean && npm run test && npm run lint && npm run typecheck && npm run lint:package && npm run test:package",
     "prepublishOnly": "npm run check",
     "preversion": "npm run check",
-    "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
-    "release": "npm version patch && npm publish && git push --follow-tags"
+    "release": "node scripts/release.mjs"
   },
   "files": [
     "dist",
