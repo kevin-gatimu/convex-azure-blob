@@ -52,7 +52,7 @@ const h = vi.hoisted(() => {
 });
 
 // One fake hook instance per UploadRow, kept across renders like the real hook's state.
-vi.mock("convex-azure-blob/react", async () => {
+vi.mock("convex-azure-blob-storage/react", async () => {
   const { useRef, useState } =
     await vi.importActual<typeof import("react")>("react");
   return {

@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         Thanks for sharing an idea. The most useful requests describe the problem and the use case,
-        not only the proposed API. See our [contributing guide](https://github.com/kevin-gatimu/convex-azure-blob/blob/main/CONTRIBUTING.md)
+        not only the proposed API. See our [contributing guide](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/CONTRIBUTING.md)
         if you would like to help implement it.
 
         Do not include credentials, connection strings, SAS tokens or URLs, or other secrets.
@@ -17,8 +17,8 @@ body:
     attributes:
       label: The problem
       description:
-        What are you trying to do with convex-azure-blob, and what gets in the
-        way today?
+        What are you trying to do with convex-azure-blob-storage, and what gets
+        in the way today?
     validations:
       required: true
 

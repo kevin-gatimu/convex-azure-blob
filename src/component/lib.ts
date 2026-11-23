@@ -1,4 +1,4 @@
-// Apps reach these as `components.azureBlob.lib.<fn>`, usually through the `AzureBlob` client class.
+// Apps reach these as `components.azureBlobStorage.lib.<fn>`, usually through the `AzureBlob` client class.
 import { paginator } from "convex-helpers/server/pagination";
 import {
   type FunctionHandle,

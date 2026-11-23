@@ -379,7 +379,7 @@ const encodeBlobPath = (blobName: string) =>
  *
  * @example
  * ```ts
- * export const azure = new AzureBlob(components.azureBlob, { maxBytes: 5 * 1024 * 1024 });
+ * export const azure = new AzureBlob(components.azureBlobStorage, { maxBytes: 5 * 1024 * 1024 });
  * ```
  */
 export class AzureBlob {
@@ -2179,7 +2179,7 @@ export class AzureBlob {
 
   /**
    * Ready-made upload functions for use with `useUploadFile` from
-   * `convex-azure-blob/react`. It also returns an internal `scanMalware` action for cron polling:
+   * `convex-azure-blob-storage/react`. It also returns an internal `scanMalware` action for cron polling:
    *
    * ```ts
    * export const { generateUploadUrl, confirmUpload, scanMalware } = azure.clientApi({

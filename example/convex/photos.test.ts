@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
-import azureBlobTest from "convex-azure-blob/test";
-import { AzureBlob } from "convex-azure-blob";
+import azureBlobTest from "convex-azure-blob-storage/test";
+import { AzureBlob } from "convex-azure-blob-storage";
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { MAX_FILE_BYTES } from "../upload-policy";
@@ -301,7 +301,7 @@ describe("Event Grid confirmation", () => {
 
   test("does not confirm blobs outside the configured path prefix", async () => {
     const t = initConvexTest();
-    const otherAzure = new AzureBlob(components.azureBlob, {
+    const otherAzure = new AzureBlob(components.azureBlobStorage, {
       blockUploads: true,
       pathPrefix: "other",
     });

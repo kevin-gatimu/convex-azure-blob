@@ -1,7 +1,7 @@
 # Convex Azure Blob Storage
 
-[![npm version](https://badge.fury.io/js/convex-azure-blob.svg)](https://badge.fury.io/js/convex-azure-blob)
-[![Test and lint](https://github.com/kevin-gatimu/convex-azure-blob/actions/workflows/test.yml/badge.svg)](https://github.com/kevin-gatimu/convex-azure-blob/actions/workflows/test.yml)
+[![npm version](https://img.shields.io/npm/v/convex-azure-blob-storage.svg)](https://www.npmjs.com/package/convex-azure-blob-storage)
+[![Test and lint](https://github.com/kevin-gatimu/convex-azure-blob-storage/actions/workflows/test.yml/badge.svg)](https://github.com/kevin-gatimu/convex-azure-blob-storage/actions/workflows/test.yml)
 
 <!-- START: Include on https://convex.dev/components -->
 
@@ -13,7 +13,7 @@ functions.
 
 ```ts
 // convex/files.ts
-export const azure = new AzureBlob(components.azureBlob);
+export const azure = new AzureBlob(components.azureBlobStorage);
 
 export const { generateUploadUrl, confirmUpload } = azure.clientApi({
   identify: async (ctx) => (await ctx.auth.getUserIdentity())?.subject ?? null,
@@ -43,7 +43,7 @@ const fileId = await upload(file);
   Your functions do, and they pass the uploader as an opaque id.
 
 Found a bug or want a feature?
-[File it here](https://github.com/kevin-gatimu/convex-azure-blob/issues).
+[File it here](https://github.com/kevin-gatimu/convex-azure-blob-storage/issues).
 
 ## Prerequisites
 
@@ -102,7 +102,7 @@ one.
 ## Installation
 
 ```sh
-npm install convex-azure-blob
+npm install convex-azure-blob-storage
 ```
 
 Install the component in your app's `convex/convex.config.ts`:
@@ -110,10 +110,10 @@ Install the component in your app's `convex/convex.config.ts`:
 ```ts
 // convex/convex.config.ts
 import { defineApp } from "convex/server";
-import azureBlob from "convex-azure-blob/convex.config.js";
+import azureBlobStorage from "convex-azure-blob-storage/convex.config.js";
 
 const app = defineApp();
-app.use(azureBlob);
+app.use(azureBlobStorage);
 
 export default app;
 ```
@@ -192,7 +192,7 @@ production.
 In the [Microsoft Entra admin center](https://entra.microsoft.com), go to
 **Entra ID → App registrations → New registration**:
 
-1. Enter a name, for example `convex-azure-blob-test`.
+1. Enter a name, for example `convex-azure-blob-storage-test`.
 2. Leave **Supported account types** set to **Accounts in this organizational
    directory only (Single tenant)**.
 3. Leave **Redirect URI** blank; this server-to-server client-credentials flow
@@ -328,10 +328,10 @@ Create a client for the component and export the upload functions:
 
 ```ts
 // convex/files.ts
-import { AzureBlob } from "convex-azure-blob";
+import { AzureBlob } from "convex-azure-blob-storage";
 import { components, internal } from "./_generated/api";
 
-export const azure = new AzureBlob(components.azureBlob, {
+export const azure = new AzureBlob(components.azureBlobStorage, {
   maxBytes: 5 * 1024 * 1024, // default 10 MiB
 });
 
@@ -365,7 +365,7 @@ referenced through your generated `internal` API.
 Then upload from React:
 
 ```tsx
-import { useUploadFile } from "convex-azure-blob/react";
+import { useUploadFile } from "convex-azure-blob-storage/react";
 import { api } from "../convex/_generated/api";
 
 function UploadButton() {
@@ -399,7 +399,7 @@ the reason, for example "The file is too large".
 Single-PUT uploads remain the default. Opt into block uploads for large files:
 
 ```ts
-export const azure = new AzureBlob(components.azureBlob, {
+export const azure = new AzureBlob(components.azureBlobStorage, {
   blockUploads: true,
   maxBytes: 1024 * 1024 * 1024, // choose an application-specific ceiling
 });
@@ -556,7 +556,7 @@ For single-PUT uploads, opt in to keeping confirmed files private until Defender
 for Storage reports a clean scan:
 
 ```ts
-export const azure = new AzureBlob(components.azureBlob, {
+export const azure = new AzureBlob(components.azureBlobStorage, {
   requireMalwareScan: true,
 });
 const uploadApi: ReturnType<AzureBlob["clientApi"]> = azure.clientApi({
@@ -648,7 +648,7 @@ export const setCover = action({
 extra arguments as the second argument of `upload`: `upload(file, { postId })`.
 
 Without React, use `uploadToAzure(uploadUrl, file, { headers, onProgress })`
-from `convex-azure-blob/react`, or any HTTP client: `PUT` the bytes to
+from `convex-azure-blob-storage/react`, or any HTTP client: `PUT` the bytes to
 `uploadUrl` with the returned `headers`.
 
 ### Allowed types and sizes
@@ -658,7 +658,7 @@ By default the allow-list is JPEG, PNG, WebP, GIF and AVIF. Change it with
 generated blob name:
 
 ```ts
-new AzureBlob(components.azureBlob, {
+new AzureBlob(components.azureBlobStorage, {
   allowedContentTypes: {
     "application/pdf": "pdf",
     "image/png": "png",
@@ -691,7 +691,9 @@ refreshes its actual tier from Azure; the failure is logged without a URL or
 SAS.
 
 ```ts
-const azure = new AzureBlob(components.azureBlob, { accessTier: "Cool" });
+const azure = new AzureBlob(components.azureBlobStorage, {
+  accessTier: "Cool",
+});
 // Invoke from authorized actions, not queries or mutations.
 await azure.setTier(ctx, fileId, "Archive");
 await azure.rehydrate(ctx, fileId, { tier: "Hot", priority: "High" });
@@ -980,12 +982,12 @@ Create one client per container or folder. Each file remembers its container, so
 reads and deletes go to the right place:
 
 ```ts
-export const avatars = new AzureBlob(components.azureBlob, {
+export const avatars = new AzureBlob(components.azureBlobStorage, {
   pathPrefix: "avatars", // blobs are named avatars/<uuid>.<ext>
   maxBytes: 1024 * 1024,
 });
 
-export const documents = new AzureBlob(components.azureBlob, {
+export const documents = new AzureBlob(components.azureBlobStorage, {
   config: { container: "documents" },
   allowedContentTypes: { "application/pdf": "pdf" },
 });
@@ -1102,7 +1104,7 @@ Register the component with
 the Azure calls:
 
 ```ts
-import azureBlobTest from "convex-azure-blob/test";
+import azureBlobTest from "convex-azure-blob-storage/test";
 import { convexTest } from "convex-test";
 import schema from "./schema";
 
@@ -1166,7 +1168,7 @@ query methods from mutations and actions too.
 | `clientApi({ identify, checkUpload?, onUpload? })`                                            | module scope | public upload functions and internal `scanMalware` action                                |
 | `eventGridHandler({ secret, onUpload? })`                                                     | module scope | HTTP action for standard-schema Event Grid BlobCreated events                            |
 
-### `convex-azure-blob/react`
+### `convex-azure-blob-storage/react`
 
 - `useUploadFile(api)` returns
   `{ upload, cancel, pause, resume, canResume, progress, isUploading, error }`.
@@ -1252,29 +1254,17 @@ after fixing the rule, resume the failed transfer.
 
 ## Roadmap
 
-Azure features in priority order. The first two are implemented in Unreleased;
-the remaining entries are future work. Contributions welcome:
+Already in 0.1.0: Microsoft Entra user delegation SAS, resumable block uploads,
+the Defender malware scan gate, Event Grid confirmation, copy from URL, faster
+sweeps with backoff, reads from actions, `Content-MD5` checks, access tiers, and
+`checkSetup`.
 
-1. **User delegation SAS — implemented** (Microsoft Entra ID instead of the
-   account key), for accounts with shared-key access disabled.
-2. **Large files with block uploads — implemented** (`Put Block` /
-   `Put Block List`) and resumable uploads, with the size checked before Convex
-   commits the blob.
-3. **Malware scan gate**: serve a file only after Defender for Storage reports
-   it clean.
-4. **Stored access policies**, to revoke outstanding URLs without rotating the
+Planned, in priority order. Contributions welcome:
+
+1. **Stored access policies**, to revoke outstanding URLs without rotating the
    key.
-5. **Event Grid** `BlobCreated` webhooks to confirm uploads without a client
-   round trip.
-6. **Copy from URL** (`Put Blob From URL`) for imports that skip Convex.
-7. **Faster sweeps**: parallel deletes, draining large backlogs, and backoff for
-   blobs that fail to delete.
-8. **Reading files from actions**, including range reads.
-9. **Checksums** (`Content-MD5`) verified at upload and confirm.
-10. **Access tiers** (Hot, Cool, Cold, Archive) per file, and lifecycle hints.
-11. **Blob index tags** for lifecycle rules and search across files.
-12. **Encryption scopes** per container or tenant.
-13. **Setup check** that diagnoses the key, container and CORS rule.
+2. **Blob index tags** for lifecycle rules and search across files.
+3. **Encryption scopes** per container or tenant.
 
 ## Development
 

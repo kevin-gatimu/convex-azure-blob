@@ -2599,9 +2599,9 @@ describe("block clientApi", () => {
   const callback = vi.fn();
   const app = defineTestApp({
     schema: defineSchema({ attachments: defineTable({ fileId: v.string() }) }),
-    components: { azureBlob: componentTest },
+    components: { azureBlobStorage: componentTest },
   });
-  const azure = new AzureBlob(app.components.azureBlob, {
+  const azure = new AzureBlob(app.components.azureBlobStorage, {
     config,
     blockUploads: true,
     now: () => T0,
@@ -2703,9 +2703,9 @@ describe("clientApi", () => {
     schema: defineSchema({
       attachments: defineTable({ fileId: v.string(), uploadedBy: v.string() }),
     }),
-    components: { azureBlob: componentTest },
+    components: { azureBlobStorage: componentTest },
   });
-  const azure = new AzureBlob(app.components.azureBlob, {
+  const azure = new AzureBlob(app.components.azureBlobStorage, {
     config,
     now: () => T0,
   });
@@ -2739,7 +2739,7 @@ describe("clientApi", () => {
       onUpload: internal.callbacks.attach,
     }),
   });
-  const gatedAzure = new AzureBlob(app.components.azureBlob, {
+  const gatedAzure = new AzureBlob(app.components.azureBlobStorage, {
     config,
     now: () => gatedNow,
     requireMalwareScan: true,
@@ -2819,7 +2819,8 @@ describe("clientApi", () => {
       "Attachment failed",
     );
     expect(
-      (await t.query(app.components.azureBlob.lib.get, { fileId }))?.status,
+      (await t.query(app.components.azureBlobStorage.lib.get, { fileId }))
+        ?.status,
     ).toBe("pending");
     expect(
       await t.run((ctx) => ctx.db.query("attachments").take(10)),
@@ -2901,14 +2902,14 @@ describe("clientApi", () => {
     ).rejects.toThrow("Failed to process");
     expect(
       (
-        await t.query(app.components.azureBlob.lib.get, {
+        await t.query(app.components.azureBlobStorage.lib.get, {
           fileId: first.fileId,
         })
       )?.status,
     ).toBe("scanning");
     expect(
       (
-        await t.query(app.components.azureBlob.lib.get, {
+        await t.query(app.components.azureBlobStorage.lib.get, {
           fileId: second.fileId,
         })
       )?.status,
@@ -2921,7 +2922,7 @@ describe("clientApi", () => {
     expect(await t.action((ctx) => gatedAzure.scanMalware(ctx))).toBe(1);
     expect(
       (
-        await t.query(app.components.azureBlob.lib.get, {
+        await t.query(app.components.azureBlobStorage.lib.get, {
           fileId: first.fileId,
         })
       )?.status,
@@ -2950,7 +2951,7 @@ describe("clientApi", () => {
   it("refuses caller-supplied uploadedBy, maxBytes and metadata, and records the signed-in user", async () => {
     const t = createTest().withIdentity({ subject: "user1" });
     const claimable = () =>
-      t.mutation(app.components.azureBlob.lib.claimSweepable, {
+      t.mutation(app.components.azureBlobStorage.lib.claimSweepable, {
         pendingBefore: T0 + DAY,
         limit: 10,
         now: T0 + DAY,
@@ -2976,7 +2977,7 @@ describe("clientApi", () => {
     expect(checkUploadSpy).toHaveBeenCalledWith(
       expect.objectContaining({ uploadedBy: "user1" }),
     );
-    const stored = await t.query(app.components.azureBlob.lib.get, {
+    const stored = await t.query(app.components.azureBlobStorage.lib.get, {
       fileId: ticket.fileId,
     });
     expect(stored).toMatchObject({
@@ -3009,11 +3010,14 @@ describe("clientApi", () => {
     ).rejects.toThrow("Not authorized to upload files");
     expect(checkUploadSpy).not.toHaveBeenCalled();
     expect(
-      await anonymous.mutation(app.components.azureBlob.lib.claimSweepable, {
-        pendingBefore: T0 + DAY,
-        limit: 10,
-        now: T0 + DAY,
-      }),
+      await anonymous.mutation(
+        app.components.azureBlobStorage.lib.claimSweepable,
+        {
+          pendingBefore: T0 + DAY,
+          limit: 10,
+          now: T0 + DAY,
+        },
+      ),
     ).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -3030,8 +3034,11 @@ describe("clientApi", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(onUpload).not.toHaveBeenCalled();
     expect(
-      (await anonymous.query(app.components.azureBlob.lib.get, { fileId }))
-        ?.status,
+      (
+        await anonymous.query(app.components.azureBlobStorage.lib.get, {
+          fileId,
+        })
+      )?.status,
     ).toBe("pending");
   });
 

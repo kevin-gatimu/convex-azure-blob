@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         Thanks for taking the time to file a bug. A small, runnable reproduction is the fastest
-        path to a fix. See our [contributing guide](https://github.com/kevin-gatimu/convex-azure-blob/blob/main/CONTRIBUTING.md)
+        path to a fix. See our [contributing guide](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/CONTRIBUTING.md)
         for local setup and checks.
 
         Do not include Azure account keys, connection strings, SAS tokens or URLs,
@@ -50,10 +50,10 @@ body:
   - type: input
     id: package-version
     attributes:
-      label: convex-azure-blob version
+      label: convex-azure-blob-storage version
       description:
-        Run `npm ls convex-azure-blob` in your app, or provide the commit SHA if
-        testing from source.
+        Run `npm ls convex-azure-blob-storage` in your app, or provide the
+        commit SHA if testing from source.
     validations:
       required: true
 
