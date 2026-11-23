@@ -48,12 +48,14 @@ try {
         [manifest.name]: `file:./${packed.filename}`,
         convex: minimumConvex,
         react: minimumReact,
+        "react-test-renderer": minimumReact,
       },
       devDependencies: Object.fromEntries(
         [
           "@edge-runtime/vm",
           "@types/node",
           "@types/react",
+          "@types/react-test-renderer",
           "convex-test",
           "typescript",
           "vite",
@@ -74,8 +76,99 @@ try {
         skipLibCheck: true,
         types: ["node", "vite/client"],
       },
-      include: ["smoke.test.ts"],
+      include: ["smoke.test.ts", "react.test.ts"],
     }),
+  );
+  await writeFile(
+    join(consumer, "tsconfig.bundler.json"),
+    JSON.stringify({
+      extends: "./tsconfig.json",
+      compilerOptions: { module: "ESNext", moduleResolution: "Bundler" },
+    }),
+  );
+  await writeFile(
+    join(consumer, "react.test.ts"),
+    `
+import { createElement } from "react";
+import { act, create } from "react-test-renderer";
+import { describe, expect, it, vi } from "vitest";
+import { useUploadFile, type UploadApi } from "convex-azure-blob/react";
+import { ConvexProvider, type ConvexReactClient } from "convex/react";
+import { makeFunctionReference } from "convex/server";
+
+class FakeXhr {
+  static sent: { method: string; url: string } | null = null;
+  status = 0;
+  method = "";
+  url = "";
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  open(method: string, url: string) { this.method = method; this.url = url; }
+  setRequestHeader() {}
+  send() {
+    FakeXhr.sent = { method: this.method, url: this.url };
+    queueMicrotask(() => {
+      this.upload.onprogress?.({ lengthComputable: true, loaded: 3, total: 3 } as ProgressEvent);
+      this.status = 201;
+      this.onload?.();
+    });
+  }
+  abort() { this.onabort?.(); }
+}
+
+describe("useUploadFile on the minimum React peer", () => {
+  it("renders and completes an upload", async () => {
+    const api: UploadApi<{ contentType: string; fileName?: string; size?: number }> = {
+      generateUploadUrl: makeFunctionReference<"mutation">("files:generateUploadUrl"),
+      confirmUpload: makeFunctionReference<"action">("files:confirmUpload"),
+    } as never;
+    const calls: unknown[] = [];
+    const client = {
+      mutation: async (name: unknown) => {
+        calls.push(name);
+        return { fileId: "f1", uploadUrl: "https://blob.test/uploads/f1", headers: {} };
+      },
+      action: async (name: unknown, args: unknown) => {
+        calls.push(name);
+        expect(args).toEqual({ fileId: "f1" });
+        return { ok: true, size: 3, contentType: "image/png" };
+      },
+    } as unknown as ConvexReactClient;
+    let hook!: ReturnType<typeof useUploadFile>;
+    const seen: Array<number | null> = [];
+    function Harness() {
+      hook = useUploadFile(api);
+      seen.push(hook.progress);
+      return null;
+    }
+    vi.stubGlobal("XMLHttpRequest", FakeXhr);
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    let renderer!: ReturnType<typeof create>;
+    try {
+      await act(async () => {
+        renderer = create(createElement(ConvexProvider, { client }, createElement(Harness)));
+      });
+      expect(hook.isUploading).toBe(false);
+      let fileId: string | undefined;
+      await act(async () => {
+        fileId = await hook.upload(new Blob(["abc"], { type: "image/png" }));
+      });
+      expect(fileId).toBe("f1");
+      expect(FakeXhr.sent).toEqual({ method: "PUT", url: "https://blob.test/uploads/f1" });
+      expect(calls).toEqual([api.generateUploadUrl, api.confirmUpload]);
+      expect(seen).toContain(1);
+      expect(hook.progress).toBeNull();
+      expect(hook.isUploading).toBe(false);
+      expect(hook.error).toBeNull();
+    } finally {
+      await act(async () => renderer?.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+});
+`,
   );
   await writeFile(
     join(consumer, "smoke.test.ts"),
@@ -161,7 +254,9 @@ describe("packed consumer on minimum Convex and React peers", () => {
     );
     assert.equal(installed.version, version, `Expected minimum ${name} peer`);
   }
-  npm(["exec", "--", "tsc", "--project", "tsconfig.json"]);
+  for (const project of ["tsconfig.json", "tsconfig.bundler.json"]) {
+    npm(["exec", "--", "tsc", "--project", project]);
+  }
   npm([
     "exec",
     "--",
@@ -170,6 +265,7 @@ describe("packed consumer on minimum Convex and React peers", () => {
     "--environment",
     "edge-runtime",
     "smoke.test.ts",
+    "react.test.ts",
   ]);
 } finally {
   await rm(consumer, { recursive: true, force: true });
