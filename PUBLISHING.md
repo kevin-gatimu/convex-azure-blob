@@ -3,32 +3,56 @@
 Publish from a clean, committed worktree using an npm account allowed to publish
 `convex-azure-blob-storage`. Use Node.js 24, matching CI, and npm.
 
-## First release
+## Releasing a version
 
-1. Confirm the name and version in `package.json`, and update `CHANGELOG.md`.
-2. Run `npm ci` to install the committed dependency versions.
-3. If component functions or the schema changed, run `npm run build:codegen` and
-   commit the generated files. This requires a configured Convex development
-   deployment; ordinary builds and publish checks use the committed bindings.
-4. Run `npm run check`. This makes a clean build, runs tests, lint and type
-   checks, then tests the packed package in an isolated consumer project.
-5. Run the Azurite integration tests as described in
-   [CONTRIBUTING.md](./CONTRIBUTING.md). CI runs them on every pull request;
-   publishing is manual and runs only the checks in step 4.
-6. Inspect `npm pack --dry-run` for unintended files.
-7. Run `npm login`, then `npm publish`. The publish hook repeats all required
-   checks; do not bypass it with `--ignore-scripts`.
-8. Tag the published commit with an annotated tag:
-   `git tag -a v0.1.0 -m "Release 0.1.0"`, then `git push --follow-tags`.
+`main` is protected: changes, including version bumps, arrive through pull
+requests, and only tags are pushed directly.
 
-Publish `0.1.0` directly for the initial release. `npm run release` increments
-the patch version first, so it would publish `0.1.1`.
+1. On a branch, bump the version without committing or tagging:
+
+   ```sh
+   npm version patch --no-git-tag-version   # or minor, major
+   npm version prerelease --preid alpha --no-git-tag-version   # alpha
+   ```
+
+   Add a `CHANGELOG.md` entry for the version. If component functions or the
+   schema changed, run `npm run build:codegen` and commit the generated files
+   (this needs a configured Convex development deployment).
+
+2. Open a pull request and merge it once CI passes. CI runs the tests on Node 22
+   and 24, Windows, and Azurite.
+
+3. Release from an up-to-date, clean `main`:
+
+   ```sh
+   git switch main && git pull
+   npm login   # once per machine
+   npm run release
+   ```
+
+   `npm run release` stops unless the worktree is clean, the branch matches
+   GitHub, and the version's tag does not exist yet. It then runs `npm publish`,
+   whose `prepublishOnly` hook repeats the full `check`; approve the npm
+   two-factor prompt when asked. Finally it creates the annotated tag (for
+   example `v0.1.2`) and pushes only the tag.
+
+   An alpha version (`0.2.0-alpha.0`) is published under the `alpha` dist-tag
+   and can be released from any pushed branch; users install it with
+   `npm install convex-azure-blob-storage@alpha`.
+
+4. Optionally create a GitHub release from the tag:
+   `gh release create v0.1.2 --verify-tag --notes-file <notes>`.
+
+Before a release, inspect `npm pack --dry-run` for unintended files. Do not
+bypass the publish hook with `--ignore-scripts`.
 
 ## Package scripts for releasing
 
 - `check` performs a clean build, tests, lint, type checks and the packed
   consumer check.
-- `preversion` runs `check` before `npm version` creates a version commit/tag.
+- `preversion` runs `check` before `npm version` bumps the version.
+- `release` publishes the merged version and pushes its tag
+  (`scripts/release.mjs`).
 - `prepublishOnly` runs `check` before any ordinary `npm publish`.
 - `prepare` builds the package during local install and packing.
 - `clean` removes only build output and root TypeScript build caches, using a
@@ -39,32 +63,6 @@ TypeScript imports and runtime entry points, and confirms an upload with a
 transactional callback. It pins the advertised minimum peers (`convex@1.46.0`
 and `react@18.3.1`), including assertions that those versions were installed. It
 requires registry access and removes its temporary project afterward.
-
-## Deploying a new alpha version
-
-```sh
-npm run alpha
-```
-
-This will create a prerelease version with an `@alpha` tag. It will then publish
-the package to npm and push the code and new tag. Users can install the package
-with `npm install convex-azure-blob-storage@alpha`.
-
-## Deploying a new release version
-
-```sh
-npm run release
-```
-
-This will create a patch version and publish as `latest`. It will then publish
-the package to npm and push the code and new tag. To publish a new minor or
-major version, you can run the commands manually:
-
-```sh
-npm version minor # or major
-npm publish
-git push --follow-tags
-```
 
 ## Building a one-off package
 
