@@ -197,7 +197,7 @@ const MAX_MALWARE_SCAN_BATCH = 50;
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SERVER_SAS_TTL_MS = 60 * 1000;
 const MAX_PUT_BLOB_FROM_URL_BYTES = 5000 * 1024 * 1024;
-const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 2 * 24 * 60 * 60 * 1000;
+const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 12 * 60 * 60 * 1000;
 const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
 // Derived from the schema validators so runtime checks can't drift from the stored values.
 const ACCESS_TIERS: readonly string[] = accessTier.members.map((m) => m.value);
@@ -220,6 +220,17 @@ const mediaType = (header: string | null | undefined) =>
 // Canonical base64 of exactly 16 bytes: 22 chars plus "==" padding, with zero trailing bits.
 const isMd5Base64 = (value: string) =>
   /^[A-Za-z0-9+/]{21}[AQgw]==$/.test(value);
+
+// No early exit, so response timing doesn't reveal how much of the secret matched.
+function secretsMatch(expectedSecret: string, actualSecret: string | null) {
+  const encoder = new TextEncoder();
+  const expected = encoder.encode(expectedSecret);
+  const actual = encoder.encode(actualSecret ?? "");
+  let diff = expected.length ^ actual.length;
+  for (let i = 0; i < expected.length; i++)
+    diff |= expected[i] ^ (actual[i] ?? 0);
+  return diff === 0;
+}
 
 function decodeXmlText(value: string) {
   return value
@@ -401,7 +412,7 @@ export class AzureBlob {
       const requestUrl = new URL(request.url);
       if (requestUrl.protocol !== "https:")
         return new Response("HTTPS is required", { status: 400 });
-      if (requestUrl.searchParams.get("secret") !== options.secret)
+      if (!secretsMatch(options.secret, requestUrl.searchParams.get("secret")))
         return new Response("Unauthorized", { status: 401 });
 
       let body: unknown;
@@ -574,7 +585,7 @@ export class AzureBlob {
   }
 
   /**
-   * Refreshes the cached delegation key when it expires within two days. Pass `{ force: true }`
+   * Refreshes the cached delegation key when it expires within twelve hours. Pass `{ force: true }`
    * to replace a still-valid key, e.g. after revoking it in Azure.
    */
   async refreshUserDelegationKey(

@@ -7,7 +7,7 @@ const crons = cronJobs();
 crons.hourly("sweep azure blobs", { minuteUTC: 17 }, internal.photos.sweep, {});
 crons.interval(
   "refresh Azure Blob user delegation key",
-  { hours: 24 },
+  { hours: 1 },
   internal.photos.refreshUserDelegationKey,
   {},
 );

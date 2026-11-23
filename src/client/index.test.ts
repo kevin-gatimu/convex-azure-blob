@@ -41,7 +41,8 @@ const entraConfig = {
 };
 const T0 = Date.UTC(2026, 0, 1, 12, 0, 0);
 const MINUTE = 60_000;
-const DAY = 24 * 60 * MINUTE;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => {
@@ -1853,7 +1854,7 @@ describe("storeFromUrl", () => {
 });
 
 describe("Microsoft Entra user-delegation SAS", () => {
-  it("refreshes only when the cached key has less than two days remaining", async () => {
+  it("refreshes only when the cached key has less than twelve hours remaining", async () => {
     const { t, azure, advance } = setupEntra();
     await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -1868,9 +1869,83 @@ describe("Microsoft Entra user-delegation SAS", () => {
     await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
     expect(fetchMock).not.toHaveBeenCalled();
 
-    advance(6 * DAY);
+    advance(11 * HOUR);
+    await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    advance(HOUR);
     await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("replaces the key at the threshold with a fresh 24-hour one", async () => {
+    const { t, azure, advance } = setupEntra();
+    const cachedKey = (now: number) =>
+      t.query(azure.component.lib.getUserDelegationKey, {
+        accountName: entraConfig.accountName,
+        now,
+      });
+    await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
+    const first = await cachedKey(T0);
+    expect(Date.parse(first!.signedExpiry)).toBe(T0 - 5 * MINUTE + DAY);
+
+    advance(12 * HOUR);
+    await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
+    const second = await cachedKey(T0 + 12 * HOUR);
+    expect(Date.parse(second!.signedExpiry)).toBe(
+      T0 + 12 * HOUR - 5 * MINUTE + DAY,
+    );
+    expect(second!.signedExpiry).not.toBe(first!.signedExpiry);
+  });
+
+  it("never leaves a gap in signing across 48 hours of hourly refreshes", async () => {
+    const { t, azure, advance } = setupEntra();
+    const keyRequests = () =>
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("comp=userdelegationkey"),
+      ).length;
+    const sign = async () => {
+      const ticket = await t.action((ctx) =>
+        azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      );
+      expect(params(ticket.uploadUrl).get("skoid")).toBeTruthy();
+    };
+    await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
+    for (let hour = 1; hour <= 48; hour++) {
+      advance(HOUR);
+      // The cron fires on the hour; signing just before it must still work.
+      await sign();
+      await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
+      await sign();
+    }
+    expect(keyRequests()).toBeGreaterThanOrEqual(3);
+    expect(keyRequests()).toBeLessThanOrEqual(5);
+  });
+
+  it("clamps an upload ticket to the cached key's expiry", async () => {
+    const { t, azure } = setup({
+      config: entraConfig,
+      uploadTtlSeconds: 7 * 24 * 60 * 60,
+    });
+    stubEntra();
+    await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
+    const key = await t.query(azure.component.lib.getUserDelegationKey, {
+      accountName: entraConfig.accountName,
+      now: T0,
+    });
+    const keyExpiry = Date.parse(key!.signedExpiry);
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    const se = Date.parse(params(ticket.uploadUrl).get("se")!);
+    expect(se).toBeLessThanOrEqual(keyExpiry);
+    expect(se).toBeLessThan(T0 + 2 * DAY);
   });
 
   it("force-replaces a still-valid key, and a failed forced refresh keeps the cached one", async () => {
@@ -1890,7 +1965,7 @@ describe("Microsoft Entra user-delegation SAS", () => {
     fetchMock.mockImplementation(async (url, init) => {
       if (String(url).includes("comp=userdelegationkey"))
         return new Response(
-          "<UserDelegationKey><SignedOid>99999999-2222-3333-4444-555555555555</SignedOid><SignedTid>aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</SignedTid><SignedStart>2026-01-01T11:55:00Z</SignedStart><SignedExpiry>2026-01-08T11:55:00Z</SignedExpiry><SignedService>b</SignedService><SignedVersion>2022-11-02</SignedVersion><Value>cmVwbGFjZW1lbnQ=</Value></UserDelegationKey>",
+          "<UserDelegationKey><SignedOid>99999999-2222-3333-4444-555555555555</SignedOid><SignedTid>aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</SignedTid><SignedStart>2026-01-01T11:55:00Z</SignedStart><SignedExpiry>2026-01-02T11:55:00Z</SignedExpiry><SignedService>b</SignedService><SignedVersion>2022-11-02</SignedVersion><Value>cmVwbGFjZW1lbnQ=</Value></UserDelegationKey>",
         );
       return await entra(url, init);
     });
@@ -3648,5 +3723,136 @@ describe("checkSetup", () => {
         expect(text).not.toMatch(/https?:\/\/|sig=|sv=|se=|\?/);
       }
     }
+  });
+});
+
+describe("eventGridHandler authentication", () => {
+  const secret = "a".repeat(32);
+  const unicodeSecret = "é".repeat(32);
+
+  function setupHandler(handlerSecret: string) {
+    const router = httpRouter();
+    const t = convexTest(defineSchema({}), {
+      ...componentTest.modules,
+      "./component/http.ts": async () => ({ default: router }),
+    });
+    const azure = new AzureBlob(register(t), { config, now: () => T0 });
+    router.route({
+      path: "/events",
+      method: "POST",
+      handler: azure.eventGridHandler({ secret: handlerSecret }),
+    });
+    return { t, azure };
+  }
+
+  const validationRequest = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify([
+      {
+        id: "validation",
+        eventType: "Microsoft.EventGrid.SubscriptionValidationEvent",
+        subject: "",
+        eventTime: new Date(T0).toISOString(),
+        dataVersion: "",
+        metadataVersion: "1",
+        data: { validationCode: "code-123" },
+      },
+    ]),
+  };
+
+  const rejected: [string, string][] = [
+    ["differs only in the last character", `${secret.slice(0, -1)}b`],
+    ["differs only in the first character", `b${secret.slice(1)}`],
+    ["is a prefix of the secret", secret.slice(0, -1)],
+    ["has extra trailing characters", `${secret}a`],
+    ["is empty", ""],
+  ];
+
+  it.each(rejected)(
+    "rejects a secret that %s without touching Azure or the file",
+    async (_name, supplied) => {
+      const { t, azure } = setupHandler(secret);
+      const ticket = await t.action((ctx) =>
+        azure.generateUploadUrl(ctx, {
+          contentType: "image/png",
+          uploadedBy: "u1",
+        }),
+      );
+      const doc = (await t.query((ctx) => azure.getFile(ctx, ticket.fileId)))!;
+      fetchMock.mockClear();
+      const response = await t.fetch(`/events?secret=${supplied}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify([
+          {
+            id: "created",
+            eventType: "Microsoft.Storage.BlobCreated",
+            subject: `/blobServices/default/containers/uploads/blobs/${doc.blobName}`,
+            eventTime: new Date(T0).toISOString(),
+            dataVersion: "",
+            metadataVersion: "1",
+            data: {
+              url: `https://127.0.0.1:10000/devstoreaccount1/uploads/${doc.blobName}`,
+            },
+          },
+        ]),
+      });
+      expect(response.status).toBe(401);
+      expect(await response.text()).toBe("Unauthorized");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(
+        await t.query((ctx) => azure.getFile(ctx, ticket.fileId)),
+      ).toMatchObject({ status: "pending" });
+    },
+  );
+
+  it("rejects a missing secret parameter", async () => {
+    const { t } = setupHandler(secret);
+    const response = await t.fetch("/events", validationRequest);
+    expect(response.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects before reading the body", async () => {
+    const { t } = setupHandler(secret);
+    const response = await t.fetch("/events?secret=", {
+      method: "POST",
+      body: "not json",
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it("accepts the correct secret", async () => {
+    const { t } = setupHandler(secret);
+    const response = await t.fetch(
+      `/events?secret=${secret}`,
+      validationRequest,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ validationResponse: "code-123" });
+  });
+
+  it("matches a multibyte secret and rejects a different multibyte character", async () => {
+    const { t } = setupHandler(unicodeSecret);
+    const ok = await t.fetch(
+      `/events?secret=${encodeURIComponent(unicodeSecret)}`,
+      validationRequest,
+    );
+    expect(ok.status).toBe(200);
+
+    const wrongLast = `${"é".repeat(31)}è`;
+    expect(wrongLast.length).toBe(unicodeSecret.length);
+    const bad = await t.fetch(
+      `/events?secret=${encodeURIComponent(wrongLast)}`,
+      validationRequest,
+    );
+    expect(bad.status).toBe(401);
+
+    const ascii = await t.fetch(
+      `/events?secret=${"e".repeat(32)}`,
+      validationRequest,
+    );
+    expect(ascii.status).toBe(401);
   });
 });
