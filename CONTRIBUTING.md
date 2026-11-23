@@ -77,17 +77,23 @@ AZURITE_BLOB_ENDPOINT=http://127.0.0.1:10000/devstoreaccount1 npm test
 These run the security and upload checks against a real storage account. They
 never run in CI or in `npm test`.
 
-1. Copy `.env.example` to `.env.local` (gitignored) and fill in the
-   `AZURE_BLOB_*` values. Each variable is explained there.
+1. Copy `.env.example` to `.env.local` (gitignored) and fill it in. Each
+   variable is explained there.
 2. Use a dedicated private test container. For the Entra tests, the app
    registration needs **Storage Blob Data Contributor** and **Storage Blob
    Delegator** on the account.
 3. Run `npm run test:live`.
 
-Leave the account key or the Entra values empty to skip that group. Values
-already set in your shell override the file. Tests write under
-`live-test/<run id>/` and clean up after themselves, and print only statuses,
-never keys or SAS URLs.
+| Tests                   | Account                                           | Variables                                                                                                                                       |
+| ----------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Microsoft Entra         | the app account                                   | `AZURE_BLOB_ACCOUNT`, `AZURE_BLOB_CONTAINER`, `AZURE_BLOB_ENDPOINT`, `AZURE_BLOB_TENANT_ID`, `AZURE_BLOB_CLIENT_ID`, `AZURE_BLOB_CLIENT_SECRET` |
+| Shared key              | a separate account that allows shared key access  | `AZURE_BLOB_SHARED_KEY_ACCOUNT`, `AZURE_BLOB_SHARED_KEY_CONTAINER`, `AZURE_BLOB_SHARED_KEY`, optional `AZURE_BLOB_SHARED_KEY_ENDPOINT`          |
+| Shared key, alternative | the app account, when it allows shared key access | `AZURE_BLOB_KEY` with the app account's values; leave the `AZURE_BLOB_SHARED_KEY_*` values empty                                                |
+| Optional                | either                                            | `AZURE_BLOB_CORS_ORIGIN` (CORS preflight check), `AZURE_BLOB_COPY_SOURCE` (`storeFromUrl` test)                                                 |
+
+A group whose variables are empty is skipped. Values already set in your shell
+override the file. Tests write under `live-test/<run id>/` and clean up after
+themselves, and print only statuses, never keys or SAS URLs.
 
 Formatting is Prettier (`npm run format`).
 
