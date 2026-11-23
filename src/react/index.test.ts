@@ -498,6 +498,87 @@ describe("useUploadFile", () => {
       },
     );
 
+    it("counts only staged blocks while paused and resumes progress from there", async () => {
+      api.renewUploadUrl = "renew" as unknown as NonNullable<
+        typeof api.renewUploadUrl
+      >;
+      FakeXhr.automatic = false;
+      generateUploadUrl.mockResolvedValue(ticket);
+      renewUploadUrl.mockResolvedValue({
+        ...ticket,
+        uploadUrl: "https://x/y?sig=new",
+      });
+      confirmUpload.mockResolvedValue({
+        ok: true,
+        size: 8,
+        contentType: "image/png",
+      });
+      await mount();
+      let result!: Promise<unknown>;
+      await act(async () => {
+        result = hook.upload(blockFile).catch((caught: unknown) => caught);
+      });
+      await act(async () => {
+        FakeXhr.requests[0]!.status = 201;
+        FakeXhr.requests[0]!.onload?.();
+        FakeXhr.requests[1]!.upload.onprogress?.({
+          lengthComputable: true,
+          loaded: 1,
+          total: 2,
+        } as ProgressEvent);
+      });
+      expect(hook.progress).toBe(0.375);
+      await act(async () => {
+        hook.pause();
+        await result;
+      });
+      expect(hook.progress).toBe(0.25);
+      const before = FakeXhr.requests.length;
+      let resumed!: Promise<string>;
+      await act(async () => {
+        resumed = hook.resume();
+      });
+      expect(hook.progress).toBe(0.25);
+      for (let round = 0; round < 4; round++)
+        await act(async () => {
+          for (const xhr of FakeXhr.requests.slice(before))
+            if (xhr.status === 0) {
+              xhr.status = 201;
+              xhr.onload?.();
+            }
+        });
+      await act(async () => {
+        expect(await resumed).toBe("f1");
+      });
+    });
+
+    it("ends the session when confirmation rejects the file, so only a fresh upload is offered", async () => {
+      generateUploadUrl.mockResolvedValue(ticket);
+      confirmUpload.mockResolvedValue({
+        ok: false,
+        reason: "The file content does not match its type",
+      });
+      await mount();
+      await act(async () => {
+        await expect(hook.upload(blockFile)).rejects.toThrow(
+          "The file content does not match its type",
+        );
+      });
+      expect(hook.canResume).toBe(false);
+      expect(hook.progress).toBeNull();
+      await expect(hook.resume()).rejects.toThrow("No paused upload");
+    });
+
+    it("keeps the session resumable when confirmation reports an expired upload", async () => {
+      generateUploadUrl.mockResolvedValue(ticket);
+      confirmUpload.mockResolvedValue({ ok: false, reason: "Upload expired" });
+      await mount();
+      await act(async () => {
+        await expect(hook.upload(blockFile)).rejects.toThrow("Upload expired");
+      });
+      expect(hook.canResume).toBe(true);
+    });
+
     it("never writes the ticket or file to browser storage", async () => {
       const storage = () => ({
         setItem: vi.fn(),

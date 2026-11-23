@@ -165,6 +165,25 @@ export async function uploadBlocksToAzure(
     options.signal?.removeEventListener("abort", onAbort);
   }
 }
+function stagedFraction(saved: {
+  file: Blob;
+  ticket: UploadTicket;
+  staged: Set<string>;
+}) {
+  const { file, ticket, staged } = saved;
+  const blockSize = ticket.blockSize ?? 0;
+  if (blockSize <= 0 || file.size <= 0) return 0;
+  let done = 0;
+  for (
+    let index = 0;
+    index < MAX_BLOCKS && index * blockSize < file.size;
+    index++
+  )
+    if (staged.has(blockId(index)))
+      done += Math.min(blockSize, file.size - index * blockSize);
+  return done / file.size;
+}
+
 /**
  * PUTs a file to an upload URL from `generateUploadUrl`. Uses XMLHttpRequest, since `fetch` does
  * not report upload progress.
@@ -273,6 +292,20 @@ export function useUploadFile<Args extends GenerateArgs>(api: UploadApi<Args>) {
   const session = useRef<Session | null>(null);
   const [canResume, setCanResume] = useState(false);
 
+  // A refused confirmation is final (the server removed the file), except an expired
+  // ticket, which resume renews; so only that keeps the session resumable.
+  const rejected = useCallback((saved: Session, reason: string) => {
+    if (reason !== "Upload expired" && session.current === saved)
+      session.current = null;
+    return new UploadError(reason);
+  }, []);
+
+  // While paused, progress counts only staged blocks, since in-flight bytes are resent.
+  const keptProgress = useCallback(() => {
+    const saved = session.current;
+    if (saved?.ticket.kind === "blocks") setProgress(stagedFraction(saved));
+  }, []);
+
   useEffect(
     () => () => {
       const active = controller.current;
@@ -305,14 +338,14 @@ export function useUploadFile<Args extends GenerateArgs>(api: UploadApi<Args>) {
       abort.signal.throwIfAborted();
       const result = await confirmUpload({ fileId: saved.ticket.fileId });
       abort.signal.throwIfAborted();
-      if (!result.ok) throw new UploadError(result.reason);
+      if (!result.ok) throw rejected(saved, result.reason);
       if (session.current === saved) {
         session.current = null;
         setCanResume(false);
       }
       return saved.ticket.fileId;
     },
-    [confirmUpload],
+    [confirmUpload, rejected],
   );
 
   const upload = useCallback(
@@ -358,10 +391,11 @@ export function useUploadFile<Args extends GenerateArgs>(api: UploadApi<Args>) {
           controller.current = null;
           setIsUploading(false);
           if (session.current?.ticket.kind !== "blocks") setProgress(null);
+          else keptProgress();
         }
       }
     },
-    [generateUploadUrl, transfer],
+    [generateUploadUrl, transfer, keptProgress],
   );
 
   const pause = useCallback(() => controller.current?.abort(), []);
@@ -381,7 +415,7 @@ export function useUploadFile<Args extends GenerateArgs>(api: UploadApi<Args>) {
     const abort = new AbortController();
     controller.current = abort;
     setError(null);
-    setProgress(0);
+    setProgress(stagedFraction(saved));
     setIsUploading(true);
     setCanResume(false);
     try {
@@ -397,7 +431,7 @@ export function useUploadFile<Args extends GenerateArgs>(api: UploadApi<Args>) {
           return saved.ticket.fileId;
         }
         if (result.reason !== "Upload expired")
-          throw new UploadError(result.reason);
+          throw rejected(saved, result.reason);
       }
       if (api.renewUploadUrl) {
         const ticket = await renew({ fileId: saved.ticket.fileId });
@@ -428,9 +462,17 @@ export function useUploadFile<Args extends GenerateArgs>(api: UploadApi<Args>) {
         controller.current = null;
         setIsUploading(false);
         if (session.current?.ticket.kind !== "blocks") setProgress(null);
+        else keptProgress();
       }
     }
-  }, [api.renewUploadUrl, renew, transfer, confirmUpload]);
+  }, [
+    api.renewUploadUrl,
+    renew,
+    transfer,
+    confirmUpload,
+    rejected,
+    keptProgress,
+  ]);
 
   return {
     upload,
