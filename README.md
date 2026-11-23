@@ -156,8 +156,8 @@ Works when shared key access is disabled. Setup steps are in
 | `AZURE_BLOB_KEY`            | no       | Must be unset, or the shared key is used instead.                                         |
 | `AZURE_BLOB_AUTHORITY_HOST` | no       | Authority base URL for sovereign clouds; defaults to `https://login.microsoftonline.com`. |
 
-Entra mode also needs the hourly `refreshUserDelegationKey` cron described
-below.
+Entra mode also needs the hourly `refreshUserDelegationKey` cron; see
+[Required crons](#required-crons).
 
 With a shared key:
 
@@ -180,6 +180,48 @@ npx convex env set AZURE_BLOB_CLIENT_SECRET   # prompts
 ```
 
 [`.env.example`](./.env.example) lists the same variables, grouped the same way.
+
+### Required crons
+
+The component does some work on a schedule, so add these jobs to your app's
+`convex/crons.ts`. Without them nothing fails at once, but problems build up:
+
+| Job                        | Schedule     | What it does                                                                                   | Needed when                        |
+| -------------------------- | ------------ | ---------------------------------------------------------------------------------------------- | ---------------------------------- |
+| `sweep`                    | hourly       | Deletes blobs of uploads that were never confirmed, and retries deletes that failed            | always                             |
+| `refreshUserDelegationKey` | every hour   | Renews the 24-hour signing key; without it, uploads and signed reads stop when the key expires | you use Microsoft Entra            |
+| `scanMalware`              | every minute | Collects Defender scan verdicts so scanned files become ready                                  | you set `requireMalwareScan: true` |
+
+```ts
+// convex/crons.ts
+import { cronJobs } from "convex/server";
+import { internal } from "./_generated/api";
+
+const crons = cronJobs();
+crons.hourly("sweep azure blobs", { minuteUTC: 17 }, internal.files.sweep, {});
+// Microsoft Entra only. Hourly, not daily: a daily run leaves minutes with no valid key.
+crons.interval(
+  "refresh Azure Blob user delegation key",
+  { hours: 1 },
+  internal.files.refreshUserDelegationKey,
+  {},
+);
+// Only with requireMalwareScan.
+crons.interval(
+  "check malware scan results",
+  { minutes: 1 },
+  internal.files.scanMalware,
+  {},
+);
+export default crons;
+```
+
+`sweep` and `refreshUserDelegationKey` are internal actions you define in
+`convex/files.ts`, shown in [Deleting files](#deleting-files). `scanMalware` is
+returned by `clientApi`, shown in
+[Defender for Storage malware scan gate](#defender-for-storage-malware-scan-gate).
+With Microsoft Entra, also run `refreshUserDelegationKey` once after deploying,
+so a key is cached before the first upload.
 
 ### Microsoft Entra user-delegation SAS
 
@@ -875,7 +917,7 @@ const crons = cronJobs();
 crons.hourly("sweep azure blobs", { minuteUTC: 17 }, internal.files.sweep, {});
 crons.interval(
   "refresh Azure Blob user delegation key",
-  { hours: 24 },
+  { hours: 1 },
   internal.files.refreshUserDelegationKey,
   {},
 );
