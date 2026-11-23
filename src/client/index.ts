@@ -190,6 +190,8 @@ export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_PENDING_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_UPLOAD_TTL_SECONDS = 5 * 60;
 const DEFAULT_READ_WINDOW_SECONDS = 60 * 60;
+const MIN_KEY_REMAINING_MS = 60_000;
+const MAX_TTL_SECONDS = 7 * 24 * 60 * 60;
 const DEFAULT_MALWARE_SCAN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MALWARE_SCAN_BACKOFF_MS = [15_000, 60_000, 5 * 60_000, 15 * 60_000];
 const MAX_MALWARE_SCAN_BATCH = 50;
@@ -325,24 +327,46 @@ function parseEventGridEvents(value: unknown): EventGridEvent[] | null {
 
 function blobAddressFromEventUrl(
   eventUrl: string,
-  endpoint: string,
+  config: Pick<AzureBlobConfig, "accountName" | "endpoint">,
 ): { container: string; blobName: string } | null {
   const segments = (path: string) =>
     path
       .split("/")
       .filter(Boolean)
       .map((segment) => decodeURIComponent(segment));
-  const endpointSegments = segments(new URL(endpoint).pathname);
-  const eventSegments = segments(new URL(eventUrl).pathname);
-  if (
-    endpointSegments.some((segment, index) => eventSegments[index] !== segment)
-  )
-    return null;
-  const [container, ...blobSegments] = eventSegments.slice(
-    endpointSegments.length,
-  );
-  if (!container || blobSegments.length === 0) return null;
-  return { container, blobName: blobSegments.join("/") };
+  const eventUrlParsed = new URL(eventUrl);
+  const eventSegments = segments(eventUrlParsed.pathname);
+  // Events are only trusted for the configured endpoint or the account's own blob host,
+  // which Event Grid reports even when the app serves blobs through a custom domain.
+  for (const base of [
+    config.endpoint,
+    `https://${config.accountName}.blob.core.windows.net`,
+  ]) {
+    const baseUrl = new URL(base);
+    if (eventUrlParsed.origin !== baseUrl.origin) continue;
+    const baseSegments = segments(baseUrl.pathname);
+    if (baseSegments.some((segment, index) => eventSegments[index] !== segment))
+      continue;
+    const [container, ...blobSegments] = eventSegments.slice(
+      baseSegments.length,
+    );
+    if (!container || blobSegments.length === 0) continue;
+    return { container, blobName: blobSegments.join("/") };
+  }
+  return null;
+}
+
+// A rejected fetch can carry the request URL (and its SAS) in its message, so callers get a fixed one.
+async function azureFetch(
+  operation: string,
+  url: string,
+  init?: RequestInit,
+): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch {
+    throw new Error(`Azure Blob ${operation} request failed`);
+  }
 }
 
 // Each path segment is encoded, so `/` keeps separating virtual folders.
@@ -367,16 +391,21 @@ export class AzureBlob {
       throw new Error(
         "Malware scan gating cannot be combined with blockUploads because scan tags are not tied to the immutable snapshot",
       );
-    if (
-      options.blockUploads &&
-      (!Number.isFinite(
+    for (const [seconds, label] of [
+      [
         options.uploadTtlSeconds ?? DEFAULT_UPLOAD_TTL_SECONDS,
-      ) ||
-        (options.uploadTtlSeconds ?? DEFAULT_UPLOAD_TTL_SECONDS) <= 0 ||
-        (options.uploadTtlSeconds ?? DEFAULT_UPLOAD_TTL_SECONDS) >
-          7 * 24 * 60 * 60)
-    )
-      throw new Error("Block upload TTL must be between 0 and 604800 seconds");
+        options.blockUploads ? "Block upload TTL" : "Upload TTL",
+      ],
+      [options.readWindowSeconds ?? DEFAULT_READ_WINDOW_SECONDS, "Read window"],
+    ] as const)
+      if (
+        !Number.isFinite(seconds) ||
+        seconds <= 0 ||
+        seconds > MAX_TTL_SECONDS
+      )
+        throw new Error(
+          `${label} must be between 0 and ${MAX_TTL_SECONDS} seconds`,
+        );
     if (
       options.pathPrefix !== undefined &&
       !PATH_PREFIX.test(options.pathPrefix)
@@ -454,7 +483,7 @@ export class AzureBlob {
         const blobUrl = event.blobUrl;
         if (!blobUrl) continue;
         config ??= this.config();
-        const address = blobAddressFromEventUrl(blobUrl, config.endpoint);
+        const address = blobAddressFromEventUrl(blobUrl, config);
         if (!address || address.container !== config.container) continue;
         const prefix = this.options.pathPrefix;
         if (prefix && !address.blobName.startsWith(`${prefix}/`)) continue;
@@ -582,6 +611,14 @@ export class AzureBlob {
       );
     }
     return key;
+  }
+
+  // Fails before a row is reserved when the key could not sign a usable upload URL.
+  private assertKeyOutlivesUpload(key: UserDelegationKey) {
+    if (Date.parse(key.signedExpiry) - this.now() <= MIN_KEY_REMAINING_MS)
+      throw new Error(
+        "The cached Azure user delegation key expires too soon; run refreshUserDelegationKey",
+      );
   }
 
   /**
@@ -913,6 +950,7 @@ export class AzureBlob {
     const delegationKey = config.accountKey
       ? undefined
       : await this.cachedUserDelegationKey(ctx, config);
+    if (delegationKey) this.assertKeyOutlivesUpload(delegationKey);
     const ttl = delegationKey
       ? Math.min(
           this.uploadTtlMs,
@@ -1015,6 +1053,7 @@ export class AzureBlob {
     const key = config.accountKey
       ? undefined
       : await this.cachedUserDelegationKey(ctx, config);
+    if (key) this.assertKeyOutlivesUpload(key);
     const now = this.now();
     const expiresAt = Math.min(
       now + this.uploadTtlMs,
@@ -1372,7 +1411,7 @@ export class AzureBlob {
       undefined,
       file.snapshot ? { snapshot: file.snapshot } : {},
     );
-    const response = await fetch(request.url, {
+    const response = await azureFetch("read", request.url, {
       method: "GET",
       headers: {
         ...request.headers,
@@ -1435,7 +1474,7 @@ export class AzureBlob {
       undefined,
       file.snapshot ? { snapshot: file.snapshot } : {},
     );
-    const head = await fetch(request.url, {
+    const head = await azureFetch("HEAD", request.url, {
       method: "HEAD",
       ...(request.headers ? { headers: request.headers } : {}),
     });
@@ -1549,7 +1588,7 @@ export class AzureBlob {
           accessToken,
           { comp: "tags" },
         );
-        const response = await fetch(request.url, {
+        const response = await azureFetch("tag read", request.url, {
           method: "GET",
           ...(request.headers ? { headers: request.headers } : {}),
         });
@@ -1648,7 +1687,7 @@ export class AzureBlob {
       undefined,
       accessToken,
     );
-    const deleted = await fetch(deletion.url, {
+    const deleted = await azureFetch("delete", deletion.url, {
       method: "DELETE",
       headers: {
         ...deletion.headers,
@@ -1709,7 +1748,9 @@ export class AzureBlob {
       undefined,
       { comp: "blocklist", blocklisttype: "all" },
     );
-    const list = await fetch(read.url, { headers: read.headers });
+    const list = await azureFetch("block list", read.url, {
+      headers: read.headers,
+    });
     if (list.status === 404) return { ok: false, reason: "Upload not found" };
     if (!list.ok)
       throw new Error(`Azure Blob block list failed with ${list.status}`);
@@ -1746,7 +1787,7 @@ export class AzureBlob {
       file.blobName,
       "r",
     );
-    const head = await fetch(base.url, {
+    const head = await azureFetch("HEAD", base.url, {
       method: "HEAD",
       headers: base.headers,
     });
@@ -1763,7 +1804,7 @@ export class AzureBlob {
       undefined,
       { comp: "blocklist" },
     );
-    const committed = await fetch(commit.url, {
+    const committed = await azureFetch("block commit", commit.url, {
       method: "PUT",
       headers: {
         ...commit.headers,
@@ -1792,7 +1833,7 @@ export class AzureBlob {
       undefined,
       { comp: "snapshot" },
     );
-    const response = await fetch(snapshotRequest.url, {
+    const response = await azureFetch("snapshot", snapshotRequest.url, {
       method: "PUT",
       headers: { ...snapshotRequest.headers, "If-Match": committedEtag },
     });
@@ -1833,7 +1874,7 @@ export class AzureBlob {
     if (this.options.verifyContent === false) return null;
     if (sniffContentType(file.contentType, new Uint8Array()) === undefined)
       return null;
-    const response = await fetch(url, {
+    const response = await azureFetch("GET", url, {
       headers: {
         ...authorizationHeaders,
         range: `bytes=0-${SNIFF_BYTES - 1}`,
@@ -1903,12 +1944,13 @@ export class AzureBlob {
       file.blobName,
       "d",
     );
-    const response = await fetch(request.url, {
+    // A network failure is deferred like a non-2xx answer, so the sweep backs off and retries.
+    const response = await azureFetch("delete", request.url, {
       method: "DELETE",
       headers: { ...request.headers, "x-ms-delete-snapshots": "include" },
-    });
+    }).catch(() => undefined);
     const now = this.now();
-    if (!response.ok && response.status !== 404) {
+    if (!response || (!response.ok && response.status !== 404)) {
       await ctx.runMutation(this.component.lib.deferSweep, {
         fileId: file.fileId,
         now,
@@ -2024,7 +2066,7 @@ export class AzureBlob {
       uploadExpiresAt,
       accessToken,
     );
-    const response = await fetch(request.url, {
+    const response = await azureFetch("upload", request.url, {
       method: "PUT",
       headers: {
         ...request.headers,

@@ -497,11 +497,14 @@ The handler answers Event Grid's subscription-validation handshake, confirms
 tracked blobs through the same size, type, and signature checks as the browser,
 and runs the configured `onUpload` mutation atomically. Duplicate events and
 browser/event races are safe; unknown blobs, containers, and event types are
-acknowledged without changes. Transient confirmation failures return HTTP 503 so
-Event Grid retries them. Keep the endpoint on HTTPS. Query-string secrets can
-appear in URLs, deployment settings, or access logs; restrict access to those
-records, avoid logging the full request URL, and rotate the Convex secret and
-Event Grid subscription endpoint together.
+acknowledged without changes. Events are accepted only for blobs on the
+configured endpoint's host or the account's own
+`https://<account>.blob.core.windows.net` host, in the configured container and
+prefix. Transient confirmation failures return HTTP 503 so Event Grid retries
+them. Keep the endpoint on HTTPS. Query-string secrets can appear in URLs,
+deployment settings, or access logs; restrict access to those records, avoid
+logging the full request URL, and rotate the Convex secret and Event Grid
+subscription endpoint together.
 
 ### Defender for Storage malware scan gate
 
@@ -1084,8 +1087,8 @@ complete test with Azure stubbed.
 | `requireMalwareScan`  | `false`                         | Poll Defender scan tags before serving; requires the `clientApi` scan action cron and cannot be combined with `blockUploads`.             |
 | `accessTier`          | none                            | Server-side ready-file tier: Hot, Cool, Cold, or Archive.                                                                                 |
 | `pathPrefix`          | none                            | Virtual folder for new blobs, e.g. `"users/avatars"`.                                                                                     |
-| `uploadTtlSeconds`    | 300                             | Lifetime of upload URLs.                                                                                                                  |
-| `readWindowSeconds`   | 3600                            | Signing window for read URLs. Each URL is valid for one to two windows.                                                                   |
+| `uploadTtlSeconds`    | 300                             | Lifetime of upload URLs, from 1 to 604800 (seven days).                                                                                   |
+| `readWindowSeconds`   | 3600                            | Signing window for read URLs, from 1 to 604800. Each URL is valid for one to two windows.                                                 |
 | `verifyContent`       | `true`                          | Check leading bytes against the file signature at confirm.                                                                                |
 | `httpsOnly`           | `true` for `https://` endpoints | Sign tokens with `spr=https`.                                                                                                             |
 
