@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.1
+
+Documentation only; no code changes.
+
+- README: a new "Required crons" section lists the `sweep`,
+  `refreshUserDelegationKey` and `scanMalware` jobs, when each is needed, and
+  what breaks without them.
+- README: the "Deleting files" cron example now refreshes the user delegation
+  key hourly instead of every 24 hours, which left minutes each day with no
+  valid key.
+- README: a Convex Components directory badge.
+
 ## 0.1.0
 
 First public release, as `convex-azure-blob-storage`.
