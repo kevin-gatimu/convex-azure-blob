@@ -1,4 +1,4 @@
-import { AzureBlob } from "convex-azure-blob";
+import { AzureBlob } from "convex-azure-blob-storage";
 import type { Auth } from "convex/server";
 import { ConvexError, v } from "convex/values";
 import { ALLOWED_CONTENT_TYPES, MAX_FILE_BYTES } from "../upload-policy";
@@ -11,7 +11,7 @@ import {
 } from "./_generated/server.js";
 
 // One instance per container or prefix. Configuration comes from the AZURE_BLOB_* variables.
-export const azure = new AzureBlob(components.azureBlob, {
+export const azure = new AzureBlob(components.azureBlobStorage, {
   maxBytes: MAX_FILE_BYTES,
   allowedContentTypes: ALLOWED_CONTENT_TYPES,
   blockUploads: true,

@@ -1,147 +1,69 @@
 # Changelog
 
-## Unreleased
-
-- **Breaking:** the `AzureBlob` constructor now throws unless `uploadTtlSeconds`
-  and `readWindowSeconds` are finite and between 0 and 604800 seconds, for every
-  configuration, not only block uploads. The errors read "Upload TTL must be
-  between 0 and 604800 seconds" and "Read window must be between 0 and 604800
-  seconds"; block uploads keep "Block upload TTL ...".
-- Hardening. Event Grid events are ignored unless their blob URL is on the
-  configured endpoint's origin or the account's own
-  `https://<account>.blob.core.windows.net` host, and in the configured
-  container and prefix. Network failures talking to Azure now throw "Azure Blob
-  <operation> request failed" without the request URL or SAS, and a failed
-  delete during `sweep` is deferred and retried. The component's `markReady`
-  refuses a pending file that requires a malware scan. With Microsoft Entra
-  credentials, `generateUploadUrl` and `renewUploadUrl` throw "The cached Azure
-  user delegation key expires too soon; run refreshUserDelegationKey" before
-  reserving a row when the key has a minute or less left.
-- User delegation keys are now requested for 24 hours and refreshed when less
-  than 12 hours remain (was 7 days and 2 days). **Action needed with Microsoft
-  Entra credentials:** run `refreshUserDelegationKey` hourly; a daily cron
-  leaves about five minutes a day with no valid key, when uploads and signed
-  reads fail. The example cron is updated. Entra-mode upload and read SAS
-  expiries are capped at the cached key's expiry, so `uploadTtlSeconds` or read
-  windows longer than about 12 hours are shortened.
-- The Event Grid secret is now compared in constant time.
-- `useUploadFile`: when `confirmUpload` rejects a block upload for any reason
-  other than "Upload expired", `canResume` is now false, because the server has
-  deleted the file; before, `resume()` was offered and failed with "Unknown
-  upload". While paused, `progress` now counts only stored blocks, and
-  `resume()` starts from that value instead of 0. The example shows the saved
-  percentage on paused rows.
-- Add `AzureBlob.checkSetup(ctx, { origin?, checksum? })` and the exported
-  `SetupCheck` and `SetupResult` types. It checks the config, credentials,
-  container and, given an origin, the CORS preflight for the headers the
-  uploader sends, and returns fix hints keyed on Azure error codes. The result
-  never contains the key, a SAS, a token, or a URL. The example app exposes it
-  as the internal `photos:checkSetup` action.
-- Add server-side access tier defaults, `setTier`, `rehydrate`, and
-  `refreshTier`, plus exported access-tier/archive-status validators and
-  optional file properties. Archived files stay unservable through rehydration;
-  failed automatic tiering preserves ready files and reads their actual tier.
-  The README covers pricing, lifecycle policies, polling, and archived snapshot
-  restrictions.
-- Add optional `md5` (base64 of a 16-byte digest, computed by the app) to
-  `generateUploadUrl` and the `clientApi` mutation. The ticket carries
-  `Content-MD5`, so Azure refuses a mismatched body, and `confirmUpload` rejects
-  and deletes a blob whose checksum is missing or different
-  (`Checksum mismatch`). New optional `files.md5` field. Not supported with
-  `blockUploads`; add `content-md5` to the CORS allowed headers to use it from
-  browsers.
-- Add bounded sweep concurrency (default 8) and optional internal-action drain
-  scheduling with `continueWith`, `run`, and `maxRuns` (default 10). Failed blob
-  deletes use exponential backoff capped at 24 hours; live upload URLs defer
-  cleanup until expiry plus clock skew. File records gain optional
-  `nextAttemptAt` and `sweepAttempts`; the component adds `deferSweep` and an
-  indexed due-time selection. The README documents the options and cron wrapper.
-- Add `AzureBlob.read(ctx, fileId, { range? })` to read a ready file's bytes
-  from an action, optionally an inclusive byte range (206). It returns null for
-  an unknown or not-ready file, and throws without exposing the URL or SAS when
-  Azure answers with an error.
-- Add `storeFromUrl` to copy HTTPS sources directly into Azure Blob Storage,
-  then apply the normal size, content-type and signature checks. Azure's
-  synchronous copy is limited to 5,000 MiB; the README documents source URL
-  validation and the source's `Content-Length` requirement.
-- Add `eventGridHandler({ secret, onUpload? })` for standard-schema Azure Event
-  Grid `BlobCreated` events. It handles subscription validation, confirms
-  tracked uploads through the normal checks, and makes repeated delivery safe.
-  Transient confirmation failures return a retryable status. The README covers
-  the HTTPS route, shared-secret setup, Azure CLI subscription, and rotation.
-- Add opt-in Defender for Storage malware scanning with internal polling,
-  `scanning`/`rejected`/`scan_timed_out` statuses, and a 24-hour timeout.
-  `onUpload` runs only after a clean verdict; block uploads cannot enable this
-  gate because their mutable blob tags cannot verify the immutable snapshot.
-  Blob index tags must be enabled, and hierarchical-namespace accounts are not
-  supported. Rejected-blob cleanup persists through upload SAS expiry, and
-  scanner failures are retried independently without blocking the batch.
-- Add opt-in resumable browser block uploads via `blockUploads`, block ticket
-  metadata, owner-authorized `renewUploadUrl`, and React `pause`, `resume`, and
-  `canResume`. The default single-PUT flow and server-side `store` remain
-  unchanged. Confirmed block files use immutable snapshot reads.
-- Expand the React example to single and multi-file queues, image/document/
-  archive/audio/video uploads, progress, pause/resume, explicit connection and
-  deletion errors, and a clear explanation of the direct Azure/Convex flow. Keep
-  signature validation and document finite Azure limits and the shared demo
-  identity.
-- Fix development script quoting for Windows.
-- Add a View file action to the example that opens the verified read URL in a
-  new tab, separate from the attachment download.
-- Add Microsoft Entra client-credential authentication and user-delegation SAS
-  for accounts with shared-key access disabled. The account-key path remains
-  preferred when `AZURE_BLOB_KEY` is configured.
-- Add `refreshUserDelegationKey` for caching delegation keys, and allow
-  `urlForFile` to receive a query context so it can sign URLs without network
-  calls. See the README for role assignments, configuration, and key-revocation
-  guidance.
-- `AzureBlobConfig.authorityHost` is optional again, so existing config objects
-  still compile; Entra token requests default to
-  `https://login.microsoftonline.com`.
-- `refreshUserDelegationKey` accepts `{ force: true }` to replace a still-valid
-  cached key after revocation; the example action forwards `force`.
-- Renewing an upload never shortens the cleanup expiry tracked for an earlier
-  issued URL, and the sweep no longer lets young short-lived uploads starve
-  eligible older ones.
-- The example shows Retry for every failed upload, even when a resume cannot
-  continue.
-- Keep pre-release file records without `uploadExpiresAt` compatible with schema
-  updates; cleanup applies a conservative expiry fallback without rewriting or
-  deleting those records.
-
 ## 0.1.0
 
-First public release.
+First public release, as `convex-azure-blob-storage`.
 
-- Confirmation and its optional `onUpload` attachment commit atomically.
-  `onUpload` is an internal mutation reference accepting `{ fileId }`, not an
-  action callback. Failed attachments roll back confirmation and can be retried;
-  repeated confirmations do not duplicate committed attachments.
-- Sweep claims stale uploads transactionally, preventing deletion of a file that
-  confirmed first. Confirmation refuses files already claimed for deletion.
-- Each file records its issued `uploadExpiresAt`, so cleanup retains tracking
-  until that expiry plus clock-skew allowance even if client TTL settings
-  change. Legacy rows without this field use the configured upload TTL (with a
-  one-hour minimum) as a cleanup fallback.
-- Upload hooks isolate overlapping uploads, honor cancellation while waiting for
-  tickets, and abort active transfers on unmount.
-- Publishing enforces clean build, tests, lint, types and a packed-consumer
-  check against the minimum supported Convex and React versions.
-- The minimum Convex version is 1.46, matching the `convex-helpers` dependency.
-  Packed-consumer installation rejects peer dependency conflicts.
+### Uploads
+
 - Direct browser uploads to Azure Blob Storage with create-only, single-blob,
   short-lived SAS URLs. SAS signing uses Web Crypto, with no Azure SDK.
 - `confirmUpload` checks the stored blob's size, content type and file signature
-  (magic bytes) before a file is served.
-- Read URLs signed per time window, with optional download file names
-  (`Content-Disposition`) and `Cache-Control` overrides, or a public or CDN base
-  URL.
+  (magic bytes) before a file is served, and deletes a blob that fails.
+- Optional `md5` on `generateUploadUrl`: the ticket carries `Content-MD5`, so
+  Azure refuses a different body, and confirmation rejects a missing or
+  different checksum (`Checksum mismatch`). Not available with block uploads.
+- Opt-in resumable block uploads (`blockUploads`) with owner-authorized
+  `renewUploadUrl`. Confirmed block files are served from an immutable snapshot.
+- Confirmation and its optional `onUpload` internal mutation commit atomically;
+  repeated confirmations are safe.
+- `eventGridHandler({ secret, onUpload? })` confirms uploads from Azure Event
+  Grid `BlobCreated` events. The secret is compared in constant time, and events
+  are ignored unless they come from the configured endpoint or the account's own
+  blob host, container and prefix.
+- Opt-in Defender for Storage malware scan gate: `onUpload` runs only after a
+  clean verdict, with `scanning`, `rejected` and `scan_timed_out` statuses.
+- Server-side `store` and `storeFromUrl` (Azure copy from an HTTPS URL), with
+  the same size, type and signature checks.
+
+### Reading and serving
+
+- Read URLs signed per time window, with optional download file names and
+  `Cache-Control` overrides, or a public or CDN base URL.
+- `AzureBlob.read(ctx, fileId, { range? })` reads a ready file's bytes from an
+  action, optionally a byte range.
+- Access tier defaults, `setTier`, `rehydrate` and `refreshTier`; archived files
+  are not served until rehydrated.
 - File names, string metadata, and paginated listing per uploader.
+
+### Deleting and cleanup
+
 - Transactional `markForDeletion`, `purge`, and a `sweep` for abandoned uploads
-  and failed deletes.
-- Server-side `store` for imports and migrations.
-- Several containers and `pathPrefix` folders through one component.
-- HTTPS-only tokens for `https://` endpoints.
+  and failed deletes, with bounded concurrency, backlog draining, and
+  exponential backoff for blobs that fail to delete.
+
+### Authentication
+
+- Shared account key, or Microsoft Entra client credentials with user delegation
+  SAS for accounts that disable shared key access. Delegation keys are requested
+  for 24 hours and cached; run `refreshUserDelegationKey` hourly. In Entra mode,
+  SAS expiries are capped at the cached key's expiry.
+
+### Safety limits
+
+- `uploadTtlSeconds` and `readWindowSeconds` must be between 0 and 604800
+  seconds; the constructor throws otherwise.
+- Network failures talking to Azure throw
+  `Azure Blob <operation> request failed` without the request URL or SAS.
+  `checkSetup` results never contain a key, SAS, token or URL.
+
+### Tooling
+
+- `AzureBlob.checkSetup(ctx, { origin?, checksum? })` checks config,
+  credentials, container and CORS, with fix hints.
 - `clientApi()` for ready-made upload functions, and the `useUploadFile` React
-  hook with progress and cancel.
-- `convex-azure-blob/test` helper for convex-test.
+  hook with progress, cancel, pause and resume. A file that confirmation rejects
+  cannot be resumed; while paused, `progress` counts only stored blocks.
+- Several containers and `pathPrefix` folders through one component.
+- `convex-azure-blob-storage/test` helper for convex-test.
+- Requires `convex` 1.46 or later; `react` 18.3.1 or 19 is optional.

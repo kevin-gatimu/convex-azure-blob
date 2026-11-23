@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const npmCli = process.env.npm_execpath;
 assert.ok(npmCli, "Run this check with npm run lint:package");
-const dest = await mkdtemp(join(tmpdir(), "convex-azure-blob-lint-"));
+const dest = await mkdtemp(join(tmpdir(), "convex-azure-blob-storage-lint-"));
 
 function npm(args, capture = false) {
   const result = spawnSync(process.execPath, [npmCli, ...args], {

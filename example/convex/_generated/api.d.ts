@@ -51,5 +51,5 @@ export declare const internal: FilterApi<
 >;
 
 export declare const components: {
-  azureBlob: import("convex-azure-blob/_generated/component.js").ComponentApi<"azureBlob">;
+  azureBlobStorage: import("convex-azure-blob-storage/_generated/component.js").ComponentApi<"azureBlobStorage">;
 };

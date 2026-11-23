@@ -1,11 +1,11 @@
 # Contributing
 
 Thanks for helping. Bug reports and pull requests are welcome at
-<https://github.com/kevin-gatimu/convex-azure-blob>.
+<https://github.com/kevin-gatimu/convex-azure-blob-storage>.
 
 ## Reporting bugs and requesting features
 
-[Open an issue](https://github.com/kevin-gatimu/convex-azure-blob/issues/new/choose)
+[Open an issue](https://github.com/kevin-gatimu/convex-azure-blob-storage/issues/new/choose)
 and choose **Bug report** or **Feature request**. Search existing issues first
 to avoid duplicates.
 
@@ -23,7 +23,7 @@ deployment keys, or other secrets in reports, logs, or screenshots.
 | `src/component/`            | The Convex component: the `files` table (`schema.ts`) and its functions (`lib.ts`).               |
 | `src/client/`               | The `AzureBlob` class apps use, SAS signing (`sas.ts`) and the file signature check (`sniff.ts`). |
 | `src/react/`                | `useUploadFile` and `uploadToAzure`.                                                              |
-| `src/test.ts`               | The `convex-azure-blob/test` helper for convex-test.                                              |
+| `src/test.ts`               | The `convex-azure-blob-storage/test` helper for convex-test.                                      |
 | `example/`                  | An app that installs the component: `example/convex` backend, `example/src` UI.                   |
 | `scripts/azurite-setup.mjs` | Creates the container and CORS rule on a local Azurite.                                           |
 

@@ -1,5 +1,5 @@
 import "./App.css";
-import { useUploadFile } from "convex-azure-blob/react";
+import { useUploadFile } from "convex-azure-blob-storage/react";
 import { useConvexConnectionState, useMutation, useQuery } from "convex/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
@@ -494,7 +494,7 @@ export default function App() {
           <span className="brand-mark" aria-hidden="true">
             B
           </span>{" "}
-          convex-azure-blob
+          convex-azure-blob-storage
         </a>
         <div
           className={`connection ${isWebSocketConnected ? "online" : ""}`}
@@ -561,7 +561,7 @@ export default function App() {
           share the same library. Do not upload sensitive files.
         </p>
         <a
-          href="https://github.com/kevin-gatimu/convex-azure-blob"
+          href="https://github.com/kevin-gatimu/convex-azure-blob-storage"
           target="_blank"
           rel="noreferrer"
         >

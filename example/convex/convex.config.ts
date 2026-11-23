@@ -1,7 +1,7 @@
 import { defineApp } from "convex/server";
-import azureBlob from "convex-azure-blob/convex.config.js";
+import azureBlobStorage from "convex-azure-blob-storage/convex.config.js";
 
 const app = defineApp();
-app.use(azureBlob);
+app.use(azureBlobStorage);
 
 export default app;

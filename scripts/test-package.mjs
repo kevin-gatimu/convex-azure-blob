@@ -11,7 +11,9 @@ const minimumConvex = "1.46.0";
 const minimumReact = "18.3.1";
 assert.equal(manifest.peerDependencies.convex, `^${minimumConvex}`);
 assert.ok(manifest.peerDependencies.react.startsWith(`^${minimumReact}`));
-const consumer = await mkdtemp(join(tmpdir(), "convex-azure-blob-package-"));
+const consumer = await mkdtemp(
+  join(tmpdir(), "convex-azure-blob-storage-package-"),
+);
 const npmCli = process.env.npm_execpath;
 assert.ok(npmCli, "Run this check with npm run test:package");
 
@@ -92,7 +94,7 @@ try {
 import { createElement } from "react";
 import { act, create } from "react-test-renderer";
 import { describe, expect, it, vi } from "vitest";
-import { useUploadFile, type UploadApi } from "convex-azure-blob/react";
+import { useUploadFile, type UploadApi } from "convex-azure-blob-storage/react";
 import { ConvexProvider, type ConvexReactClient } from "convex/react";
 import { makeFunctionReference } from "convex/server";
 
@@ -174,13 +176,13 @@ describe("useUploadFile on the minimum React peer", () => {
     join(consumer, "smoke.test.ts"),
     `
 import { describe, expect, it, vi } from "vitest";
-import { AzureBlob, type UploadCallback } from "convex-azure-blob";
-import { uploadToAzure, useUploadFile } from "convex-azure-blob/react";
-import component from "convex-azure-blob/convex.config";
-import componentJs from "convex-azure-blob/convex.config.js";
-import componentTest from "convex-azure-blob/test";
-import type { ComponentApi } from "convex-azure-blob/_generated/component";
-import type { ComponentApi as ComponentApiJs } from "convex-azure-blob/_generated/component.js";
+import { AzureBlob, type UploadCallback } from "convex-azure-blob-storage";
+import { uploadToAzure, useUploadFile } from "convex-azure-blob-storage/react";
+import component from "convex-azure-blob-storage/convex.config";
+import componentJs from "convex-azure-blob-storage/convex.config.js";
+import componentTest from "convex-azure-blob-storage/test";
+import type { ComponentApi } from "convex-azure-blob-storage/_generated/component";
+import type { ComponentApi as ComponentApiJs } from "convex-azure-blob-storage/_generated/component.js";
 import { defineTestApp } from "convex-test";
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
@@ -194,9 +196,9 @@ describe("packed consumer on minimum Convex and React peers", () => {
   it("registers the shipped component and commits an upload callback", async () => {
     const app = defineTestApp({
       schema: defineSchema({ attachments: defineTable({ fileId: v.string() }) }),
-      components: { azureBlob: componentTest },
+      components: { azureBlobStorage: componentTest },
     });
-    const reference: ComponentApi & ComponentApiJs = app.components.azureBlob;
+    const reference: ComponentApi & ComponentApiJs = app.components.azureBlobStorage;
     const azure = new AzureBlob(reference, {
       config: {
         accountName: "test", accountKey: btoa("test key"),
