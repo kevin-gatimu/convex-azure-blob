@@ -1,7 +1,7 @@
 # Publishing
 
 Publish from a clean, committed worktree using an npm account allowed to publish
-`convex-azure-blob`. Use Node.js 24, matching CI, and npm.
+`convex-azure-blob-storage`. Use Node.js 24, matching CI, and npm.
 
 ## First release
 
@@ -13,10 +13,11 @@ Publish from a clean, committed worktree using an npm account allowed to publish
 4. Run `npm run check`. This makes a clean build, runs tests, lint and type
    checks, then tests the packed package in an isolated consumer project.
 5. Run the Azurite integration tests as described in
-   [CONTRIBUTING.md](./CONTRIBUTING.md). CI also runs these before release.
+   [CONTRIBUTING.md](./CONTRIBUTING.md). CI runs them on every pull request;
+   publishing is manual and runs only the checks in step 4.
 6. Inspect `npm pack --dry-run` for unintended files.
-7. Run `npm login`, then `npm publish --access public`. The publish hook repeats
-   all required checks; do not bypass it with `--ignore-scripts`.
+7. Run `npm login`, then `npm publish`. The publish hook repeats all required
+   checks; do not bypass it with `--ignore-scripts`.
 8. Tag the published commit with an annotated tag:
    `git tag -a v0.1.0 -m "Release 0.1.0"`, then `git push --follow-tags`.
 
@@ -47,7 +48,7 @@ npm run alpha
 
 This will create a prerelease version with an `@alpha` tag. It will then publish
 the package to npm and push the code and new tag. Users can install the package
-with `npm install convex-azure-blob@alpha`.
+with `npm install convex-azure-blob-storage@alpha`.
 
 ## Deploying a new release version
 
