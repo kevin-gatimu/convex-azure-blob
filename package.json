@@ -20,6 +20,7 @@
     "sas"
   ],
   "type": "module",
+  "sideEffects": false,
   "scripts": {
     "dev": "convex dev --typecheck-components --start \"npm run dev:build\"",
     "dev:frontend": "cd example && vite",
@@ -35,10 +36,12 @@
     "format": "prettier --write .",
     "test": "vitest run --typecheck",
     "test:package": "npm run build && node scripts/test-package.mjs",
+    "lint:package": "npm run build && node scripts/lint-package.mjs",
+    "test:live": "node scripts/test-live.mjs",
     "test:watch": "vitest --typecheck --clearScreen false",
     "test:coverage": "vitest run --coverage --coverage.reporter=text",
     "prepare": "npm run build",
-    "check": "npm run build:clean && npm run test && npm run lint && npm run typecheck && npm run test:package",
+    "check": "npm run build:clean && npm run test && npm run lint && npm run typecheck && npm run lint:package && npm run test:package",
     "prepublishOnly": "npm run check",
     "preversion": "npm run check",
     "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
@@ -88,6 +91,7 @@
     "convex-helpers": "^0.1.128"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "0.18.5",
     "@convex-dev/eslint-plugin": "^5.0.0",
     "@edge-runtime/vm": "^5.0.0",
     "@eslint/eslintrc": "^3.3.6",
@@ -97,6 +101,7 @@
     "@types/react-dom": "^19.2.4",
     "@types/react-test-renderer": "^19.1.0",
     "@vitejs/plugin-react": "^6.0.5",
+    "@vitest/coverage-v8": "4.1.12",
     "chokidar-cli": "3.0.0",
     "convex": "^1.47.0",
     "convex-test": "^0.0.62",
@@ -107,6 +112,7 @@
     "globals": "^17.9.0",
     "pkg-pr-new": "^0.0.86",
     "prettier": "3.9.6",
+    "publint": "0.3.25",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-test-renderer": "^19.2.8",

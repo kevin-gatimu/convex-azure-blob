@@ -285,6 +285,8 @@ export const markReady = mutation({
     if (!row || row.status === "deleting") return null;
     if (row.status === "ready") return toDoc(row);
     if (row.status !== "pending" && row.status !== "scanning") return null;
+    // A scan-gated file must pass through markScanning before it can be ready.
+    if (row.malwareScanRequired && row.status === "pending") return null;
     if (
       row.uploadMode === "blocks" &&
       (!row.snapshot ||

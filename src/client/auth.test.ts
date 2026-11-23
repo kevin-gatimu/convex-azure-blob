@@ -174,4 +174,43 @@ describe("requestUserDelegationKey", () => {
       requestUserDelegationKey(config, Date.UTC(2026, 0, 1)),
     ).rejects.toThrow("missing SignedOid");
   });
+
+  it.each([
+    ["a non-blob SignedService", { SignedService: "c" }],
+    ["an uppercase SignedService", { SignedService: "B" }],
+    ["an unparseable SignedStart", { SignedStart: "yesterday" }],
+    ["an unparseable SignedExpiry", { SignedExpiry: "not-a-date" }],
+  ])("refuses a key response with %s without echoing it", async (_n, patch) => {
+    const fields: Record<string, string> = {
+      SignedOid: "11111111-2222-3333-4444-555555555555",
+      SignedTid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      SignedStart: "2026-01-01T11:55:00Z",
+      SignedExpiry: "2026-01-02T11:55:00Z",
+      SignedService: "b",
+      SignedVersion: "2022-11-02",
+      Value: "c2VjcmV0LWtleS12YWx1ZQ==",
+      ...patch,
+    };
+    const xml = Object.entries(fields)
+      .map(([name, value]) => `<${name}>${value}</${name}>`)
+      .join("");
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "access-token" })),
+      )
+      .mockResolvedValueOnce(
+        new Response(`<UserDelegationKey>${xml}</UserDelegationKey>`),
+      );
+    const error = await requestUserDelegationKey(
+      config,
+      Date.UTC(2026, 0, 1, 12),
+    ).then(
+      () => undefined,
+      (caught: unknown) => caught as Error,
+    );
+    expect(error?.message).toBe(
+      "Azure Blob returned an invalid user delegation key",
+    );
+    expect(error?.message.includes(fields.Value!)).toBe(false);
+  });
 });

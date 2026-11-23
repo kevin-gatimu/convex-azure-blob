@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Breaking:** the `AzureBlob` constructor now throws unless `uploadTtlSeconds`
+  and `readWindowSeconds` are finite and between 0 and 604800 seconds, for every
+  configuration, not only block uploads. The errors read "Upload TTL must be
+  between 0 and 604800 seconds" and "Read window must be between 0 and 604800
+  seconds"; block uploads keep "Block upload TTL ...".
+- Hardening. Event Grid events are ignored unless their blob URL is on the
+  configured endpoint's origin or the account's own
+  `https://<account>.blob.core.windows.net` host, and in the configured
+  container and prefix. Network failures talking to Azure now throw "Azure Blob
+  <operation> request failed" without the request URL or SAS, and a failed
+  delete during `sweep` is deferred and retried. The component's `markReady`
+  refuses a pending file that requires a malware scan. With Microsoft Entra
+  credentials, `generateUploadUrl` and `renewUploadUrl` throw "The cached Azure
+  user delegation key expires too soon; run refreshUserDelegationKey" before
+  reserving a row when the key has a minute or less left.
 - User delegation keys are now requested for 24 hours and refreshed when less
   than 12 hours remain (was 7 days and 2 days). **Action needed with Microsoft
   Entra credentials:** run `refreshUserDelegationKey` hourly; a daily cron

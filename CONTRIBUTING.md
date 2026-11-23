@@ -6,8 +6,8 @@ Thanks for helping. Bug reports and pull requests are welcome at
 ## Reporting bugs and requesting features
 
 [Open an issue](https://github.com/kevin-gatimu/convex-azure-blob/issues/new/choose)
-and choose **Bug report** or **Feature request**. Search existing issues first to
-avoid duplicates.
+and choose **Bug report** or **Feature request**. Search existing issues first
+to avoid duplicates.
 
 For bugs, include a minimal reproduction, expected and actual behavior, package
 and runtime versions, and whether you use Azure Blob Storage or Azurite. For
@@ -51,8 +51,14 @@ npm run build:codegen  # component codegen, then build to dist/
 npm run typecheck
 npm run lint
 npm test
-npm run test:package  # tarball imports and upload flow with minimum peers
+npm run test:coverage # tests with v8 coverage; fails below the thresholds in vitest.config.js
+npm run lint:package  # publint and Are the Types Wrong on the packed tarball
+npm run test:package  # tarball imports (NodeNext and Bundler), upload flow and a React 18 render with minimum peers
 ```
+
+Run commands from a path with an uppercase drive letter on Windows (`D:\...`).
+Vitest fails every suite when started from a lowercase `d:` path, which Git
+Bash's `/d/...` produces.
 
 `npm run check` runs all release checks, including the isolated consumer test.
 The consumer test requires registry access; component codegen additionally
@@ -65,6 +71,23 @@ Azurite, which checks real SAS signatures:
 docker compose up -d azurite && npm run azurite:setup
 AZURITE_BLOB_ENDPOINT=http://127.0.0.1:10000/devstoreaccount1 npm test
 ```
+
+## Live Azure tests
+
+These run the security and upload checks against a real storage account. They
+never run in CI or in `npm test`.
+
+1. Copy `.env.example` to `.env.local` (gitignored) and fill in the
+   `AZURE_BLOB_*` values. Each variable is explained there.
+2. Use a dedicated private test container. For the Entra tests, the app
+   registration needs **Storage Blob Data Contributor** and **Storage Blob
+   Delegator** on the account.
+3. Run `npm run test:live`.
+
+Leave the account key or the Entra values empty to skip that group. Values
+already set in your shell override the file. Tests write under
+`live-test/<run id>/` and clean up after themselves, and print only statuses,
+never keys or SAS URLs.
 
 Formatting is Prettier (`npm run format`).
 
