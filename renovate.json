@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:best-practices"],
-  "timezone": "America/Los_Angeles",
+  "timezone": "Africa/Nairobi",
   "packageRules": [
     {
       "groupName": "Routine updates",
