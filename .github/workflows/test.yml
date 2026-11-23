@@ -57,6 +57,8 @@ jobs:
         if: matrix.node == '24.x'
         run: npm run lint:package
       - name: Test packed package
+        # Checks the minimum peers, not Node; npm 10 on Node 22 crashes on the aliased typescript dev dependency.
+        if: matrix.node == '24.x'
         run: npm run test:package
 
   windows:
