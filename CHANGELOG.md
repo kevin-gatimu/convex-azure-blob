@@ -10,6 +10,7 @@ Documentation only; no code changes.
 - README: the "Deleting files" cron example now refreshes the user delegation
   key hourly instead of every 24 hours, which left minutes each day with no
   valid key.
+- README: a Convex Components directory badge.
 
 ## 0.1.0
 

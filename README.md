@@ -1,5 +1,6 @@
 # Convex Azure Blob Storage
 
+[![Convex Component](https://www.convex.dev/components/badge/convex-azure-blob-storage)](https://www.convex.dev/components/convex-azure-blob-storage)
 [![npm version](https://img.shields.io/npm/v/convex-azure-blob-storage.svg)](https://www.npmjs.com/package/convex-azure-blob-storage)
 [![Test and lint](https://github.com/kevin-gatimu/convex-azure-blob-storage/actions/workflows/test.yml/badge.svg)](https://github.com/kevin-gatimu/convex-azure-blob-storage/actions/workflows/test.yml)
 
