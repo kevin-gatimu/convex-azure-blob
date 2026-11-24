@@ -50,50 +50,19 @@ Found a bug or want a feature?
 
 ### An Azure storage account
 
-1. Create a storage account and a **private** container (no anonymous access).
-   [Azure portal guide](https://learn.microsoft.com/azure/storage/blobs/storage-quickstart-blobs-portal).
-2. Copy an access key from **Security + networking → Access keys**.
-3. Add a CORS rule for your app's origins under **Settings → Resource sharing
-   (CORS) → Blob service**:
+Create a storage account and a **private** container (no anonymous access), copy
+an access key (or use
+[Microsoft Entra](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/entra.md)),
+and add a CORS rule for your app's origins. The steps, the CORS table and the
+Azure CLI command are in
+[Azure setup](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/azure-setup.md#an-azure-storage-account).
 
-   | Allowed origins          | Allowed methods           | Allowed headers                                                                 | Exposed headers                      | Max age |
-   | ------------------------ | ------------------------- | ------------------------------------------------------------------------------- | ------------------------------------ | ------- |
-   | `https://your.app` (etc) | `GET, HEAD, PUT, OPTIONS` | `x-ms-blob-type, content-type, x-ms-version, x-ms-client-request-id, x-ms-date` | `etag, content-length, content-type` | `3600`  |
-
-   Or with the Azure CLI:
-
-   ```sh
-   az storage cors add --services b --account-name <account> \
-     --origins https://your.app --methods GET HEAD PUT OPTIONS \
-     --allowed-headers 'x-ms-blob-type,content-type,x-ms-version,x-ms-client-request-id,x-ms-date' \
-     --exposed-headers 'etag,content-length,content-type' --max-age 3600
-   ```
-
-   **For this example:** use the exact origin `http://localhost:5173`, without a
-   trailing slash. In the Azure portal, select the **Blob service** tab, fill in
-   **Allowed headers** as well as the origin and methods, and select **Save**.
-   Adding just the origin is not enough: a rule can allow ordinary `GET` and
-   headerless `PUT` requests while rejecting the browser's upload preflight.
-   `content-type` and `x-ms-version` must be allowed for block uploads.
-
-   If an upload reports a network/CORS error, confirm these fields on the same
-   rule:
-
-   | Field           | Local example value                                                             |
-   | --------------- | ------------------------------------------------------------------------------- |
-   | Allowed origins | `http://localhost:5173`                                                         |
-   | Allowed methods | `GET, HEAD, PUT, OPTIONS`                                                       |
-   | Allowed headers | `content-type, x-ms-version, x-ms-blob-type, x-ms-client-request-id, x-ms-date` |
-   | Exposed headers | `etag, content-length, content-type`                                            |
-   | Max age         | `3600`                                                                          |
-
-   RBAC permissions do not replace CORS. After saving, resume the failed upload.
-   Preserve any existing CORS rules for other applications.
-
-For local development, use [Azurite](#local-development-with-azurite) instead.
-Once the variables are set, [check your setup](#checking-your-setup) to catch a
-wrong key, a missing role, a missing container, or a CORS rule that blocks
-uploads.
+For local development, use
+[Azurite](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/testing.md#local-development-with-azurite)
+instead. Once the variables are set,
+[check your setup](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/azure-setup.md#checking-your-setup)
+to catch a wrong key, a missing role, a missing container, or a CORS rule that
+blocks uploads.
 
 ### A Convex app
 
@@ -147,7 +116,7 @@ The account must allow shared key access.
 #### Microsoft Entra
 
 Works when shared key access is disabled. Setup steps are in
-[Microsoft Entra user-delegation SAS](#microsoft-entra-user-delegation-sas).
+[Microsoft Entra user-delegation SAS](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/entra.md).
 
 | Variable                    | Required | Meaning                                                                                   |
 | --------------------------- | -------- | ----------------------------------------------------------------------------------------- |
@@ -218,152 +187,12 @@ export default crons;
 ```
 
 `sweep` and `refreshUserDelegationKey` are internal actions you define in
-`convex/files.ts`, shown in [Deleting files](#deleting-files). `scanMalware` is
-returned by `clientApi`, shown in
-[Defender for Storage malware scan gate](#defender-for-storage-malware-scan-gate).
+`convex/files.ts`, shown in
+[Deleting files and the sweep](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/deleting-and-sweep.md).
+`scanMalware` is returned by `clientApi`, shown in
+[Defender for Storage malware scan gate](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/malware-scanning.md).
 With Microsoft Entra, also run `refreshUserDelegationKey` once after deploying,
 so a key is cached before the first upload.
-
-### Microsoft Entra user-delegation SAS
-
-Use these steps to configure a test storage account and Microsoft Entra
-application for user-delegation SAS. Use a dedicated test account/container, not
-production.
-
-#### 1. Register a single-tenant app
-
-In the [Microsoft Entra admin center](https://entra.microsoft.com), go to
-**Entra ID → App registrations → New registration**:
-
-1. Enter a name, for example `convex-azure-blob-storage-test`.
-2. Leave **Supported account types** set to **Accounts in this organizational
-   directory only (Single tenant)**.
-3. Leave **Redirect URI** blank; this server-to-server client-credentials flow
-   does not use a redirect.
-4. Select **Register**.
-
-From the app's **Overview** page, save the **Directory (tenant) ID** and
-**Application (client) ID**. These are configuration values, not secrets.
-
-#### 2. Create a client secret
-
-Open **Certificates & secrets → Client secrets → New client secret**. Add a
-description and choose an expiry, then select **Add**. Copy the secret's
-**Value** immediately; it is only shown once. Store it securely and never commit
-it, put it in a screenshot, or paste it into chat.
-
-#### 3. Prepare the storage account
-
-Use a general-purpose v2 storage account and create a private blob container for
-testing, such as `convex-test`. On the storage account's **Security** settings:
-
-- Leave **Require secure transfer for REST API operations** enabled.
-- Leave anonymous container access disabled.
-- Clear **Enable storage account key access**. This is the setting that ensures
-  the test exercises Entra authorization rather than account-key auth.
-- Keeping the minimum TLS version at 1.2 is recommended.
-
-The portal's **Default to Microsoft Entra authorization** option only changes
-the portal's default sign-in behavior; it does not grant the app access. Azure
-RBAC role assignments below grant that access.
-
-For uploads from the example's browser, also configure the storage account's
-**Resource sharing (CORS) → Blob service** rule for `http://localhost:5173`,
-including allowed upload headers, then **Save**. Follow the exact
-[local CORS values above](#an-azure-storage-account). This browser requirement
-is separate from Entra app roles and is easy to miss when server-side tests
-pass.
-
-#### 4. Assign the app's Azure roles
-
-For **Storage Blob Delegator**, open the storage account's **Access control
-(IAM) → Add → Add role assignment** and choose the **Storage Blob Delegator**
-role. Assign it at the **storage account** scope; this role allows the app to
-request user-delegation keys.
-
-For **Storage Blob Data Contributor**, open the test container's **Access
-control (IAM) → Add → Add role assignment** and choose that role. This grants
-blob read, write, and delete access to the test container only. If container
-scope is unavailable, assign it from the storage account's IAM page instead,
-which grants access to all containers in that account.
-
-For both assignments, select **User, group, or service principal** under
-**Assign access to** (not **Managed identity**), then select the app
-registration you created. In the member picker it may appear as an
-**Application**; confirm the app appears in the Members table before continuing.
-Do not proceed if the review page says **No members selected**. Select
-**Review + assign**, verify the role, scope, and app member, then select
-**Review + assign** again to submit. Allow a few minutes for role assignments to
-propagate before testing.
-
-#### 5. Configure the Convex development deployment
-
-From your project directory, set the account name, endpoint, container, tenant
-ID, and client ID on the **development** deployment:
-
-```sh
-npx convex env set AZURE_BLOB_ACCOUNT '<storage-account-name>'
-npx convex env set AZURE_BLOB_ENDPOINT 'https://<storage-account-name>.blob.core.windows.net'
-npx convex env set AZURE_BLOB_CONTAINER '<test-container-name>'
-npx convex env set AZURE_BLOB_TENANT_ID '<directory-tenant-id>'
-npx convex env set AZURE_BLOB_CLIENT_ID '<application-client-id>'
-```
-
-Set the client secret interactively so it is not included in the command or
-shell history:
-
-```sh
-npx convex env set AZURE_BLOB_CLIENT_SECRET
-```
-
-Do not set `AZURE_BLOB_KEY` for this test. If it is already set on this
-development deployment, remove it:
-
-```sh
-npx convex env remove AZURE_BLOB_KEY
-```
-
-You can optionally set `AZURE_BLOB_AUTHORITY_HOST` for a sovereign cloud; the
-default is `https://login.microsoftonline.com`. If `AZURE_BLOB_KEY` is set,
-account-key auth takes precedence and Entra credentials are not used.
-
-The two role scopes above are intentionally different: **Storage Blob
-Delegator** must be assigned at the storage account, resource group, or
-subscription scope; **Storage Blob Data Contributor** can be scoped to the
-container. See Microsoft's docs for
-[user-delegation SAS permissions](https://learn.microsoft.com/azure/storage/blobs/storage-blob-user-delegation-sas-create)
-and
-[Get User Delegation Key](https://learn.microsoft.com/rest/api/storageservices/get-user-delegation-key).
-
-The example's `refreshUserDelegationKey` internal action is scheduled hourly and
-refreshes the key when it has less than twelve hours remaining. Run the action
-once from the Convex dashboard after deployment to initialize the cache; uploads
-and signed read URLs fail with a clear error until a valid key is cached. Keys
-are valid for 24 hours. In Entra mode, upload and read SAS expiries are capped
-at the cached key's expiry, so a long `uploadTtlSeconds` (for block uploads) can
-be cut to as little as about 12 hours; renew with `renewUploadUrl`. Refresh
-hourly: with a daily schedule the key expires a few minutes before the next run.
-
-The cached delegation key is a signing secret stored in the component table.
-Treat access to the Convex deployment and its component data as privileged.
-Azure's **Revoke User Delegation Keys** operation invalidates the cached key and
-all SAS URLs signed with delegation keys; the cron must obtain a new key before
-Entra-backed SAS operations can continue. The routine refresh keeps a cached key
-that is still valid, so after revoking, force a replacement. Check the
-revocation first, then run the example action with `force`:
-
-```sh
-npx convex run photos:refreshUserDelegationKey '{"force":true}'
-```
-
-`refreshUserDelegationKey(ctx, { force: true })` skips the cached key and stores
-the replacement. If the forced request fails, the cached key is kept and the
-error is thrown. Uploads that were in flight need a fresh upload URL.
-
-Pre-release deployments may contain file records created before
-`uploadExpiresAt` was stored. These records remain valid and are not rewritten;
-cleanup uses the file's creation time plus the configured upload TTL, with a
-one-hour minimum, as a conservative expiry fallback.
 
 ## Uploading files
 
@@ -437,346 +266,6 @@ function UploadButton() {
 events, then calls `confirmUpload`. If confirmation fails, `upload` rejects with
 the reason, for example "The file is too large".
 
-### Large files and resumable uploads
-
-Single-PUT uploads remain the default. Opt into block uploads for large files:
-
-```ts
-export const azure = new AzureBlob(components.azureBlobStorage, {
-  blockUploads: true,
-  maxBytes: 1024 * 1024 * 1024, // choose an application-specific ceiling
-});
-
-export const { generateUploadUrl, renewUploadUrl, confirmUpload } =
-  azure.clientApi({
-    identify: async (ctx) =>
-      (await ctx.auth.getUserIdentity())?.tokenIdentifier ?? null,
-  });
-```
-
-Block uploads require the file's `size`. Their ticket retains `fileId`,
-`uploadUrl`, and `headers`, and adds `kind: "blocks"`, `blockSize`, and
-`expiresAt`. The React hook detects the ticket automatically:
-
-```tsx
-const {
-  upload,
-  pause,
-  resume,
-  cancel,
-  canResume,
-  progress,
-  isUploading,
-  error,
-} = useUploadFile(api.files);
-```
-
-- `upload(file)` starts a new session. Each chunk is a `Blob.slice()` sent
-  directly to Azure, with bounded parallel requests and aggregate byte progress.
-- `pause()` aborts active requests but keeps the file and successful block IDs.
-  `resume()` renews the same upload ticket and sends only unfinished blocks.
-  Handle the rejected upload promise as well as displaying `error`.
-- While paused, `progress` counts only the blocks Azure has stored, since
-  in-flight bytes are sent again, and `resume()` continues from that value.
-- A failed transfer can be resumed when `canResume` is true. A file that
-  `confirmUpload` rejects (wrong type, size or checksum) is deleted, so
-  `canResume` turns false and only a new `upload()` can retry it; an expired
-  ticket stays resumable. `cancel()` discards the session; it does not
-  immediately delete Azure's staged blocks.
-- Resume state exists only in this hook instance. Reloading, leaving the page,
-  or unmounting the uploader discards it. No SAS tokens or file data are saved
-  to browser storage.
-- Use separate hook instances for separate files, or await uploads sequentially.
-  Starting another upload on the same hook cancels its previous session.
-
-Only the uploader may renew or confirm a session. Convex checks the staged block
-count, ordering, and sizes before committing the block list, then checks the
-committed type and signature. Confirmed reads use an immutable snapshot so the
-staging SAS cannot change the bytes that have been verified. With the pinned
-Azure API version, staging needs a short-lived, single-blob **write** SAS;
-unlike the default create-only ticket, it is not a permission boundary against a
-malicious client committing or changing the staging blob. Only verified content
-is published by Convex.
-
-Azure has finite limits: at most 50,000 blocks and 4,000 MiB per block for the
-service version used here (about 190.7 TiB per blob). Your configured `maxBytes`
-still applies; the SDK's default remains 10 MiB. Unfinished Azure blocks expire
-after seven days, and the sweep removes abandoned Convex reservations after
-their upload expiry. Keep the sweep running.
-
-The staging write SAS lets a client stage uncommitted blocks, up to Azure's
-limits, until the ticket expires. Uncommitted blocks are billed until Azure
-discards them after seven days, and `maxBytes` is only enforced at confirm. Keep
-`uploadTtlSeconds` short, rate-limit with `checkUpload`, and set a cost or
-lifecycle alert on the storage account.
-
-For custom public upload functions, authorize the uploader before calling the
-SDK and expose a compatible `renewUploadUrl({ fileId })` mutation for the hook.
-`store` remains a single-PUT server-side upload; block mode is for browser
-upload sessions.
-
-### Integrity check with MD5
-
-Pass an optional `md5` to `generateUploadUrl`: the file's MD5 digest as base64
-(exactly 16 bytes). The ticket's `headers` then include `Content-MD5`, so Azure
-refuses a PUT whose body differs, and `confirmUpload` rejects (and deletes) a
-blob whose stored `Content-MD5` is missing or different, with the reason
-`Checksum mismatch`. An invalid `md5` throws a `ConvexError`.
-
-The app must compute the digest itself: Web Crypto has no MD5 and this package
-adds no hashing dependency. Use any MD5 implementation you trust, then:
-
-```ts
-const { upload } = useUploadFile(api.files);
-const fileId = await upload(file, { md5 }); // md5: base64 of the 16-byte digest
-```
-
-`useUploadFile` forwards extra arguments to your `generateUploadUrl` (add
-`md5: v.optional(v.string())` to a custom mutation's args; `clientApi` already
-accepts it) and sends the ticket headers with the PUT. Add `content-md5` to the
-CORS rule's **Allowed headers** so browsers may send it. `md5` is not supported
-with `blockUploads`: passing both throws a `ConvexError`.
-
-### Event Grid upload confirmation
-
-The browser normally calls `confirmUpload` after Azure accepts a PUT. To recover
-when the browser closes or loses its connection first, mount an Event Grid
-handler in `convex/http.ts`:
-
-```ts
-const handler = azure.eventGridHandler({
-  secret: process.env.AZURE_BLOB_EVENT_GRID_SECRET ?? "",
-  onUpload: internal.photos.attach,
-});
-
-http.route({
-  path: "/azure-blob/events",
-  method: "POST",
-  handler,
-});
-```
-
-Set `AZURE_BLOB_EVENT_GRID_SECRET` in Convex before deploying the route. The
-secret must be at least 32 characters; generate a random value rather than
-choosing a password. This callback should match the `onUpload` used by
-`clientApi`, so the browser and Event Grid confirm the same app record.
-
-Generate and set a secret, then create a standard-schema Event Grid subscription
-for the storage account:
-
-```sh
-secret="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
-npx convex env set AZURE_BLOB_EVENT_GRID_SECRET "$secret"
-resource_group="<resource-group>"
-account="<storage-account>"
-deployment="<deployment>"
-account_id="$(az storage account show --name "$account" --resource-group "$resource_group" --query id -o tsv)"
-az eventgrid event-subscription create \
-  --name confirm-blob-uploads \
-  --source-resource-id "$account_id" \
-  --endpoint-type webhook \
-  --endpoint "https://$deployment.convex.site/azure-blob/events?secret=$secret" \
-  --included-event-types Microsoft.Storage.BlobCreated \
-  --event-delivery-schema EventGridSchema
-```
-
-The handler answers Event Grid's subscription-validation handshake, confirms
-tracked blobs through the same size, type, and signature checks as the browser,
-and runs the configured `onUpload` mutation atomically. Duplicate events and
-browser/event races are safe; unknown blobs, containers, and event types are
-acknowledged without changes. Events are accepted only for blobs on the
-configured endpoint's host or the account's own
-`https://<account>.blob.core.windows.net` host, in the configured container and
-prefix. Transient confirmation failures return HTTP 503 so Event Grid retries
-them. Keep the endpoint on HTTPS. Query-string secrets can appear in URLs,
-deployment settings, or access logs; restrict access to those records, avoid
-logging the full request URL, and rotate the Convex secret and Event Grid
-subscription endpoint together.
-
-### Defender for Storage malware scan gate
-
-For single-PUT uploads, opt in to keeping confirmed files private until Defender
-for Storage reports a clean scan:
-
-```ts
-export const azure = new AzureBlob(components.azureBlobStorage, {
-  requireMalwareScan: true,
-});
-const uploadApi: ReturnType<AzureBlob["clientApi"]> = azure.clientApi({
-  identify: async (ctx) =>
-    (await ctx.auth.getUserIdentity())?.tokenIdentifier ?? null,
-});
-export const { generateUploadUrl, confirmUpload, scanMalware } = uploadApi;
-```
-
-`scanMalware` is an internal action. Schedule it from a Convex cron so pending
-scan jobs are polled:
-
-```ts
-crons.interval(
-  "check malware scan results",
-  { minutes: 1 },
-  internal.files.scanMalware,
-  {},
-);
-```
-
-Enable Defender for Storage **on-upload malware scanning** for the storage
-account and leave scan-result blob index tags enabled. Blob index tags aren't
-supported on accounts with hierarchical namespace enabled. The scanner reads the
-`Malware scanning scan result` tag (also accepts `Scan result`) using
-`Get Blob Tags`. `No threats found` is clean; `Malicious` deletes the blob and
-retains a `rejected` file row. Other outcomes, including `Not scanned` and
-errors, remain unservable and eventually time out. For account-key SAS this
-requires the `t` permission; in Entra mode, the identity needs the
-`Microsoft.Storage/storageAccounts/blobServices/containers/blobs/tags/read` data
-action. Files stay in `scanning` until a clean verdict or become
-`scan_timed_out` after 24 hours without a definitive result. `getUrl` only
-serves `ready` files, and `onUpload` runs only after a clean scan. Apps can read
-`getFile` to display the scanning, rejected, or timed-out state. Rejected-blob
-cleanup continues through the upload ticket's expiry and a clock-skew grace
-period, so a still-valid create-only SAS cannot recreate it.
-
-Scanning is asynchronous: actual latency varies with file size, type and service
-load. Defender for Storage bills per GB scanned; configure its monthly scanning
-cap to control cost. If the cap is reached or tags are unavailable, the file
-remains unservable and eventually times out. The package polls in bounded
-batches with backoff; the cron interval controls how quickly new results are
-observed.
-
-Blob index tags are not tamper-resistant. Principals allowed to modify tags can
-alter the verdict, so do not treat tag polling as the sole security control for
-high-assurance workflows; use Defender's Event Grid events or alerts as
-appropriate. The option cannot be combined with `blockUploads`: the block upload
-SAS can change the mutable base blob after confirmation, while the library
-serves an immutable snapshot, and Defender's tag does not prove that snapshot
-was scanned.
-
-### Writing your own upload functions
-
-`clientApi` is a shortcut. When the upload belongs to something in your schema
-(a post, a profile), write the functions yourself and check permissions first:
-
-```ts
-export const generateCoverUploadUrl = mutation({
-  args: { postId: v.id("posts"), contentType: v.string() },
-  handler: async (ctx, { postId, contentType }) => {
-    const userId = await requireUser(ctx);
-    await requireCanEdit(ctx, userId, postId);
-    return await azure.generateUploadUrl(ctx, {
-      contentType,
-      uploadedBy: userId,
-      fileName: "cover",
-      metadata: { postId },
-    });
-    // => { fileId, uploadUrl, headers }
-  },
-});
-
-export const setCover = action({
-  args: { postId: v.id("posts"), fileId: v.string() },
-  handler: async (ctx, { postId, fileId }) => {
-    const userId = await requireUserInAction(ctx);
-    const file = await azure.getFile(ctx, fileId);
-    if (file?.uploadedBy !== userId) throw new Error("Not your upload");
-    const result = await azure.confirmUpload(ctx, fileId);
-    if (!result.ok) throw new Error(result.reason);
-    await ctx.runMutation(internal.posts.saveCover, { postId, fileId });
-  },
-});
-```
-
-`useUploadFile` works with these too, as long as the mutation takes
-`contentType` and returns the `{ fileId, uploadUrl, headers }` ticket. Pass any
-extra arguments as the second argument of `upload`: `upload(file, { postId })`.
-
-Without React, use `uploadToAzure(uploadUrl, file, { headers, onProgress })`
-from `convex-azure-blob-storage/react`, or any HTTP client: `PUT` the bytes to
-`uploadUrl` with the returned `headers`.
-
-### Allowed types and sizes
-
-By default the allow-list is JPEG, PNG, WebP, GIF and AVIF. Change it with
-`allowedContentTypes`, which maps each content type to the extension of the
-generated blob name:
-
-```ts
-new AzureBlob(components.azureBlobStorage, {
-  allowedContentTypes: {
-    "application/pdf": "pdf",
-    "image/png": "png",
-    "text/csv": "csv",
-  },
-  maxBytes: 25 * 1024 * 1024,
-});
-```
-
-At confirm, the component reads the blob's real size and content type from
-Azure. It also reads the first 64 bytes and checks them against the file
-signature for JPEG, PNG, GIF, WebP, AVIF, HEIC, PDF, ZIP, MP4, WebM and MP3
-(`SNIFFABLE_CONTENT_TYPES`). Types without a known signature, such as CSV, skip
-that byte check. Turn it off with `verifyContent: false`.
-
-Warning: browsers can execute some content types (`text/html`, `image/svg+xml`,
-`application/xhtml+xml`, `text/javascript`, XML). They are served with that type
-from the storage origin, and Azure does not send
-`X-Content-Type-Options: nosniff`. If you must accept them, serve them as
-downloads (`getUrl(ctx, id, { download: true })`) or from a separate storage
-account or domain with no cookies.
-
-## Access tiers
-
-Set `accessTier: "Hot" | "Cool" | "Cold" | "Archive"` on `AzureBlob` to tier
-files server-side after they become ready, including server uploads, Event Grid
-confirmation, block commits, and clean malware scans. Upload tickets never
-include tier headers. A failed automatic tier change leaves the file ready and
-refreshes its actual tier from Azure; the failure is logged without a URL or
-SAS.
-
-```ts
-const azure = new AzureBlob(components.azureBlobStorage, {
-  accessTier: "Cool",
-});
-// Invoke from authorized actions, not queries or mutations.
-await azure.setTier(ctx, fileId, "Archive");
-await azure.rehydrate(ctx, fileId, { tier: "Hot", priority: "High" });
-await azure.refreshTier(ctx, fileId); // poll from an internal action or cron
-```
-
-`getFile` and `list` expose optional `accessTier` and `archiveStatus`. The
-`accessTier` and `archiveStatus` validators are exported for app validators.
-`setTier`, `rehydrate`, and `refreshTier` return false for unknown or non-ready
-files, and throw a `ConvexError` with the HTTP status on Azure non-2xx
-responses, without including the request URL. `rehydrate` also throws when the
-file's recorded tier is known and not `Archive`. Authorize callers and ownership
-before invoking these server methods; they are not exposed by `clientApi`.
-
-Archived files return null from both `getUrl` and `urlForFile`, even for public
-containers. A 202 Accepted tier change keeps `accessTier: "Archive"` and records
-`archiveStatus`, such as `"rehydrate-pending-to-hot"`; the file remains
-unservable until `refreshTier` observes an online tier. Refresh reads
-`x-ms-access-tier` and `x-ms-archive-status` from HEAD and clears the archive
-status when absent. Refresh after external tier changes, too. Previously issued
-URLs are not revoked by metadata updates. Standard-priority rehydration (the
-default) can take **up to 15 hours**; High priority costs more and is not an
-immediate-read guarantee.
-
-Cool, Cold, and Archive have early-deletion charges for deleting or moving data
-before **30, 90, and 180 days**, respectively. For age-based tiering, use Azure
-Blob Storage **lifecycle management rules** instead of per-file actions. Not all
-storage account types support every tier. Block uploads tier their immutable
-snapshot, not the mutable staging blob; Azure cannot directly rehydrate an
-archived snapshot, so recovering it requires copying to a new online blob
-outside these methods. Avoid Archive for block uploads when in-place rehydration
-is needed.
-
-See Microsoft's
-[Set Blob Tier REST API](https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tier),
-[Get Blob Properties](https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-properties),
-[access tier pricing rules](https://learn.microsoft.com/en-us/azure/storage/blobs/access-tiers-overview),
-and
-[archive rehydration overview](https://learn.microsoft.com/en-us/azure/storage/blobs/archive-rehydrate-overview).
-
 ## Serving files
 
 ```ts
@@ -817,69 +306,6 @@ If you already loaded the file (from `list` or `getFile`), call
 context is required for Entra authentication so the cached delegation key can be
 read without a network request; it is optional with account-key authentication.
 
-### Through a CDN or public container
-
-Set `AZURE_BLOB_PUBLIC_BASE_URL` (for example `https://cdn.example.com/uploads`)
-and `getUrl` returns `<base>/<blob name>` with no token. That makes URLs
-permanent and easy to cache at the edge. Download URLs are still signed, since
-they need a `Content-Disposition` override.
-
-## Reading files from actions
-
-`read` fetches a ready file's bytes inside an action, for thumbnails, parsing or
-re-uploading. It returns a `Response`, or `null` if the file is unknown or not
-`ready`. Check the caller's permission first.
-
-```ts
-export const thumbnail = action({
-  args: { fileId: v.string() },
-  handler: async (ctx, { fileId }) => {
-    await requireUserInAction(ctx);
-    const response = await azure.read(ctx, fileId);
-    if (!response) return null;
-    const image = new Uint8Array(await response.arrayBuffer());
-    // ...resize, then azure.store(ctx, { data, contentType, uploadedBy })
-  },
-});
-
-// Only the first kilobyte (end is inclusive); Azure answers 206.
-const head = await azure.read(ctx, fileId, { range: { start: 0, end: 1023 } });
-```
-
-`start` must be a non-negative integer and `end`, if given, an integer no
-smaller than `start`; otherwise `read` throws. Any other Azure status than 200
-(206 when `range` is given) throws an error with the status only, never the URL
-or SAS, and the returned `Response` has an empty `url`. The request uses a
-one-minute read-only SAS (or your Entra token) against the internal endpoint, so
-the bytes stream from Azure to the action, not through a browser URL.
-
-## Listing files and metadata
-
-```ts
-export const myFiles = query({
-  args: { paginationOpts: paginationOptsValidator },
-  handler: async (ctx, { paginationOpts }) => {
-    const userId = await requireUser(ctx);
-    return await azure.list(ctx, { uploadedBy: userId, paginationOpts });
-  },
-});
-```
-
-`list` returns ready files, newest first, as a standard pagination result. Each
-file has `fileId`, `container`, `blobName`, `contentType`, `size`, `maxBytes`,
-`uploadedBy`, `fileName`, `metadata`, `status`, `createdAt` and
-`uploadExpiresAt`.
-
-Set a display name and string metadata at upload (`fileName`, `metadata`), or
-later:
-
-```ts
-await azure.updateFile(ctx, fileId, { metadata: { alt: "A red bicycle" } });
-```
-
-Metadata is limited to 32 keys with values up to 1,024 characters. File names
-are limited to 255 characters. The file name is never used in the blob path.
-
 ## Deleting files
 
 Stop serving the file in the same mutation that removes your reference to it,
@@ -906,167 +332,9 @@ export const purge = internalAction({
 });
 ```
 
-Add a cron as a safety net. It deletes uploads that were never confirmed (after
-an hour by default) and retries any delete that failed:
-
-```ts
-// convex/crons.ts
-import { cronJobs } from "convex/server";
-import { internal } from "./_generated/api";
-
-const crons = cronJobs();
-crons.hourly("sweep azure blobs", { minuteUTC: 17 }, internal.files.sweep, {});
-crons.interval(
-  "refresh Azure Blob user delegation key",
-  { hours: 1 },
-  internal.files.refreshUserDelegationKey,
-  {},
-);
-export default crons;
-
-// convex/files.ts
-export const sweep = internalAction({
-  args: { run: v.optional(v.number()) },
-  returns: v.number(),
-  handler: async (ctx, args): Promise<number> =>
-    await azure.sweep(ctx, {
-      continueWith: internal.files.sweep,
-      run: args.run,
-    }),
-});
-
-export const refreshUserDelegationKey = internalAction({
-  args: {},
-  returns: v.null(),
-  handler: async (ctx) => {
-    await azure.refreshUserDelegationKey(ctx);
-    return null;
-  },
-});
-```
-
-`azure.delete` is an alias of `purge`. After a delete, the row stays in the
-`deleting` state until the file's recorded `uploadExpiresAt` plus a five-minute
-clock-skew allowance, because that URL could otherwise re-create the blob. A
-later sweep removes it. Changing client TTL settings does not shorten this
-retention. Sweep atomically claims stale pending uploads before deleting them,
-so a confirmation that commits first is not swept. Each sweep examines at most
-1000 expired pending rows in expiry order while skipping those younger than the
-age cutoff; if more than 1000 young rows sort ahead of an older one, it waits
-until they age out.
-
-Sweep claims up to `limit` files (default 100, clamped to 1-200) and deletes
-with `concurrency` workers (default 8, a positive integer). A failed Azure
-delete is deferred for one minute, doubling on each failure up to 24 hours, so
-one failing blob does not monopolize later batches. A successful delete with a
-live upload URL is deferred until its recorded expiry plus the clock-skew
-allowance.
-
-Pass an internal action as `continueWith` to drain a backlog: a full claimed
-batch schedules it with `{ run: run + 1 }` at zero delay while
-`run + 1 < maxRuns`. `run` defaults to 0 and `maxRuns` to 10; the action must
-forward `run` and use the same sweep options on each invocation. A scheduler is
-required only when using `continueWith`; existing callers with just `runQuery`
-and `runMutation` still work. The return counts successful blob deletes
-(including 404), not removed rows. The cron starts a fresh chain with `{}`.
-
-## Storing files from actions
-
-Upload bytes you already have (an import, a generated PDF, a migration from
-Convex file storage):
-
-```ts
-export const importAvatar = internalAction({
-  args: { url: v.string(), userId: v.string() },
-  handler: async (ctx, { url, userId }) => {
-    const response = await fetch(url);
-    const result = await azure.store(ctx, {
-      data: await response.blob(), // Blob, ArrayBuffer or Uint8Array
-      contentType: response.headers.get("content-type") ?? "",
-      uploadedBy: userId,
-      fileName: "avatar",
-    });
-    if (!result.ok) throw new Error(result.reason);
-    return result.fileId;
-  },
-});
-```
-
-`store` runs the same checks as a browser upload.
-
-When a source is already available at an HTTPS URL, Azure can fetch it directly
-without passing the bytes through the Convex action:
-
-```ts
-const result = await azure.storeFromUrl(ctx, {
-  sourceUrl,
-  contentType: "image/png",
-  uploadedBy: userId,
-  fileName: "avatar",
-  maxBytes: 5 * 1024 * 1024,
-});
-if (!result.ok) throw new Error(result.reason);
-return result.fileId;
-```
-
-`storeFromUrl` accepts only HTTPS source URLs and applies the same size,
-content-type and file-signature checks as `store`. The source must be publicly
-readable or include a read SAS, and must return a valid `Content-Length`. Source
-URLs are limited to 2 KiB. Azure's synchronous operation is limited to 5,000
-MiB; an oversized source or one without a valid length is rejected. Azure
-fetches the source URL itself, so treat user-supplied URLs as an SSRF risk:
-validate them against your application's trusted-source policy before calling
-this method. HTTPS alone does not make an arbitrary URL safe. Do not log source
-URLs that contain SAS tokens.
-
-## Encryption scopes
-
-An
-[Azure encryption scope](https://learn.microsoft.com/azure/storage/blobs/encryption-scope-overview)
-encrypts blobs with a key of its own, so one storage account can keep each
-customer's data under a separate key. Set `encryptionScope` and every new blob
-this client writes lands in that scope:
-
-```ts
-export const azure = new AzureBlob(components.azureBlob, {
-  encryptionScope: "customer-a",
-});
-```
-
-- **The scope must already exist** on the storage account and be enabled; create
-  it in the portal or with the Azure CLI. Scopes can use Microsoft-managed keys
-  or customer-managed keys in Azure Key Vault. Names are 3-63 lowercase letters,
-  digits and single dashes.
-- **Only writes carry it.** Upload tickets, block staging and commit, `store`,
-  and `storeFromUrl` are signed with the SAS `ses` field. With Microsoft Entra
-  authentication the server-side writes send `x-ms-encryption-scope` instead.
-  Read URLs, HEAD checks, tag reads, tier changes, and deletes don't use the
-  scope, and Azure decrypts scoped blobs transparently while the scope is
-  enabled.
-- **Containers can enforce their own default scope.** If a container's default
-  scope prohibits overrides, writes with a different scope fail with 403.
-- **Existing blobs keep their scope.** Changing the option affects only new
-  uploads.
-- **Azurite caveat.** Azurite validates the `ses` signature but doesn't
-  implement encryption scopes, so it neither encrypts nor rejects an unknown
-  scope. Verify scoped uploads against a real storage account.
-
-## Several containers or folders
-
-Create one client per container or folder. Each file remembers its container, so
-reads and deletes go to the right place:
-
-```ts
-export const avatars = new AzureBlob(components.azureBlobStorage, {
-  pathPrefix: "avatars", // blobs are named avatars/<uuid>.<ext>
-  maxBytes: 1024 * 1024,
-});
-
-export const documents = new AzureBlob(components.azureBlobStorage, {
-  config: { container: "documents" },
-  allowedContentTypes: { "application/pdf": "pdf" },
-});
-```
+The sweep cron that removes abandoned uploads and retries failed deletes, its
+action, and sweep tuning are in
+[Deleting files and the sweep](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/deleting-and-sweep.md).
 
 ## Security model
 
@@ -1086,13 +354,15 @@ export const documents = new AzureBlob(components.azureBlobStorage, {
   anything. A SAS cannot cap the upload size, so an oversized blob exists until
   confirm (or the sweep) deletes it.
 - **Active content.** Executable types such as HTML and SVG need care; see the
-  warning under "Allowed types and sizes".
+  warning under
+  [Allowed types and sizes](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/uploads.md#allowed-types-and-sizes).
 - **Malware scanning is opt-in.** Use `requireMalwareScan` with Defender for
   Storage to keep confirmed files unservable until a clean scan result arrives.
   Without it, files are not checked for malware. See
   [Defender for Storage](https://learn.microsoft.com/azure/defender-for-cloud/defender-for-storage-introduction)
-  and the scan-gate section above. SVG is not in the default allow-list, because
-  it can carry script.
+  and the
+  [scan-gate guide](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/malware-scanning.md).
+  SVG is not in the default allow-list, because it can carry script.
 - **Signing secrets stay server-side.** The account key is read from deployment
   environment variables and is never stored in component tables, passed as a
   function argument, returned or logged. In Entra mode, client credentials stay
@@ -1106,247 +376,29 @@ export const documents = new AzureBlob(components.azureBlobStorage, {
 - **Authorization is yours.** `uploadedBy` is an opaque string. The component
   does not check it, except that `clientApi` only lets the uploader confirm.
 
-## Checking your setup
+## Guides
 
-`checkSetup` verifies the configuration from an action and reports one entry per
-check, each with a fix hint when it fails:
-
-```ts
-export const checkSetup = internalAction({
-  args: { origin: v.optional(v.string()), checksum: v.optional(v.boolean()) },
-  handler: async (ctx, args) => await azure.checkSetup(ctx, args),
-});
-```
-
-Run it from the Convex dashboard, or
-`npx convex run photos:checkSetup '{"origin":"http://localhost:5173"}'` in the
-example app.
-
-| Check         | Passes when                                                                                                    |
-| ------------- | -------------------------------------------------------------------------------------------------------------- |
-| `config`      | the required environment variables resolve (the hint names the missing ones)                                   |
-| `credentials` | Azure accepts a signed request (shared key), or a Microsoft Entra token and a user delegation key are obtained |
-| `container`   | a read probe for a random blob name answers `BlobNotFound`, so the container exists and the identity can read  |
-| `cors`        | with `origin`, a `PUT` preflight for the headers the uploader sends is allowed on the endpoint browsers use    |
-
-A check is skipped, with the hint `skipped: <check> failed`, when an earlier one
-it depends on fails. The Entra check only verifies that a delegation key can be
-requested; it does not cache it, so run `refreshUserDelegationKey` separately.
-In Entra mode the container probe uses a 60-second user-delegation SAS, so a
-wrong `AZURE_BLOB_ACCOUNT` fails the `credentials` check. A malformed
-`AZURE_BLOB_KEY` also fails `credentials`, not as an unreachable endpoint.
-
-The `cors` preflight asks for `x-ms-blob-type` and `content-type`; with
-`blockUploads` it asks for `content-type` only, and `checksum: true` (uploads
-that send an `md5`) adds `content-md5` unless `blockUploads` is on, since block
-uploads don't support `md5`. Azure answers a bad signature or a storage account
-firewall block as `AuthorizationFailure`, so that hint names the account key,
-the clock, and the firewall or network rules (for example Convex's egress). The
-result never contains the key, a SAS, a token, or a URL.
-
-## Local development with Azurite
-
-[Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite)
-emulates Blob Storage and validates SAS signatures the way Azure does. It does
-not implement the Get User Delegation Key REST API or Entra OAuth, so
-user-delegation authentication is covered by mocked tests and must be verified
-against an Azure storage account.
-
-```sh
-docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
-  azurite-blob --blobHost 0.0.0.0 --loose
-```
-
-Create a container and a CORS rule for your dev server. This repository has a
-script for that, `scripts/azurite-setup.mjs`. Then point Convex at it:
-
-```sh
-npx convex env set AZURE_BLOB_ACCOUNT devstoreaccount1
-npx convex env set AZURE_BLOB_KEY 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='
-npx convex env set AZURE_BLOB_CONTAINER uploads
-npx convex env set AZURE_BLOB_ENDPOINT http://127.0.0.1:10000/devstoreaccount1
-```
-
-That key is Azurite's published development key. It is not a secret and only
-works with the emulator. A cloud Convex deployment cannot reach `127.0.0.1`, so
-choose a local deployment when `npx convex dev` asks, or expose Azurite through
-a tunnel.
-
-## Testing your app
-
-Register the component with
-[convex-test](https://docs.convex.dev/testing/convex-test) and stub `fetch` for
-the Azure calls:
-
-```ts
-import azureBlobTest from "convex-azure-blob-storage/test";
-import { convexTest } from "convex-test";
-import schema from "./schema";
-
-const modules = import.meta.glob("./**/*.ts");
-
-function initConvexTest() {
-  const t = convexTest(schema, modules);
-  azureBlobTest.register(t); // pass a name if you installed it under another one
-  return t;
-}
-```
-
-See [`example/convex/photos.test.ts`](./example/convex/photos.test.ts) for a
-complete test with Azure stubbed.
-
-## Blob index tags
-
-Choose `tags?: Record<string, string>` server-side in `generateUploadUrl`,
-`store`, or `storeFromUrl`. They are reserved on the file row, never included in
-browser upload headers or `clientApi` arguments, and written to Azure only after
-confirmation makes the file ready. This includes block uploads and Event Grid
-confirmation; malware-gated files wait for a clean Defender verdict.
-
-```ts
-const ticket = await azure.generateUploadUrl(ctx, {
-  contentType: "image/png",
-  uploadedBy: userId,
-  tags: { project: "gallery", retention: "temporary" },
-});
-// In an authorized action:
-const tags = await azure.getTags(ctx, ticket.fileId);
-await azure.setTags(ctx, ticket.fileId, { project: "gallery" });
-```
-
-`getTags` reads Azure's current tags, not the reserved row, and returns `null`
-for unknown or non-ready files. `setTags` replaces only the app-managed keys
-recorded in the row: omitted app keys are removed, other existing keys
-(including Defender's scan-result tags) are preserved, and the new app values
-win on overlap. Passing `{}` removes all app-managed keys. Azure replaces the
-entire tag set, so these writes first GET existing tags and enforce the combined
-ten-tag limit. Avoid managing Defender's keys yourself. Concurrent tag writers
-should be serialized by the app; the GET/PUT merge is not atomic.
-
-`setTags` returns `false` for unknown or non-ready files and updates the row
-only after Azure accepts the write. Invalid tags and Azure failures throw a
-`ConvexError`; non-2xx errors include the status, never the URL or SAS.
-Automatic ready-time writes are best-effort: a failure is logged without
-credentials and the file stays ready. The row retains the requested tags; use
-`setTags` to retry. `updateFile` cannot set tags because it is a mutation, not
-an action. Authorize callers in your app before exposing these action methods.
-
-Tags need their own permission. With an account key the package signs the `t`
-SAS permission itself. With Microsoft Entra, the identity needs the
-`blobs/tags/read` and `blobs/tags/write` data actions: **Storage Blob Data
-Owner** has them, **Storage Blob Data Contributor** does not. Without them Azure
-answers `403 AuthorizationPermissionMismatch`; automatic writes log it and keep
-the file ready, while `getTags` and `setTags` throw.
-
-**Never put secrets in tags:** anyone with tag permission on the account or blob
-can read them. Azure allows at most **10 tags**, with keys **1–128 characters**
-and values **0–256 characters**, all case-sensitive strings. Allowed characters
-are ASCII letters (`a-z`, `A-Z`), digits (`0-9`), space, plus, minus, period,
-colon, equals, underscore, and forward slash (` +-.:=_/`). These limits apply to
-the merged set, including Azure-managed tags.
-
-Tags can drive Azure
-[lifecycle management rules](https://learn.microsoft.com/en-us/azure/storage/blobs/lifecycle-management-overview)
-and
-[Find Blobs by Tags](https://learn.microsoft.com/en-us/azure/storage/blobs/storage-manage-find-blobs).
-For example, a filter can be `"project" = 'gallery' AND @container = 'uploads'`.
-Find requires separate `f` permission (or appropriate RBAC), is eventually
-consistent, and is not exposed by this package. Tag reads/writes use a
-short-lived blob-scoped `t` service SAS, or Entra authorization; both service
-and user-delegation SAS support `t`.
-
-For block uploads, **tags target the base blob**, while reads still serve the
-immutable snapshot. Azure's
-[Set Blob Tags](https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tags)
-supports snapshots since API 2020-08-04 and versions since 2019-12-12;
-[Get Blob Tags](https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-tags)
-also supports both. We deliberately use the base blob to share Defender's tag
-resource and keep app tags discoverable by Azure's index and lifecycle rules.
-Tags describe the base blob, not immutable snapshot content.
+| Guide                                                                                                                          | Covers                                                                             |
+| ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| [Azure setup](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/azure-setup.md)                         | the storage account, CORS, and `checkSetup`                                        |
+| [Microsoft Entra](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/entra.md)                           | sign with an app registration instead of a key                                     |
+| [Uploads in depth](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/uploads.md)                        | large and resumable uploads, MD5, custom upload functions, allowed types and sizes |
+| [Event Grid confirmation](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/event-grid.md)              | confirm uploads from Azure instead of the browser                                  |
+| [Malware scanning](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/malware-scanning.md)               | hold files until Defender for Storage clears them                                  |
+| [Access tiers](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/access-tiers.md)                       | hot, cool, cold and archive blobs                                                  |
+| [Reading and listing](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/reading-and-listing.md)         | CDN, reads from actions, listing and metadata                                      |
+| [Deleting and the sweep](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/deleting-and-sweep.md)       | retention, retries and sweep tuning                                                |
+| [Storing from actions](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/storing-from-actions.md)       | upload bytes you already have                                                      |
+| [Encryption scopes](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/encryption-scopes.md)             | encrypt new blobs with an Azure scope                                              |
+| [Containers and prefixes](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/containers-and-prefixes.md) | several containers or folders                                                      |
+| [Testing](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/testing.md)                                 | Azurite and testing your app                                                       |
+| [Blob index tags](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/blob-index-tags.md)                 | tag blobs for lifecycle rules and search                                           |
 
 ## API reference
 
-### `new AzureBlob(component, options?)`
-
-| Option                | Default                         | Meaning                                                                                                                                   |
-| --------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `config`              | env vars                        | `{ accountName, accountKey?, tenantId?, clientId?, clientSecret?, authorityHost?, container, endpoint, internalEndpoint, publicBaseUrl }` |
-| `allowedContentTypes` | JPEG/PNG/WebP/GIF/AVIF          | Content type → blob-name extension.                                                                                                       |
-| `maxBytes`            | 10 MiB                          | Size ceiling. Callers can ask for less, never more.                                                                                       |
-| `blockUploads`        | `false`                         | Opt into resumable browser block uploads; requires `size` and a renewal mutation.                                                         |
-| `requireMalwareScan`  | `false`                         | Poll Defender scan tags before serving; requires the `clientApi` scan action cron and cannot be combined with `blockUploads`.             |
-| `accessTier`          | none                            | Server-side ready-file tier: Hot, Cool, Cold, or Archive.                                                                                 |
-| `pathPrefix`          | none                            | Virtual folder for new blobs, e.g. `"users/avatars"`.                                                                                     |
-| `encryptionScope`     | none                            | Existing Azure encryption scope for new blobs; see [Encryption scopes](#encryption-scopes).                                               |
-| `uploadTtlSeconds`    | 300                             | Lifetime of upload URLs, from 1 to 604800 (seven days).                                                                                   |
-| `readWindowSeconds`   | 3600                            | Signing window for read URLs, from 1 to 604800. Each URL is valid for one to two windows.                                                 |
-| `verifyContent`       | `true`                          | Check leading bytes against the file signature at confirm.                                                                                |
-| `httpsOnly`           | `true` for `https://` endpoints | Sign tokens with `spr=https`.                                                                                                             |
-
-### Methods
-
-The `ctx` type each method needs is the smallest that works, so you can call
-query methods from mutations and actions too.
-
-| Method                                                                                               | Call from    | Returns                                                                                  |
-| ---------------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------- |
-| `generateUploadUrl(ctx, { contentType, uploadedBy, maxBytes?, size?, fileName?, metadata?, tags? })` | mutation     | `{ fileId, uploadUrl, headers }`                                                         |
-| `renewUploadUrl(ctx, { fileId, uploadedBy })`                                                        | mutation     | Same pending upload ticket with a renewed expiry; authorize the uploader first.          |
-| `confirmUpload(ctx, fileId, onUpload?)`                                                              | action       | `{ ok: true, size, contentType }` or `{ ok: false, reason }`                             |
-| `getFile(ctx, fileId)`                                                                               | query        | `FileDoc` or `null`                                                                      |
-| `read(ctx, fileId, { range?: { start, end? } }?)`                                                    | action       | `Response` (200, or 206 with `range`), or `null` unless the file is `ready`              |
-| `getUrl(ctx, fileId, { download?, cacheControl? })`                                                  | query        | URL or `null`                                                                            |
-| `urlForFile(file, { download?, cacheControl? }, ctx?)`                                               | anywhere     | URL or `null`                                                                            |
-| `list(ctx, { uploadedBy?, paginationOpts })`                                                         | query        | `PaginationResult<FileDoc>`                                                              |
-| `updateFile(ctx, fileId, { fileName?, metadata? })`                                                  | mutation     | `boolean`                                                                                |
-| `getTags(ctx, fileId)`                                                                               | action       | `Record<string, string>` or `null`                                                       |
-| `setTags(ctx, fileId, tags)`                                                                         | action       | `boolean`                                                                                |
-| `setTier(ctx, fileId, tier)`                                                                         | action       | `boolean`                                                                                |
-| `rehydrate(ctx, fileId, { tier, priority? })`                                                        | action       | `boolean`                                                                                |
-| `refreshTier(ctx, fileId)`                                                                           | action       | `boolean`                                                                                |
-| `markForDeletion(ctx, fileId)`                                                                       | mutation     | `boolean`                                                                                |
-| `purge(ctx, fileId)` / `delete(ctx, fileId)`                                                         | action       | `boolean`                                                                                |
-| `sweep(ctx, { pendingOlderThanMs?, limit?, concurrency?, continueWith?, run?, maxRuns? })`           | action       | number of blobs removed                                                                  |
-| `store(ctx, { data, contentType, uploadedBy, maxBytes?, fileName?, metadata?, tags? })`              | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                                        |
-| `storeFromUrl(ctx, { sourceUrl, contentType, uploadedBy, maxBytes?, fileName?, metadata?, tags? })`  | action       | `{ ok: true, fileId }` or `{ ok: false, reason }`                                        |
-| `refreshUserDelegationKey(ctx, { force? })`                                                          | action       | `void`; refreshes the Entra delegation-key cache; `force` replaces a valid key           |
-| `checkSetup(ctx, { origin?, checksum? }?)`                                                           | action       | `{ ok, checks: [{ name, ok, hint? }] }`; see [Checking your setup](#checking-your-setup) |
-| `scanMalware(ctx, limit?)`                                                                           | action       | number of due Defender scan jobs checked                                                 |
-| `clientApi({ identify, checkUpload?, onUpload? })`                                                   | module scope | public upload functions and internal `scanMalware` action                                |
-| `eventGridHandler({ secret, onUpload? })`                                                            | module scope | HTTP action for standard-schema Event Grid BlobCreated events                            |
-
-### `convex-azure-blob-storage/react`
-
-- `useUploadFile(api)` returns
-  `{ upload, cancel, pause, resume, canResume, progress, isUploading, error }`.
-  `api` has `generateUploadUrl` and `confirmUpload` function references, plus
-  `renewUploadUrl` for resumable block uploads.
-- `uploadToAzure(uploadUrl, file, { headers?, onProgress?, signal? })` is the
-  same upload without React.
-- `uploadBlocksToAzure(ticket, file, { headers?, onProgress?, signal?, stagedBlockIds? })`
-  stages blocks without committing them. Retain the successful `Set<string>` of
-  `stagedBlockIds` for retries, renew expired tickets, then call your
-  owner-authorized `confirmUpload`.
-- `UploadError` is thrown for failed PUTs (with `status`) and rejected
-  confirmations.
-- Starting another upload cancels the previous one. Cancellation also applies
-  while waiting for an upload ticket, and unmounting aborts the active PUT. A
-  confirmation already sent to the server cannot be undone by cancellation.
-  `pause()` differs from `cancel()` by keeping the in-memory block session for
-  `resume()`; single-PUT uploads cannot resume staged blocks.
-
-`FileDoc` has optional `uploadMode`, `expectedSize`, `blockSize`, and `snapshot`
-fields for block sessions. These fields are absent on legacy and single-PUT
-records. Snapshot-backed reads use signed Azure snapshot URLs even when
-`publicBaseUrl` is configured, to avoid serving the mutable base blob.
-
-### Lower-level exports
-
-`signBlobSas`, `blobStringToSign`, `attachmentDisposition`, `sniffContentType`,
-`SNIFFABLE_CONTENT_TYPES`, `resolveConfig` and `SAS_VERSION`, for advanced use
-and your own tests.
-
-<!-- END: Include on https://convex.dev/components -->
+The `AzureBlob` class, its methods, the React hook and the lower-level exports
+are listed in the
+[API reference](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/api.md).
 
 ## Example app
 
@@ -1389,33 +441,8 @@ The npm scripts use Windows-compatible quoting. If the frontend says Convex is
 disconnected, keep `npm run dev` running and verify `VITE_CONVEX_URL` points to
 that deployment. Restart Vite after changing its environment configuration.
 
-For live Azure with Entra authentication, use the
-[Entra setup guide](#microsoft-entra-user-delegation-sas). The storage account's
-**Blob service CORS** rule must include the exact frontend origin, such as
-`http://localhost:5173` (and a different origin if Vite chooses a different
-port). Allow `PUT, GET, HEAD, OPTIONS`, the headers in the
-[CORS prerequisites](#an-azure-storage-account), and expose `etag`. A successful
-server-side integration test does not prove browser CORS is configured. The UI
-reports network/CORS failures per file instead of silently dropping a batch;
-after fixing the rule, resume the failed transfer.
-
-## Roadmap
-
-Already in 0.1.0: Microsoft Entra user delegation SAS, resumable block uploads,
-the Defender malware scan gate, Event Grid confirmation, copy from URL, faster
-sweeps with backoff, reads from actions, `Content-MD5` checks, access tiers, and
-`checkSetup`.
-
-Planned, in priority order. Contributions welcome:
-
-1. **Stored access policies**, to revoke outstanding URLs without rotating the
-   key.
-2. **Blob index tags** for lifecycle rules and search across files.
-3. **Encryption scopes** per container or tenant.
-
-## Development
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md).
+For live Azure, see
+[Running the example against live Azure](https://github.com/kevin-gatimu/convex-azure-blob-storage/blob/main/docs/testing.md#running-the-example-against-live-azure).
 
 ## License
 

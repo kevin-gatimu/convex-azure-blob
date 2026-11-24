@@ -9,6 +9,8 @@
   `store`, and `storeFromUrl` write new blobs into that Azure encryption scope
   (SAS `ses`, or `x-ms-encryption-scope` with Entra bearer auth). Reads, tags,
   tiers, and deletes are unchanged. Invalid names are rejected at construction.
+- Docs: the README now covers setup and the basic flow; feature guides moved to
+  `docs/`.
 
 ## 0.1.1
 
