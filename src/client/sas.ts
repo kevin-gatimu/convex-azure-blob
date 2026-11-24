@@ -38,6 +38,8 @@ export type BlobSasInput = {
   responseHeaders?: SasResponseHeaders;
   /** Azure snapshot timestamp; signs the immutable snapshot resource. */
   snapshot?: string;
+  /** Encryption scope new blobs are written with; Azure rejects `ses` on SAS versions before 2020-12-06. */
+  encryptionScope?: string;
 };
 
 export type UserDelegationKey = {
@@ -84,7 +86,7 @@ export function blobStringToSign(input: BlobSasInput) {
     SAS_VERSION,
     input.snapshot ? "bs" : "b",
     input.snapshot ?? "",
-    "", // signedEncryptionScope
+    input.encryptionScope ?? "",
     headers.cacheControl ?? "",
     headers.contentDisposition ?? "",
     headers.contentEncoding ?? "",
@@ -116,7 +118,7 @@ export function userDelegationStringToSign(input: UserDelegationSasInput) {
     SAS_VERSION,
     input.snapshot ? "bs" : "b",
     input.snapshot ?? "",
-    "", // signedEncryptionScope
+    input.encryptionScope ?? "",
     headers.cacheControl ?? "",
     headers.contentDisposition ?? "",
     headers.contentEncoding ?? "",
@@ -171,6 +173,7 @@ export async function signBlobSas(input: BlobSasInput) {
   if (input.protocol) params.set("spr", input.protocol);
   if (input.snapshot) params.set("snapshot", input.snapshot);
   if (input.ipRange) params.set("sip", input.ipRange);
+  if (input.encryptionScope) params.set("ses", input.encryptionScope);
   const headers = input.responseHeaders ?? {};
   const overrides = [
     ["rscc", headers.cacheControl],
@@ -219,6 +222,7 @@ export async function signUserDelegationSas(input: UserDelegationSasInput) {
   if (input.protocol) params.set("spr", input.protocol);
   if (input.snapshot) params.set("snapshot", input.snapshot);
   if (input.ipRange) params.set("sip", input.ipRange);
+  if (input.encryptionScope) params.set("ses", input.encryptionScope);
   const headers = input.responseHeaders ?? {};
   const overrides = [
     ["rscc", headers.cacheControl],

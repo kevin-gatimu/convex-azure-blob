@@ -126,6 +126,11 @@ export type AzureBlobOptions = {
   accessTier?: AccessTier;
   /** Virtual folder for new blobs, e.g. `"avatars"` gives `avatars/<uuid>.png`. */
   pathPrefix?: string;
+  /**
+   * Existing Azure encryption scope that new blobs are written with, e.g. `"customer-a"`.
+   * Reads, deletes and tag operations do not need it.
+   */
+  encryptionScope?: string;
   /** How long an upload URL stays valid. Default 300. */
   uploadTtlSeconds?: number;
   /** Read URLs are signed per window so every caller in it gets the same cacheable URL. Default 3600. */
@@ -200,6 +205,8 @@ const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SERVER_SAS_TTL_MS = 60 * 1000;
 const MAX_PUT_BLOB_FROM_URL_BYTES = 5000 * 1024 * 1024;
 const DELEGATION_KEY_REFRESH_THRESHOLD_MS = 12 * 60 * 60 * 1000;
+// Azure: 3-63 lowercase letters, digits and dashes, each dash between letters or digits.
+const ENCRYPTION_SCOPE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const PATH_PREFIX = /^[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/i;
 // Derived from the schema validators so runtime checks can't drift from the stored values.
 const ACCESS_TIERS: readonly string[] = accessTier.members.map((m) => m.value);
@@ -436,6 +443,16 @@ export class AzureBlob {
           `${label} must be between 0 and ${MAX_TTL_SECONDS} seconds`,
         );
     if (
+      options.encryptionScope !== undefined &&
+      (options.encryptionScope.length < 3 ||
+        options.encryptionScope.length > 63 ||
+        !ENCRYPTION_SCOPE.test(options.encryptionScope))
+    ) {
+      throw new Error(
+        `Invalid encryptionScope "${options.encryptionScope}": use 3-63 lowercase letters, digits and single "-" separators`,
+      );
+    }
+    if (
       options.pathPrefix !== undefined &&
       !PATH_PREFIX.test(options.pathPrefix)
     ) {
@@ -568,6 +585,7 @@ export class AzureBlob {
     permissions: string,
     expiresOn?: number,
     snapshot?: string,
+    encrypt = false,
   ) {
     if (!config.accountKey) {
       throw new Error("Account-key signing requires AZURE_BLOB_KEY");
@@ -584,6 +602,7 @@ export class AzureBlob {
       expiresOn: expiresOn ?? now + SERVER_SAS_TTL_MS,
       protocol: this.protocolFor(base),
       snapshot,
+      encryptionScope: encrypt ? this.options.encryptionScope : undefined,
     });
     return `${this.blobUrl(base, container, blobName)}?${sas}`;
   }
@@ -596,6 +615,7 @@ export class AzureBlob {
     expiresOn?: number,
     accessToken?: string,
     params: Record<string, string> = {},
+    encrypt = false,
   ) {
     if (config.accountKey) {
       const url = new URL(
@@ -606,6 +626,7 @@ export class AzureBlob {
           permissions,
           expiresOn,
           params.snapshot,
+          encrypt,
         ),
       );
       for (const [key, value] of Object.entries(params))
@@ -622,6 +643,10 @@ export class AzureBlob {
       headers: {
         authorization: `Bearer ${token}`,
         "x-ms-version": SAS_VERSION,
+        // A bearer token has no `ses`, so the scope travels as a header.
+        ...(encrypt && this.options.encryptionScope
+          ? { "x-ms-encryption-scope": this.options.encryptionScope }
+          : {}),
       },
     };
   }
@@ -1039,6 +1064,7 @@ export class AzureBlob {
           startsOn,
           expiresOn: uploadExpiresAt,
           protocol,
+          encryptionScope: this.options.encryptionScope,
         })
       : await this.signDelegationSas(
           ctx,
@@ -1050,6 +1076,7 @@ export class AzureBlob {
             startsOn,
             expiresOn: uploadExpiresAt,
             protocol,
+            encryptionScope: this.options.encryptionScope,
           },
           delegationKey,
         );
@@ -1486,6 +1513,7 @@ export class AzureBlob {
       protocol?: "https";
       responseHeaders?: SasResponseHeaders;
       snapshot?: string;
+      encryptionScope?: string;
     },
     cachedKey?: UserDelegationKey,
   ) {
@@ -1503,6 +1531,7 @@ export class AzureBlob {
       responseHeaders: input.responseHeaders,
       delegationKey: key,
       snapshot: input.snapshot,
+      encryptionScope: input.encryptionScope,
     });
   }
 
@@ -1933,6 +1962,7 @@ export class AzureBlob {
       undefined,
       undefined,
       { comp: "blocklist" },
+      true,
     );
     const committed = await azureFetch("block commit", commit.url, {
       method: "PUT",
@@ -2197,6 +2227,8 @@ export class AzureBlob {
       "c",
       uploadExpiresAt,
       accessToken,
+      undefined,
+      true,
     );
     const response = await azureFetch("upload", request.url, {
       method: "PUT",
@@ -2280,6 +2312,8 @@ export class AzureBlob {
       "c",
       uploadExpiresAt,
       accessToken,
+      undefined,
+      true,
     );
     let response: Response;
     try {

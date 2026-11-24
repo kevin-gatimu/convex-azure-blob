@@ -480,4 +480,39 @@ describe.skipIf(!endpoint)("against Azurite", () => {
     ).toBe(true);
     expect(await t.action((ctx) => azure.sweep(ctx))).toBe(1);
   });
+
+  it("accepts a ses-signed upload ticket and rejects one whose scope was altered", async () => {
+    const t = convexTest(defineSchema({}), componentTest.modules);
+    const azure = new AzureBlob(register(t), {
+      config,
+      pathPrefix: "integration",
+      encryptionScope: "customer-a",
+    });
+    const { ticket, put } = await browserUpload(azure, t, PNG);
+    expect(new URL(ticket.uploadUrl).searchParams.get("ses")).toBe(
+      "customer-a",
+    );
+    // Azurite checks the signature but does not enforce the scope; real accounts do.
+    expect(put.status).toBe(201);
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+    ).toMatchObject({ ok: true });
+    await t.action((ctx) => azure.purge(ctx, ticket.fileId));
+
+    const second = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    const tampered = new URL(second.uploadUrl);
+    tampered.searchParams.set("ses", "customer-b");
+    const denied = await fetch(tampered, {
+      method: "PUT",
+      headers: second.headers,
+      body: PNG,
+    });
+    expect(denied.status).toBe(403);
+    await t.action((ctx) => azure.purge(ctx, second.fileId));
+  });
 });
