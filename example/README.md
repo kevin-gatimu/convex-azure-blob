@@ -52,7 +52,7 @@ SAS cannot change the content that was verified.
 ## Running and troubleshooting
 
 Follow the [example setup](../README.md#example-app) and the
-[Entra setup guide](../README.md#microsoft-entra-user-delegation-sas).
+[Entra setup guide](../docs/entra.md).
 
 - Keep `npm run dev` and `npm run dev:frontend` running in separate terminals.
 - If the connection indicator is disconnected, check the backend process and
@@ -60,8 +60,8 @@ Follow the [example setup](../README.md#example-app) and the
 - Browser uploads need a **Blob service CORS** rule for the exact frontend
   origin. For `http://localhost:5173`, allow `PUT, GET, HEAD, OPTIONS` and the
   `content-type` and `x-ms-version` headers. See the
-  [complete CORS rule](../README.md#an-azure-storage-account), including exposed
-  headers, and select **Save** in the portal.
+  [complete CORS rule](../docs/azure-setup.md#an-azure-storage-account),
+  including exposed headers, and select **Save** in the portal.
 - Signature checks are not malware scanning. Apply authentication, quotas, and
   application-specific size ceilings before using the demo in production.
 

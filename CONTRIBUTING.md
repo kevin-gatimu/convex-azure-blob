@@ -97,6 +97,20 @@ themselves, and print only statuses, never keys or SAS URLs.
 
 Formatting is Prettier (`npm run format`).
 
+## Roadmap
+
+Already in 0.1.0: Microsoft Entra user delegation SAS, resumable block uploads,
+the Defender malware scan gate, Event Grid confirmation, copy from URL, faster
+sweeps with backoff, reads from actions, `Content-MD5` checks, access tiers, and
+`checkSetup`.
+
+Unreleased: blob index tags and encryption scopes.
+
+Planned. Contributions welcome:
+
+1. **Stored access policies**, to revoke outstanding URLs without rotating the
+   key.
+
 ## Releasing
 
 See [PUBLISHING.md](./PUBLISHING.md). Add an entry to `CHANGELOG.md` for every
