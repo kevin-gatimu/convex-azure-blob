@@ -1,7 +1,10 @@
 {
   "name": "convex-azure-blob-storage",
   "description": "Azure Blob Storage for Convex: direct browser uploads with short-lived SAS URLs, file metadata in Convex, and no Azure SDK.",
-  "repository": "github:kevin-gatimu/convex-azure-blob-storage",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kevin-gatimu/convex-azure-blob-storage.git"
+  },
   "homepage": "https://github.com/kevin-gatimu/convex-azure-blob-storage#readme",
   "bugs": {
     "url": "https://github.com/kevin-gatimu/convex-azure-blob-storage/issues"
