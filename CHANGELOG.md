@@ -1,16 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Add server-chosen blob index tags to uploads, `store`, and `storeFromUrl`,
   with ready-time Defender-preserving merges and the `getTags`/`setTags`
-  actions.
+  actions. New optional `files.tags` field.
 - Add the `encryptionScope` option. Upload tickets, block staging and commit,
   `store`, and `storeFromUrl` write new blobs into that Azure encryption scope
   (SAS `ses`, or `x-ms-encryption-scope` with Entra bearer auth). Reads, tags,
   tiers, and deletes are unchanged. Invalid names are rejected at construction.
 - Docs: the README now covers setup and the basic flow; feature guides moved to
-  `docs/`.
+  `docs/`. The Entra guide notes that managed identities are not supported.
 
 ## 0.1.1
 
