@@ -5329,3 +5329,180 @@ describe("blob index tags", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("encryption scope", () => {
+  const scope = "customer-a";
+
+  it.each([
+    "ab",
+    "a".repeat(64),
+    "Customer",
+    "-abc",
+    "abc-",
+    "a--b",
+    "a_b",
+    "a b",
+    "",
+  ])("rejects the invalid scope name %j", (encryptionScope) => {
+    expect(() => new AzureBlob({} as never, { encryptionScope })).toThrow(
+      "Invalid encryptionScope",
+    );
+  });
+
+  it.each(["abc", "customer-a", "a".repeat(63), "a1-b2-c3"])(
+    "accepts the scope name %j",
+    (encryptionScope) => {
+      expect(
+        () => new AzureBlob({} as never, { encryptionScope }),
+      ).not.toThrow();
+    },
+  );
+
+  it("signs the browser upload ticket with ses and leaves read and delete URLs unscoped", async () => {
+    const { t, azure } = setup({ encryptionScope: scope });
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(params(ticket.uploadUrl).get("ses")).toBe(scope);
+    expect(params(ticket.uploadUrl).get("sp")).toBe("c");
+    expect(ticket.headers).not.toHaveProperty("x-ms-encryption-scope");
+
+    stubBlob({ length: PNG.length });
+    expect(
+      (await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId))).ok,
+    ).toBe(true);
+    for (const [url] of fetchMock.mock.calls)
+      expect(params(String(url)).has("ses")).toBe(false);
+
+    const readUrl = await t.query((ctx) => azure.getUrl(ctx, ticket.fileId));
+    expect(params(readUrl).get("sp")).toBe("r");
+    expect(params(readUrl).has("ses")).toBe(false);
+
+    fetchMock.mockClear();
+    await t.action((ctx) => azure.purge(ctx, ticket.fileId));
+    expect(methods()).toEqual(["DELETE"]);
+    expect(params(String(fetchMock.mock.calls[0]?.[0])).has("ses")).toBe(false);
+  });
+
+  it("does not sign ses without the option", async () => {
+    const { t, azure } = setup();
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(params(ticket.uploadUrl).has("ses")).toBe(false);
+  });
+
+  it("signs block staging and the server-side commit with ses but not the snapshot or reads", async () => {
+    const state = setup({ blockUploads: true, encryptionScope: scope });
+    const ticket = await state.t.action((ctx) =>
+      state.azure.generateUploadUrl(ctx, {
+        uploadedBy: "u1",
+        contentType: "image/png",
+        size: PNG.length,
+      }),
+    );
+    expect(ticket.kind).toBe("blocks");
+    expect(params(ticket.uploadUrl).get("sp")).toBe("w");
+    expect(params(ticket.uploadUrl).get("ses")).toBe(scope);
+
+    stubBlocks();
+    expect(
+      (
+        await state.t.action((ctx) =>
+          state.azure.confirmUpload(ctx, ticket.fileId),
+        )
+      ).ok,
+    ).toBe(true);
+    const seen = fetchMock.mock.calls.map(([url, init]) => ({
+      method: init?.method ?? "GET",
+      comp: params(String(url)).get("comp"),
+      ses: params(String(url)).get("ses"),
+    }));
+    expect(seen).toEqual([
+      { method: "GET", comp: "blocklist", ses: null },
+      { method: "HEAD", comp: null, ses: null },
+      { method: "PUT", comp: "blocklist", ses: scope },
+      { method: "PUT", comp: "snapshot", ses: null },
+      { method: "HEAD", comp: null, ses: null },
+      { method: "GET", comp: null, ses: null },
+    ]);
+  });
+
+  it("signs the server-side store PUT with ses", async () => {
+    const { t, azure } = setup({ encryptionScope: scope });
+    stubBlob({ length: PNG.length });
+    const result = await t.action((ctx) =>
+      azure.store(ctx, {
+        data: PNG,
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(result.ok).toBe(true);
+    expect(methods()).toEqual(["PUT", "HEAD", "GET"]);
+    expect(params(String(fetchMock.mock.calls[0]?.[0])).get("ses")).toBe(scope);
+    for (const [url] of fetchMock.mock.calls.slice(1))
+      expect(params(String(url)).has("ses")).toBe(false);
+  });
+
+  it("signs the storeFromUrl destination with ses", async () => {
+    const { t, azure } = setup({ encryptionScope: scope });
+    stubBlob({ length: PNG.length });
+    const result = await t.action((ctx) =>
+      azure.storeFromUrl(ctx, {
+        sourceUrl: "https://source.example/image.png",
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(result.ok).toBe(true);
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(params(String(url)).get("ses")).toBe(scope);
+    expect(init?.headers).toMatchObject({
+      "x-ms-copy-source": "https://source.example/image.png",
+    });
+  });
+
+  it("signs user-delegation upload tickets with ses", async () => {
+    const { t, azure } = setup({ config: entraConfig, encryptionScope: scope });
+    stubEntra({ length: PNG.length });
+    await t.action((ctx) => azure.refreshUserDelegationKey(ctx));
+    const ticket = await t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(params(ticket.uploadUrl).get("skoid")).toBeTruthy();
+    expect(params(ticket.uploadUrl).get("ses")).toBe(scope);
+  });
+  it("sends the scope as a header on bearer-token writes only", async () => {
+    const { t, azure } = setup({ config: entraConfig, encryptionScope: scope });
+    stubEntra({ length: PNG.length });
+    const result = await t.action((ctx) =>
+      azure.store(ctx, {
+        data: PNG,
+        contentType: "image/png",
+        uploadedBy: "u1",
+      }),
+    );
+    expect(result.ok).toBe(true);
+    const blobCalls = fetchMock.mock.calls.filter(
+      ([url]) => !String(url).includes("/oauth2/v2.0/token"),
+    );
+    expect(blobCalls[0]?.[1]?.headers).toMatchObject({
+      "x-ms-encryption-scope": scope,
+    });
+    for (const [url, init] of blobCalls) {
+      expect(params(String(url)).has("ses")).toBe(false);
+      if (init !== blobCalls[0]?.[1])
+        expect(init?.headers).not.toHaveProperty("x-ms-encryption-scope");
+    }
+  });
+});

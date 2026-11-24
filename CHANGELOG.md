@@ -5,6 +5,10 @@
 - Add server-chosen blob index tags to uploads, `store`, and `storeFromUrl`,
   with ready-time Defender-preserving merges and the `getTags`/`setTags`
   actions.
+- Add the `encryptionScope` option. Upload tickets, block staging and commit,
+  `store`, and `storeFromUrl` write new blobs into that Azure encryption scope
+  (SAS `ses`, or `x-ms-encryption-scope` with Entra bearer auth). Reads, tags,
+  tiers, and deletes are unchanged. Invalid names are rejected at construction.
 
 ## 0.1.1
 

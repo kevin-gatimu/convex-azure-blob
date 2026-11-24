@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   attachmentDisposition,
@@ -52,6 +53,27 @@ describe("blob service SAS", () => {
     );
   });
 
+  it("signs the encryption scope in its slot and as ses", async () => {
+    const input = {
+      ...base,
+      permissions: "c",
+      expiresOn: Date.UTC(2026, 0, 1, 1, 0, 0),
+      encryptionScope: "customer-a",
+    };
+    const fields = blobStringToSign(input).split("\n");
+    expect(fields.slice(8, 12)).toEqual(["b", "", "customer-a", ""]);
+    const params = new URLSearchParams(await signBlobSas(input));
+    expect(params.get("ses")).toBe("customer-a");
+    expect(params.get("sig")).toBe(
+      createHmac("sha256", Buffer.from(KEY, "base64"))
+        .update(blobStringToSign(input))
+        .digest("base64"),
+    );
+    const { encryptionScope: _scope, ...unscoped } = input;
+    const plain = new URLSearchParams(await signBlobSas(unscoped));
+    expect(plain.has("ses")).toBe(false);
+    expect(blobStringToSign(unscoped).split("\n")[10]).toBe("");
+  });
   // Expected signatures come from an independent HMAC-SHA256 over the strings above (Python hmac).
   it("signs a read token that matches the independent HMAC", async () => {
     const query = await signBlobSas({
@@ -233,6 +255,27 @@ describe("user delegation SAS", () => {
     );
   });
 
+  it("signs the encryption scope in its slot and as ses in a delegation SAS", async () => {
+    const scoped = {
+      ...input,
+      permissions: "c",
+      encryptionScope: "customer-a",
+    };
+    expect(
+      userDelegationStringToSign(scoped).split("\n").slice(16, 20),
+    ).toEqual(["b", "", "customer-a", ""]);
+    const params = new URLSearchParams(await signUserDelegationSas(scoped));
+    expect(params.get("ses")).toBe("customer-a");
+    expect(params.get("sig")).toBe(
+      createHmac("sha256", Buffer.from(delegationKey.keyValue, "base64"))
+        .update(userDelegationStringToSign(scoped))
+        .digest("base64"),
+    );
+    const plain = new URLSearchParams(
+      await signUserDelegationSas({ ...scoped, encryptionScope: undefined }),
+    );
+    expect(plain.has("ses")).toBe(false);
+  });
   // Expected signature is an independent HMAC-SHA256 vector computed with Python hmac.
   it("signs a user delegation token against the independent HMAC vector", async () => {
     const query = await signUserDelegationSas(input);
