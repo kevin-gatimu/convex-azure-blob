@@ -106,10 +106,8 @@ sweeps with backoff, reads from actions, `Content-MD5` checks, access tiers, and
 
 Unreleased: blob index tags and encryption scopes.
 
-Planned. Contributions welcome:
-
-1. **Stored access policies**, to revoke outstanding URLs without rotating the
-   key.
+Have an idea or need?
+[Open an issue](https://github.com/kevin-gatimu/convex-azure-blob-storage/issues).
 
 ## Releasing
 

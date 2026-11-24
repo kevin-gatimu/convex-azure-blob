@@ -29,6 +29,10 @@ description and choose an expiry, then select **Add**. Copy the secret's
 **Value** immediately; it is only shown once. Store it securely and never commit
 it, put it in a screenshot, or paste it into chat.
 
+Managed identities are not supported. Azure issues their tokens only to code
+running on Azure compute, and Convex functions run on Convex's own
+infrastructure, so a client secret is required.
+
 ## 3. Prepare the storage account
 
 Use a general-purpose v2 storage account and create a private blob container for
