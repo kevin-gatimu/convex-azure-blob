@@ -52,6 +52,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           maxBytes: number;
           md5?: string;
           metadata?: Record<string, string>;
+          tags?: Record<string, string>;
           uploadExpiresAt: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -132,6 +133,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "scan_timed_out"
             | "deleting";
           sweepAttempts?: number;
+          tags?: Record<string, string>;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -171,6 +173,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "scan_timed_out"
             | "deleting";
           sweepAttempts?: number;
+          tags?: Record<string, string>;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -238,6 +241,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               | "scan_timed_out"
               | "deleting";
             sweepAttempts?: number;
+            tags?: Record<string, string>;
             uploadExpiresAt?: number;
             uploadMode?: "blocks";
             uploadedBy: string;
@@ -292,6 +296,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "scan_timed_out"
             | "deleting";
           sweepAttempts?: number;
+          tags?: Record<string, string>;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -338,6 +343,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "scan_timed_out"
             | "deleting";
           sweepAttempts?: number;
+          tags?: Record<string, string>;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -377,6 +383,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "scan_timed_out"
             | "deleting";
           sweepAttempts?: number;
+          tags?: Record<string, string>;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -416,6 +423,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "scan_timed_out"
             | "deleting";
           sweepAttempts?: number;
+          tags?: Record<string, string>;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
@@ -469,10 +477,18 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "scan_timed_out"
             | "deleting";
           sweepAttempts?: number;
+          tags?: Record<string, string>;
           uploadExpiresAt?: number;
           uploadMode?: "blocks";
           uploadedBy: string;
         } | null,
+        Name
+      >;
+      setTags: FunctionReference<
+        "mutation",
+        "internal",
+        { fileId: string; tags: Record<string, string> },
+        boolean,
         Name
       >;
       update: FunctionReference<

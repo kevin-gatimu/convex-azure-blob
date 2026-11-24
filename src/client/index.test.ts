@@ -4943,3 +4943,389 @@ describe("limits and validation", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("blob index tags", () => {
+  function stubTags(existing: Record<string, string> = {}, status = 204) {
+    const blobFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (params(String(url)).get("comp") === "tags") {
+        if (init?.method === "PUT") return new Response(null, { status });
+        return new Response(
+          `<Tags><TagSet>${Object.entries(existing)
+            .map(
+              ([key, value]) =>
+                `<Tag><Key>${key}</Key><Value>${value}</Value></Tag>`,
+            )
+            .join("")}</TagSet></Tags>`,
+        );
+      }
+      return await blobFetch(url, init);
+    });
+  }
+  const writes = () =>
+    fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        params(String(url)).get("comp") === "tags" && init?.method === "PUT",
+    );
+  const reserveTags = (
+    t: ReturnType<typeof setup>["t"],
+    azure: AzureBlob,
+    tags: Record<string, string>,
+  ) =>
+    t.action((ctx) =>
+      azure.generateUploadUrl(ctx, {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        tags,
+        size: PNG.length,
+      }),
+    );
+
+  it.each([
+    [
+      "too many",
+      Object.fromEntries(Array.from({ length: 11 }, (_, i) => [`k${i}`, "v"])),
+    ],
+    ["empty key", { "": "v" }],
+    ["long key", { ["k".repeat(129)]: "v" }],
+    ["long value", { key: "v".repeat(257) }],
+    ["bad key character", { "key&": "v" }],
+    ["bad value character", { key: "<secret>" }],
+    ["non ASCII", { key: "é" }],
+    ["trailing key newline", { "key\n": "value" }],
+    ["trailing value newline", { key: "value\n" }],
+    ["non string", { key: 1 }],
+    ["non record", null],
+  ])(
+    "rejects %s tags before any upload or auth request",
+    async (_label, invalid) => {
+      const { t, azure } = setup({ config: entraConfig });
+      const common = {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        tags: invalid as Record<string, string>,
+      };
+      await expect(
+        t.action((ctx) => azure.generateUploadUrl(ctx, common)),
+      ).rejects.toThrow();
+      await expect(
+        t.action((ctx) => azure.store(ctx, { ...common, data: PNG })),
+      ).rejects.toThrow();
+      await expect(
+        t.action((ctx) =>
+          azure.storeFromUrl(ctx, {
+            ...common,
+            sourceUrl: "https://example.com/image.png",
+          }),
+        ),
+      ).rejects.toThrow();
+      await expect(
+        t.action((ctx) => azure.setTags(ctx, "unknown", common.tags)),
+      ).rejects.toThrow();
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts boundary lengths and allowed characters without browser tag headers", async () => {
+    const { t, azure, file } = setup();
+    const tags = {
+      ["k".repeat(128)]: "v".repeat(256),
+      "azAZ09 +-.:=_/": "",
+      empty: "azAZ09 +-.:=_/",
+    };
+    const ticket = await reserveTags(t, azure, tags);
+    expect(await file(ticket.fileId)).toMatchObject({
+      tags,
+      status: "pending",
+    });
+    expect(
+      Object.keys(ticket.headers).some((key) =>
+        key.toLowerCase().includes("tag"),
+      ),
+    ).toBe(false);
+    expect(params(ticket.uploadUrl).get("sp")).toBe("c");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("writes on confirm and replaces app-managed keys while retaining Defender tags", async () => {
+    const { t, azure, file } = setup();
+    const ticket = await reserveTags(t, azure, {
+      project: "old",
+      obsolete: "remove",
+    });
+    stubBlob({});
+    stubTags({ "Malware scanning scan result": "No threats found" });
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+    ).toMatchObject({ ok: true });
+    expect(writes()).toHaveLength(1);
+    const [url, init] = writes()[0]!;
+    expect(params(String(url)).get("sp")).toBe("t");
+    expect(new Headers(init?.headers).get("x-ms-version")).toBe("2022-11-02");
+    expect(new Headers(init?.headers).get("content-type")).toBe(
+      "application/xml; charset=UTF-8",
+    );
+    expect(init?.body).toContain(
+      "<Key>Malware scanning scan result</Key><Value>No threats found</Value>",
+    );
+    expect(init?.body).toContain("<Key>project</Key><Value>old</Value>");
+    stubTags({
+      "Malware scanning scan result": "No threats found",
+      project: "old",
+      obsolete: "remove",
+      external: "keep",
+    });
+    expect(
+      await t.action((ctx) =>
+        azure.setTags(ctx, ticket.fileId, { project: "new" }),
+      ),
+    ).toBe(true);
+    const body = writes().at(-1)![1]!.body;
+    expect(body).toContain("<Key>external</Key><Value>keep</Value>");
+    expect(body).toContain("<Key>Malware scanning scan result</Key>");
+    expect(body).toContain("<Key>project</Key><Value>new</Value>");
+    expect(body).not.toContain("obsolete");
+    expect(await file(ticket.fileId)).toMatchObject({
+      tags: { project: "new" },
+      status: "ready",
+    });
+    stubTags({ project: "new", external: "keep" });
+    expect(await t.action((ctx) => azure.setTags(ctx, ticket.fileId, {}))).toBe(
+      true,
+    );
+    expect(writes().at(-1)![1]?.body).not.toContain("project");
+  });
+
+  it("reads Azure tags including XML entities and empty values rather than row tags", async () => {
+    const { t, azure, upload } = setup();
+    const fileId = await upload();
+    fetchMock.mockResolvedValue(
+      new Response(
+        "<Tags><TagSet><Tag><Key>external</Key><Value>a&#x2f;b&#32;c</Value></Tag><Tag><Key>empty</Key><Value /></Tag></TagSet></Tags>",
+      ),
+    );
+    expect(await t.action((ctx) => azure.getTags(ctx, fileId))).toEqual({
+      external: "a/b c",
+      empty: "",
+    });
+  });
+
+  it("returns null or false for unknown and non-ready files without Azure requests", async () => {
+    const { t, azure, reserve } = setup();
+    const fileId = await reserve();
+    for (const id of ["unknown", fileId]) {
+      expect(await t.action((ctx) => azure.getTags(ctx, id))).toBeNull();
+      expect(
+        await t.action((ctx) => azure.setTags(ctx, id, { project: "new" })),
+      ).toBe(false);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["GET", "PUT"])(
+    "reports %s non-2xx with status only and does not update row",
+    async (method) => {
+      const { t, azure, upload, file } = setup();
+      const fileId = await upload();
+      fetchMock.mockImplementation(async (_url, init) =>
+        init?.method === method
+          ? new Response("https://example.com/?sig=secret", { status: 503 })
+          : new Response("<Tags><TagSet/></Tags>"),
+      );
+      try {
+        await t.action((ctx) =>
+          method === "GET"
+            ? azure.getTags(ctx, fileId)
+            : azure.setTags(ctx, fileId, { project: "new" }),
+        );
+        expect.unreachable("non-2xx must throw");
+      } catch (error) {
+        const message = String(error);
+        expect(message).toContain(
+          `Azure Blob tag ${method === "GET" ? "read" : "write"} failed with 503`,
+        );
+        expect(message).not.toMatch(/sig=|https?:|secret/);
+      }
+      expect((await file(fileId))?.tags).toBeUndefined();
+      expect(await file(fileId)).toMatchObject({ status: "ready" });
+    },
+  );
+
+  it("sanitizes transport errors without applying explicit updates", async () => {
+    const { t, azure, upload, file } = setup();
+    const fileId = await upload();
+    fetchMock.mockRejectedValue(new Error("https://example.com/?sig=secret"));
+    await expect(t.action((ctx) => azure.getTags(ctx, fileId))).rejects.toThrow(
+      "Azure Blob tag read request failed",
+    );
+    await expect(
+      t.action((ctx) => azure.setTags(ctx, fileId, {})),
+    ).rejects.toThrow("Azure Blob tag read request failed");
+    expect((await file(fileId))?.tags).toBeUndefined();
+  });
+
+  it.each(["failure", "merged limit"])(
+    "retains ready state and logs sanitized automatic %s",
+    async (kind) => {
+      const { t, azure, file } = setup();
+      const ticket = await reserveTags(t, azure, { project: "new" });
+      stubBlob({});
+      stubTags(
+        kind === "merged limit"
+          ? Object.fromEntries(
+              Array.from({ length: 10 }, (_, i) => [`external${i}`, "v"]),
+            )
+          : {},
+        503,
+      );
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        expect(
+          await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+        ).toMatchObject({ ok: true });
+        expect(await file(ticket.fileId)).toMatchObject({
+          status: "ready",
+          tags: { project: "new" },
+        });
+        expect(log).toHaveBeenCalledWith(
+          "Azure Blob tag write failed after becoming ready; retaining ready file",
+        );
+        if (kind === "merged limit") {
+          expect(writes()).toHaveLength(0);
+          await expect(
+            t.action((ctx) =>
+              azure.setTags(ctx, ticket.fileId, { project: "new" }),
+            ),
+          ).rejects.toThrow("limited to 10 tags");
+        }
+      } finally {
+        log.mockRestore();
+      }
+    },
+  );
+
+  it.each(["store", "storeFromUrl"])(
+    "writes tags after %s becomes ready",
+    async (method) => {
+      const { t, azure, file } = setup();
+      stubBlob({});
+      stubTags({ defender: "keep" });
+      const common = {
+        contentType: "image/png",
+        uploadedBy: "u1",
+        tags: { project: "new" },
+      };
+      const result = await t.action((ctx) =>
+        method === "store"
+          ? azure.store(ctx, { ...common, data: PNG })
+          : azure.storeFromUrl(ctx, {
+              ...common,
+              sourceUrl: "https://example.com/image.png",
+            }),
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error(result.reason);
+      expect(await file(result.fileId)).toMatchObject({
+        status: "ready",
+        tags: common.tags,
+      });
+      expect(writes()).toHaveLength(1);
+      expect(writes()[0]![1]?.body).toContain("<Key>defender</Key>");
+    },
+  );
+
+  it("writes tags on the base blob after block snapshot confirmation", async () => {
+    const { t, azure, file } = setup({ blockUploads: true });
+    const ticket = await reserveTags(t, azure, { project: "blocks" });
+    stubBlocks();
+    stubTags();
+    expect(
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId)),
+    ).toMatchObject({ ok: true });
+    expect(await file(ticket.fileId)).toMatchObject({
+      status: "ready",
+      snapshot: expect.any(String),
+    });
+    expect(writes()).toHaveLength(1);
+    expect(params(String(writes()[0]![0])).has("snapshot")).toBe(false);
+    expect(Object.keys(ticket.headers).some((key) => key.includes("tag"))).toBe(
+      false,
+    );
+  });
+
+  it.each([204, 503])(
+    "writes only after clean malware verdict and retains ready on tag status %s",
+    async (status) => {
+      const { t, azure, file } = setup({ requireMalwareScan: true });
+      const ticket = await reserveTags(t, azure, { project: "scanned" });
+      stubBlob({});
+      await t.action((ctx) => azure.confirmUpload(ctx, ticket.fileId));
+      expect(await file(ticket.fileId)).toMatchObject({ status: "scanning" });
+      expect(writes()).toHaveLength(0);
+      stubTags({ "Malware scanning scan result": "No threats found" }, status);
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        expect(await t.action((ctx) => azure.scanMalware(ctx))).toBe(1);
+        expect(await file(ticket.fileId)).toMatchObject({ status: "ready" });
+        expect(writes()).toHaveLength(1);
+        expect(writes()[0]![1]?.body).toContain(
+          "<Key>Malware scanning scan result</Key><Value>No threats found</Value>",
+        );
+        expect(log.mock.calls.length).toBe(status === 503 ? 1 : 0);
+      } finally {
+        log.mockRestore();
+      }
+    },
+  );
+
+  it("writes tags through Event Grid confirmation and ignores redelivery", async () => {
+    const router = httpRouter();
+    const t = convexTest(defineSchema({}), {
+      ...componentTest.modules,
+      "./component/http.ts": async () => ({ default: router }),
+    });
+    const azure = new AzureBlob(register(t), {
+      config: {
+        ...config,
+        endpoint: "https://127.0.0.1:10000/devstoreaccount1",
+      },
+      now: () => T0,
+    });
+    const ticket = await reserveTags(t, azure, { project: "event" });
+    const doc = (await t.query((ctx) => azure.getFile(ctx, ticket.fileId)))!;
+    const secret = "a".repeat(32);
+    router.route({
+      path: "/events",
+      method: "POST",
+      handler: azure.eventGridHandler({ secret }),
+    });
+    const request = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify([
+        {
+          id: "tag-event",
+          eventType: "Microsoft.Storage.BlobCreated",
+          subject: `/blobServices/default/containers/uploads/blobs/${doc.blobName}`,
+          eventTime: new Date(T0).toISOString(),
+          dataVersion: "",
+          metadataVersion: "1",
+          data: {
+            url: `https://127.0.0.1:10000/devstoreaccount1/uploads/${doc.blobName}`,
+          },
+        },
+      ]),
+    };
+    stubBlob({});
+    stubTags();
+    expect((await t.fetch(`/events?secret=${secret}`, request)).status).toBe(
+      200,
+    );
+    expect(writes()).toHaveLength(1);
+    fetchMock.mockClear();
+    expect((await t.fetch(`/events?secret=${secret}`, request)).status).toBe(
+      200,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

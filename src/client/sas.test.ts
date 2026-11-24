@@ -256,6 +256,19 @@ describe("user delegation SAS", () => {
     });
   });
 
+  it("signs tag-only and ordered delete-tag user delegation tokens", async () => {
+    for (const permissions of ["t", "dt"]) {
+      const params = new URLSearchParams(
+        await signUserDelegationSas({ ...input, permissions }),
+      );
+      expect(params.get("sp")).toBe(permissions);
+      expect(params.get("sr")).toBe("b");
+    }
+    await expect(
+      signUserDelegationSas({ ...input, permissions: "td" }),
+    ).rejects.toThrow("Invalid SAS permissions");
+  });
+
   it("rejects a SAS that outlives its delegation key", async () => {
     await expect(
       signUserDelegationSas({

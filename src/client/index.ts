@@ -249,14 +249,43 @@ function decodeXmlText(value: string) {
     .replace(/&amp;/g, "&");
 }
 
+function parseTags(xml: string): Record<string, string> {
+  return Object.fromEntries(
+    Array.from(
+      xml.matchAll(
+        /<Tag>\s*<Key>([\s\S]*?)<\/Key>\s*<Value(?:\s*\/>|>([\s\S]*?)<\/Value>)\s*<\/Tag>/gi,
+      ),
+      (match) => [decodeXmlText(match[1]!), decodeXmlText(match[2] ?? "")],
+    ),
+  );
+}
+
+function assertTags(tags: Record<string, string> | undefined) {
+  if (tags === undefined) return;
+  if (!isRecord(tags))
+    throw new ConvexError("Blob index tags must be a string record");
+  if (Object.keys(tags).length > 10)
+    throw new ConvexError("Blob index tags are limited to 10 tags");
+  for (const [key, value] of Object.entries(tags)) {
+    if (key.length < 1 || key.length > 128 || /[^a-zA-Z0-9 +\-.:=_/]/.test(key))
+      throw new ConvexError("Invalid blob index tag key");
+    if (
+      typeof value !== "string" ||
+      value.length > 256 ||
+      /[^a-zA-Z0-9 +\-.:=_/]/.test(value)
+    )
+      throw new ConvexError("Invalid blob index tag value");
+  }
+}
+
 function malwareScanResult(xml: string) {
-  for (const match of xml.matchAll(
-    /<Tag>\s*<Key>([\s\S]*?)<\/Key>\s*<Value>([\s\S]*?)<\/Value>\s*<\/Tag>/gi,
-  )) {
-    const key = decodeXmlText(match[1]!).trim().toLowerCase();
-    if (key === "scan result" || key === "malware scanning scan result") {
-      return decodeXmlText(match[2]!).trim().toLowerCase();
-    }
+  for (const [key, value] of Object.entries(parseTags(xml))) {
+    const normalized = key.trim().toLowerCase();
+    if (
+      normalized === "scan result" ||
+      normalized === "malware scanning scan result"
+    )
+      return value.trim().toLowerCase();
   }
   return undefined;
 }
@@ -864,11 +893,13 @@ export class AzureBlob {
       size?: number;
       fileName?: string;
       metadata?: Record<string, string>;
+      tags?: Record<string, string>;
       md5?: string;
     },
     ttlMs = this.uploadTtlMs,
     blocks = false,
   ) {
+    assertTags(args.tags);
     const contentType = mediaType(args.contentType);
     const extension = this.allowed[contentType];
     if (!extension) throw new ConvexError("This file type is not allowed");
@@ -898,6 +929,7 @@ export class AzureBlob {
       uploadedBy: args.uploadedBy,
       fileName: args.fileName,
       metadata: args.metadata,
+      tags: args.tags,
       ...(this.options.requireMalwareScan ? { malwareScanRequired: true } : {}),
       ...(args.md5 !== undefined ? { md5: args.md5 } : {}),
       createdAt,
@@ -937,9 +969,11 @@ export class AzureBlob {
       size?: number;
       fileName?: string;
       metadata?: Record<string, string>;
+      tags?: Record<string, string>;
       md5?: string;
     },
   ): Promise<UploadTicket> {
+    assertTags(args.tags);
     if (args.md5 !== undefined) {
       if (this.options.blockUploads)
         throw new ConvexError("md5 is not supported with block uploads");
@@ -1312,11 +1346,113 @@ export class AzureBlob {
     });
   }
 
-  private async applyReadyTier(
+  private async tagRequest(
+    file: Pick<FileDoc, "container" | "blobName">,
+    method: "GET" | "PUT",
+    tags?: Record<string, string>,
+    config = this.config(),
+    accessToken?: string,
+  ) {
+    const request = await this.serverRequest(
+      config,
+      file.container,
+      file.blobName,
+      "t",
+      undefined,
+      accessToken,
+      { comp: "tags" },
+    );
+    try {
+      return await fetch(request.url, {
+        method,
+        headers: {
+          ...request.headers,
+          "x-ms-version": SAS_VERSION,
+          ...(method === "PUT"
+            ? { "content-type": "application/xml; charset=UTF-8" }
+            : {}),
+        },
+        ...(method === "PUT"
+          ? {
+              body: `<?xml version="1.0" encoding="utf-8"?><Tags><TagSet>${Object.entries(
+                tags!,
+              )
+                .map(
+                  ([key, value]) =>
+                    `<Tag><Key>${key}</Key><Value>${value}</Value></Tag>`,
+                )
+                .join("")}</TagSet></Tags>`,
+            }
+          : {}),
+      });
+    } catch {
+      throw new ConvexError(
+        `Azure Blob tag ${method === "GET" ? "read" : "write"} request failed`,
+      );
+    }
+  }
+
+  private async readTags(file: Pick<FileDoc, "container" | "blobName">) {
+    const response = await this.tagRequest(file, "GET");
+    if (!response.ok)
+      throw new ConvexError(
+        `Azure Blob tag read failed with ${response.status}`,
+      );
+    return parseTags(await response.text());
+  }
+
+  private async writeTags(file: FileDoc, tags: Record<string, string>) {
+    // Tags target the base blob so Defender tags and Azure's index share one resource.
+    const merged = await this.readTags(file);
+    for (const key of Object.keys(file.tags ?? {})) delete merged[key];
+    const replacement = { ...merged, ...tags };
+    assertTags(replacement);
+    const response = await this.tagRequest(file, "PUT", replacement);
+    if (!response.ok)
+      throw new ConvexError(
+        `Azure Blob tag write failed with ${response.status}`,
+      );
+  }
+
+  /** Reads the base blob's Azure index tags; returns null unless the file is ready. */
+  async getTags(
+    ctx: RunActionCtx,
+    fileId: string,
+  ): Promise<Record<string, string> | null> {
+    const file = await this.getFile(ctx, fileId);
+    return file?.status === "ready" ? await this.readTags(file) : null;
+  }
+
+  /** Replaces app-managed tags, preserving other Azure tags; returns false unless ready. */
+  async setTags(
+    ctx: RunActionCtx,
+    fileId: string,
+    tags: Record<string, string>,
+  ): Promise<boolean> {
+    assertTags(tags);
+    const file = await this.getFile(ctx, fileId);
+    if (!file || file.status !== "ready") return false;
+    await this.writeTags(file, tags);
+    return await ctx.runMutation(this.component.lib.setTags, { fileId, tags });
+  }
+
+  private async applyReadyTags(file: FileDoc) {
+    if (file.tags === undefined) return;
+    try {
+      await this.writeTags(file, file.tags);
+    } catch {
+      console.error(
+        "Azure Blob tag write failed after becoming ready; retaining ready file",
+      );
+    }
+  }
+
+  private async applyReadyOptions(
     ctx: RunActionCtx,
     file: FileDoc,
     headers?: Headers,
   ) {
+    await this.applyReadyTags(file);
     if (this.options.accessTier) {
       try {
         await this.changeTier(ctx, file, this.options.accessTier);
@@ -1515,7 +1651,7 @@ export class AzureBlob {
           ...(file.snapshot ? { snapshot: file.snapshot } : {}),
         });
     if (confirmed?.status === "ready")
-      await this.applyReadyTier(ctx, confirmed, head.headers);
+      await this.applyReadyOptions(ctx, confirmed, head.headers);
     else if (confirmed?.status === "scanning")
       // Record the tier now, so the scan path needs no extra HEAD when no default tier is set.
       await this.recordTier(ctx, confirmed.fileId, head.headers).catch(() =>
@@ -1579,19 +1715,13 @@ export class AzureBlob {
           }
           continue;
         }
-        const request = await this.serverRequest(
-          config,
-          job.container,
-          job.blobName,
-          "t",
+        const response = await this.tagRequest(
+          job,
+          "GET",
           undefined,
+          config,
           accessToken,
-          { comp: "tags" },
         );
-        const response = await azureFetch("tag read", request.url, {
-          method: "GET",
-          ...(request.headers ? { headers: request.headers } : {}),
-        });
         if (response.status === 404) {
           await this.deferMalwareScan(
             ctx,
@@ -1613,7 +1743,7 @@ export class AzureBlob {
             ...(job.snapshot ? { snapshot: job.snapshot } : {}),
           });
           if (ready) {
-            await this.applyReadyTier(ctx, ready);
+            await this.applyReadyOptions(ctx, ready);
           }
         } else if (result === "malicious") {
           const cleanupUntil = (job.uploadExpiresAt ?? now) + CLOCK_SKEW_MS;
@@ -2043,8 +2173,10 @@ export class AzureBlob {
       maxBytes?: number;
       fileName?: string;
       metadata?: Record<string, string>;
+      tags?: Record<string, string>;
     },
   ): Promise<StoreResult> {
+    assertTags(args.tags);
     const config = this.config();
     const accessToken = config.accountKey
       ? undefined
@@ -2096,8 +2228,10 @@ export class AzureBlob {
       maxBytes?: number;
       fileName?: string;
       metadata?: Record<string, string>;
+      tags?: Record<string, string>;
     },
   ): Promise<StoreResult> {
+    assertTags(args.tags);
     const { sourceUrl: sourceAddress, ...rest } = args;
     let source: URL;
     try {
