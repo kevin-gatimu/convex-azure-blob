@@ -101,6 +101,64 @@ describe.skipIf(!endpoint)("against Azurite", () => {
     expect(result.checks.at(-1)).toMatchObject({ name: "cors", ok: false });
   });
 
+  it("sets and reads index tags with real tag SAS and preserves Defender tags", async () => {
+    const { t, azure } = setup();
+    const result = await t.action((ctx) =>
+      azure.store(ctx, {
+        data: PNG,
+        contentType: "image/png",
+        uploadedBy: "u1",
+        tags: { project: "initial" },
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
+    try {
+      expect(
+        await t.action((ctx) => azure.getTags(ctx, result.fileId)),
+      ).toEqual({ project: "initial" });
+      const file = (await t.query((ctx) => azure.getFile(ctx, result.fileId)))!;
+      const sas = await signBlobSas({
+        ...config,
+        blobName: file.blobName,
+        permissions: "t",
+        startsOn: Date.now() - 300000,
+        expiresOn: Date.now() + 60000,
+      });
+      const url = `${config.endpoint}/${file.container}/${file.blobName}?${sas}&comp=tags`;
+      expect(
+        (
+          await fetch(url, {
+            method: "PUT",
+            headers: {
+              "x-ms-version": "2022-11-02",
+              "content-type": "application/xml; charset=UTF-8",
+            },
+            body: "<Tags><TagSet><Tag><Key>project</Key><Value>initial</Value></Tag><Tag><Key>Malware scanning scan result</Key><Value>No threats found</Value></Tag></TagSet></Tags>",
+          })
+        ).status,
+      ).toBe(204);
+      expect(
+        await t.action((ctx) =>
+          azure.setTags(ctx, result.fileId, { updated: "yes" }),
+        ),
+      ).toBe(true);
+      expect(
+        await t.action((ctx) => azure.getTags(ctx, result.fileId)),
+      ).toEqual({
+        updated: "yes",
+        "Malware scanning scan result": "No threats found",
+      });
+      const readUrl = new URL(
+        (await t.query((ctx) => azure.getUrl(ctx, result.fileId)))!,
+      );
+      readUrl.searchParams.set("comp", "tags");
+      expect((await fetch(readUrl)).status).toBe(403);
+    } finally {
+      await t.action((ctx) => azure.delete(ctx, result.fileId));
+    }
+  });
+
   it("sets and refreshes tiers using a real write SAS and denies a read SAS", async () => {
     const t = convexTest(defineSchema({}), componentTest.modules);
     const azure = new AzureBlob(register(t), { config, accessTier: "Cool" });

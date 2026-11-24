@@ -58,6 +58,7 @@ export const create = mutation({
     uploadedBy: v.string(),
     fileName: v.optional(v.string()),
     metadata: metadataValidator,
+    tags: fileFields.tags,
     malwareScanRequired: fileFields.malwareScanRequired,
     createdAt: v.number(),
     uploadExpiresAt: v.number(),
@@ -84,6 +85,19 @@ export const create = mutation({
     )
       throw new ConvexError("Invalid block upload size");
     return await ctx.db.insert("files", { ...args, status: "pending" });
+  },
+});
+
+/** Records app-managed tags after Azure accepts their replacement. */
+export const setTags = mutation({
+  args: { fileId: v.string(), tags: v.record(v.string(), v.string()) },
+  returns: v.boolean(),
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("files", args.fileId);
+    const row = id ? await ctx.db.get("files", id) : null;
+    if (!id || !row || row.status !== "ready") return false;
+    await ctx.db.patch("files", id, { tags: args.tags });
+    return true;
   },
 });
 

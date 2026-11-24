@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add server-chosen blob index tags to uploads, `store`, and `storeFromUrl`,
+  with ready-time Defender-preserving merges and the `getTags`/`setTags`
+  actions.
+
 ## 0.1.1
 
 Documentation only; no code changes.

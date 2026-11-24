@@ -43,6 +43,8 @@ export const fileFields = {
   fileName: v.optional(v.string()),
   /** App-defined string metadata. */
   metadata: v.optional(v.record(v.string(), v.string())),
+  /** App-managed blob index tags, separate from Azure-managed tags. */
+  tags: v.optional(v.record(v.string(), v.string())),
   status: fileStatus,
   accessTier: v.optional(accessTier),
   archiveStatus: v.optional(archiveStatus),
